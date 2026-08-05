@@ -3432,7 +3432,16 @@ from zeus.brain.prompts import (
 
 
 def test_system_prompt_is_long_enough_to_cache():
-    """Opus 5's prompt-cache minimum is 512 tokens; ~4 chars/token."""
+    """Opus 5's prompt-cache minimum is 512 tokens.
+
+    2048 chars is a deliberately conservative proxy. Measured against the
+    live count_tokens endpoint, the shipped 2049-char prompt is ~640 tokens
+    — about 3.2 chars/token, not the 4 this threshold assumes — so the real
+    floor is nearer 1640 chars and this test leaves ~25% headroom. Below the
+    minimum a cache_control marker does not error; it silently no-ops with
+    cache_creation_input_tokens: 0, which is why this is pinned by a test at
+    all rather than left to inspection.
+    """
     assert len(SYSTEM_PROMPT) > 2048
 
 
