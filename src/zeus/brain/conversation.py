@@ -91,6 +91,11 @@ class Conversation:
                     spoken.append(REFUSAL_LINE)
                     yield REFUSAL_LINE
                     buffer = ""
+                    # Discard any earlier round's content. If a tool round
+                    # already completed, that content holds a tool_use block
+                    # whose tool_result will never arrive, and replaying it
+                    # next turn is a 400.
+                    final_content = None
                     break
                 # Keep only the LAST round's content. A turn that uses a
                 # tool is >1 round (tool_use, then text); appending per
@@ -109,16 +114,29 @@ class Conversation:
             yield ERROR_LINE
             spoken.append(ERROR_LINE)
             buffer = ""
-
-        if final_content is not None:
-            self._messages.append(
-                {"role": "assistant", "content": final_content}
-            )
+            final_content = None  # same reason as the refusal path
 
         remainder = buffer.strip()
         if remainder:
             spoken.append(remainder)
             yield remainder
+
+        # Exactly one assistant message per turn, always. The model's own
+        # closing content when the turn completed normally; otherwise
+        # whatever ZEUS actually said out loud, so the transcript matches
+        # what the user heard. Contributing nothing would leave two adjacent
+        # user messages on the next send(), which the API rejects just as
+        # surely as a dangling tool_use. This runs after the remainder
+        # flush so a trailing fragment is already part of `spoken` before
+        # it's used as the fallback.
+        if final_content is not None:
+            self._messages.append(
+                {"role": "assistant", "content": final_content}
+            )
+        elif spoken:
+            self._messages.append(
+                {"role": "assistant", "content": " ".join(spoken)}
+            )
 
         if spoken:
             self._store.add_message(

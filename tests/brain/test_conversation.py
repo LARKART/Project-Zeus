@@ -37,6 +37,22 @@ class StubStream:
         })()
 
 
+class RaisingStream:
+    """A stream that blows up as soon as it's iterated.
+
+    Kept separate from StubStream (rather than adding a should-raise flag
+    to it) so the normal stub stays simple. Exists to exercise the
+    except-path history bookkeeping when an earlier round in the same turn
+    already completed successfully.
+    """
+
+    def __iter__(self):
+        raise RuntimeError("stream broke mid-turn")
+
+    def get_final_message(self):  # pragma: no cover - never reached
+        raise AssertionError("get_final_message() called on a stream that never iterated")
+
+
 class StubClient:
     def __init__(self, streams):
         """streams[i] is turn i's response.
@@ -75,6 +91,25 @@ def _conversation(client, wiring):
         client=client, config=BrainConfig(), store=store, journal=journal,
         conversation_id=conv, system="SYSTEM", tools=[],
     )
+
+
+def _assert_history_is_well_formed(messages):
+    """Strict role alternation, and no unresolved tool_use anywhere.
+
+    Written generically (no hardcoded role list) so it keeps meaning if the
+    turn shape changes.
+    """
+    roles = [m["role"] for m in messages]
+    assert all(roles[i] != roles[i + 1] for i in range(len(roles) - 1)), roles
+
+    def _has_tool_use(message):
+        content = message["content"]
+        return isinstance(content, list) and any(
+            isinstance(block, dict) and block.get("type") == "tool_use"
+            for block in content
+        )
+
+    assert not any(_has_tool_use(m) for m in messages), messages
 
 
 def test_send_yields_complete_sentences(wiring):
@@ -170,18 +205,70 @@ def test_a_tool_using_turn_leaves_history_alternating(wiring):
     list(conversation.send("first"))
     list(conversation.send("second"))
 
-    submitted = client.calls[1]["messages"]
-    roles = [m["role"] for m in submitted]
-    assert all(roles[i] != roles[i + 1] for i in range(len(roles) - 1)), roles
+    _assert_history_is_well_formed(client.calls[1]["messages"])
 
-    def _has_tool_use(message):
-        content = message["content"]
-        return isinstance(content, list) and any(
-            isinstance(block, dict) and block.get("type") == "tool_use"
-            for block in content
-        )
 
-    assert not any(_has_tool_use(m) for m in submitted)
+def test_a_refused_first_round_still_leaves_history_alternating(wiring):
+    """A turn that is refused on its very first round contributes NO
+    final_content. Because send() always appends a user message up front,
+    a turn that contributes no assistant message back leaves two adjacent
+    user messages, which the API rejects just as surely as a dangling
+    tool_use."""
+    client = StubClient([
+        StubStream([], stop_reason="refusal"),
+        StubStream(["Sure."]),
+    ])
+    conversation = _conversation(client, wiring)
+    list(conversation.send("first"))
+    list(conversation.send("second"))
+
+    _assert_history_is_well_formed(client.calls[1]["messages"])
+
+
+def test_a_refusal_after_a_tool_round_drops_the_dangling_tool_use(wiring):
+    """Role alternation alone can look fine here — the defect is in the
+    CONTENT: without clearing final_content on the refusal path, the
+    dangling tool_use from the completed first round rides along into the
+    next send() wearing a plausible ['user', 'assistant', 'user'] shape."""
+    tool_round = StubStream(
+        [], stop_reason="tool_use",
+        content=[{
+            "type": "tool_use", "id": "toolu_2",
+            "name": "record_outcome", "input": {},
+        }],
+    )
+    refusal_round = StubStream([], stop_reason="refusal")
+    client = StubClient([
+        [tool_round, refusal_round],
+        StubStream(["Sure."]),
+    ])
+    conversation = _conversation(client, wiring)
+    list(conversation.send("first"))
+    list(conversation.send("second"))
+
+    _assert_history_is_well_formed(client.calls[1]["messages"])
+
+
+def test_an_exception_after_a_tool_round_drops_the_dangling_tool_use(wiring):
+    """Same mechanism as the refusal case, via the except path instead: an
+    earlier round's tool_use must not survive an exception in a later
+    round of the same turn."""
+    tool_round = StubStream(
+        [], stop_reason="tool_use",
+        content=[{
+            "type": "tool_use", "id": "toolu_3",
+            "name": "record_outcome", "input": {},
+        }],
+    )
+    client = StubClient([
+        [tool_round, RaisingStream()],
+        StubStream(["Sure."]),
+    ])
+    conversation = _conversation(client, wiring)
+    list(conversation.send("first"))
+    list(conversation.send("second"))
+
+    _assert_history_is_well_formed(client.calls[1]["messages"])
 
 
 def test_fake_conversation_replays_a_script():
