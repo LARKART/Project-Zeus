@@ -112,6 +112,13 @@ class MicStream:
     # -- audio path ----------------------------------------------------
     def _on_audio(self, indata, frames, time_info, status) -> None:
         """sounddevice callback. Must never raise — it runs on the audio thread."""
+        if self._stopping.is_set():
+            # Shutdown is signalled: stop feeding the queue. frames() ends by
+            # draining to empty, so a producer that keeps pushing after stop()
+            # would starve it of that observation and hang the consumer. The
+            # device close in stop() is best-effort and swallows exceptions,
+            # so we cannot assume the callback has actually ceased.
+            return
         if status:
             log.debug("audio status: %s", status)
         frame = bytes(indata)

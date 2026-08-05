@@ -141,3 +141,44 @@ def test_restart_does_not_inherit_the_previous_stop():
     stream.stop()
 
     assert list(stream.frames()) == [FRAME, FRAME]
+
+
+def test_frames_terminates_even_if_the_callback_keeps_firing():
+    """F3: frames() must not be starved of termination by a producer that
+    keeps pushing after stop() — e.g. because stop()'s device close raised
+    and was swallowed, leaving the sounddevice callback still firing.
+
+    Drain-then-stop means frames() only returns once it observes an empty
+    queue; a producer that never lets the queue go empty would otherwise
+    hang the consumer forever. _on_audio must become a no-op once shutdown
+    is signalled so the queue can actually drain.
+    """
+    stream = MicStream(AudioConfig())
+    stream._running = True
+    stream.stop()
+    assert stream._stopping.is_set()
+
+    keep_producing = threading.Event()
+    keep_producing.set()
+
+    def produce():
+        while keep_producing.is_set():
+            stream._on_audio(FRAME, FRAME_SAMPLES, None, None)
+
+    producer = threading.Thread(target=produce, daemon=True)
+    producer.start()
+
+    finished = threading.Event()
+
+    def consume():
+        for _ in stream.frames():
+            pass
+        finished.set()
+
+    consumer = threading.Thread(target=consume, daemon=True)
+    consumer.start()
+
+    completed = finished.wait(2)
+    keep_producing.clear()
+
+    assert completed, "frames() did not terminate within 2s while the callback kept firing"
