@@ -641,6 +641,7 @@ CREATE TABLE IF NOT EXISTS goals (
 CREATE TABLE IF NOT EXISTS checkins (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     kind          TEXT NOT NULL CHECK (kind IN ('morning','evening')),
+    local_date    TEXT NOT NULL,                 -- local YYYY-MM-DD, same convention as goals.date
     scheduled_for TEXT NOT NULL,
     fired_at      TEXT,
     outcome       TEXT NOT NULL DEFAULT 'deferred'
@@ -648,6 +649,7 @@ CREATE TABLE IF NOT EXISTS checkins (
     attempts      INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_checkins_sched ON checkins (scheduled_for);
+CREATE INDEX IF NOT EXISTS idx_checkins_local_date ON checkins (local_date, kind);
 
 CREATE TABLE IF NOT EXISTS conversations (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -841,6 +843,7 @@ class Goal:
 class CheckIn:
     id: int
     kind: str
+    local_date: str
     scheduled_for: datetime
     fired_at: datetime | None
     outcome: str
@@ -894,16 +897,20 @@ class Store:
 
     # ---- goals -------------------------------------------------------
     def set_goal(self, date: str, text: str) -> int:
-        cur = self.connection.execute(
+        # RETURNING, not cur.lastrowid: last_insert_rowid() is only updated by
+        # a real insert, so on the ON CONFLICT DO UPDATE branch lastrowid
+        # silently returns the id of whatever row was last inserted on this
+        # connection — a caller that then calls update_goal(that_id, ...)
+        # mutates an unrelated day's goal.
+        row = self.connection.execute(
             "INSERT INTO goals (date, text, set_at) VALUES (?, ?, ?) "
             "ON CONFLICT(date) DO UPDATE SET text = excluded.text, "
             "set_at = excluded.set_at, status = 'pending', "
-            "reviewed_at = NULL, notes = NULL",
+            "reviewed_at = NULL, notes = NULL "
+            "RETURNING id",
             (date, text, self._now()),
-        )
-        if cur.lastrowid:
-            return cur.lastrowid
-        return self.get_goal(date).id  # type: ignore[union-attr]
+        ).fetchone()
+        return int(row["id"])
 
     def get_goal(self, date: str) -> Goal | None:
         row = self.connection.execute(
@@ -918,16 +925,24 @@ class Store:
         )
 
     def update_goal(self, goal_id: int, status: str, notes: str | None = None) -> None:
+        # COALESCE, matching update_checkin's fired_at below: omitting the
+        # optional notes arg must not erase notes written by an earlier
+        # review. Clearing notes is still reachable — set_goal's upsert
+        # resets them to NULL.
         self.connection.execute(
-            "UPDATE goals SET status = ?, notes = ?, reviewed_at = ? WHERE id = ?",
+            "UPDATE goals SET status = ?, notes = COALESCE(?, notes), "
+            "reviewed_at = ? WHERE id = ?",
             (status, notes, self._now(), goal_id),
         )
 
     # ---- check-ins ---------------------------------------------------
     def open_checkin(self, kind: str, scheduled_for: datetime) -> int:
+        # scheduled_for is aware and carries the *local* zone the scheduler
+        # built it in, so .date() is the local calendar day. Reading it
+        # before to_utc_iso() converts is what keeps Store timezone-free.
         cur = self.connection.execute(
-            "INSERT INTO checkins (kind, scheduled_for) VALUES (?, ?)",
-            (kind, to_utc_iso(scheduled_for)),
+            "INSERT INTO checkins (kind, local_date, scheduled_for) VALUES (?, ?, ?)",
+            (kind, scheduled_for.date().isoformat(), to_utc_iso(scheduled_for)),
         )
         return int(cur.lastrowid)
 
@@ -936,7 +951,33 @@ class Store:
             "SELECT * FROM checkins WHERE id = ?", (checkin_id,)
         ).fetchone()
         return CheckIn(
-            id=row["id"], kind=row["kind"],
+            id=row["id"], kind=row["kind"], local_date=row["local_date"],
+            scheduled_for=from_utc_iso(row["scheduled_for"]),
+            fired_at=_dt(row["fired_at"]), outcome=row["outcome"],
+            attempts=row["attempts"],
+        )
+
+    def find_open_checkin(self, kind: str, date: str) -> CheckIn | None:
+        """The unresolved check-in of this kind on this local date, if any.
+
+        "Open" means not yet terminal: 'answered' and 'skipped' are settled
+        outcomes, while 'deferred' and 'no_answer' are both still eligible
+        for a retry and so still count as open.
+
+        Matching on local_date rather than date(scheduled_for) is load-bearing:
+        scheduled_for is stored as UTC, and evening 21:00 at UTC-5 lands on
+        the *next* UTC day, so a UTC-date match would miss it.
+        """
+        row = self.connection.execute(
+            "SELECT * FROM checkins WHERE kind = ? AND local_date = ? "
+            "AND outcome NOT IN ('answered','skipped') "
+            "ORDER BY id DESC LIMIT 1",
+            (kind, date),
+        ).fetchone()
+        if row is None:
+            return None
+        return CheckIn(
+            id=row["id"], kind=row["kind"], local_date=row["local_date"],
             scheduled_for=from_utc_iso(row["scheduled_for"]),
             fired_at=_dt(row["fired_at"]), outcome=row["outcome"],
             attempts=row["attempts"],
@@ -4317,15 +4358,21 @@ class CheckIn:
         return EVENING_OPENER(goal.text) if goal else FOLDED_OPENER
 
     def _find_or_open(self, scheduled_for: datetime) -> int:
-        """Reuse the open check-in row so attempts accumulate across retries."""
-        date = local_date(scheduled_for, self._tz)
-        for row in self._store.connection.execute(
-            "SELECT id FROM checkins WHERE kind = ? AND outcome IN "
-            "('deferred','no_answer') AND date(scheduled_for) <= ? "
-            "ORDER BY id DESC LIMIT 1",
-            (self._kind, date),
-        ):
-            return row["id"]
+        """Reuse today's open check-in row so attempts accumulate across retries.
+
+        Goes through Store.find_open_checkin rather than raw SQL. That method
+        matches on the stored local_date, which matters twice: scheduled_for is
+        stored as UTC (so a UTC-date match would miss an evening check-in in a
+        western timezone), and the match is for THIS date only — an unresolved
+        check-in left over from a previous day must not be reused, or today's
+        first attempt would inherit yesterday's attempt count and could exhaust
+        its retries before it has run once.
+        """
+        existing = self._store.find_open_checkin(
+            self._kind, local_date(scheduled_for, self._tz)
+        )
+        if existing is not None:
+            return existing.id
         return self._store.open_checkin(self._kind, scheduled_for)
 
     def run(self, scheduled_for: datetime) -> Outcome:
@@ -5446,12 +5493,26 @@ Task 1 was dispatched:
 `.gitignore` also already exists (it ignores `.worktrees/` and
 `.superpowers/`), so Task 1 verifies and extends it rather than creating it.
 
-### Known simplification, flagged deliberately
+### Resolved during execution (was: known simplification)
 
-`CheckIn._find_or_open` reuses an open check-in row by matching on kind and
-date via raw SQL rather than a dedicated `Store` method. This is the one place
-a task reaches past the `Store` façade. It is acceptable for Slice 1 and should
-become `Store.find_open_checkin(kind, date)` when Slice 2 touches this file.
+`CheckIn._find_or_open` originally reused an open check-in row via raw SQL
+against `store.connection`, reaching past the `Store` façade, with
+`Store.find_open_checkin` deferred to Slice 2. Task 3's review found that the
+deferral left `find_open_checkin` named in Task 3's Produces block but
+implemented nowhere. It is now implemented in Task 3 and `_find_or_open` calls
+it, which also retired two latent defects in the raw SQL: it compared a UTC
+`date(scheduled_for)` against a local date, and its `<=` would reuse an
+unresolved check-in from an earlier day.
+
+### Naming collision, flagged deliberately
+
+Two different classes are named `CheckIn`: the `Store` row dataclass in
+`zeus.memory.store` (Task 3) and the ritual runner in `zeus.ritual` (Task 15).
+They live in different modules and do not collide in practice: Task 15 never
+imports the store's dataclass by name, it only receives instances back from
+`store.get_checkin()` / `store.find_open_checkin()` and reads `.id` and
+`.attempts`. Renaming is a Slice 2 concern; do not rename mid-slice, as the
+store dataclass name is already committed and referenced across tasks.
 
 ---
 
