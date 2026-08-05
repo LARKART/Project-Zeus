@@ -1888,7 +1888,11 @@ class Presence:
 - [ ] **Step 4: Run the test and verify it passes**
 
 Run: `.venv/bin/pytest tests/context/test_presence.py -v`
-Expected: PASS — 13 tests
+Expected: PASS — 12 tests (9 parametrized decision-table cases + the
+threshold-boundary test + 2 Presence tests. An earlier draft of this plan
+said 13; that was a miscount of the parametrize list, not a dropped case —
+the table above covers every row of spec §8, both DEFER precedence rules,
+and the exclusive `idle > threshold` boundary.)
 
 - [ ] **Step 5: Manually resolve risk R3 — Focus detection**
 
