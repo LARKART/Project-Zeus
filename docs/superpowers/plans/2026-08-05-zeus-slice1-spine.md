@@ -4621,7 +4621,12 @@ class CheckIn:
 - [ ] **Step 4: Run the test and verify it passes**
 
 Run: `.venv/bin/pytest tests/ritual/test_checkin.py -v`
-Expected: PASS — 9 tests
+Expected: PASS — 14 tests (the Step 1 file collects 10; an earlier draft
+said 9, miscounting. Plus 4 added in review to cover `VoiceIO` directly,
+which the Step 1 file never exercises — it drives `CheckIn` through a
+`StubVoice`. The important one asserts `speak()` unmutes in a `finally`:
+without it, a `say()` that raises leaves the wake detector muted forever
+and ZEUS never wakes again until the daemon restarts.)
 
 - [ ] **Step 5: Commit**
 
