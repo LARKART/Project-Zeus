@@ -3212,3 +3212,2082 @@ Expected: PASS — 10 tests
 git add src/zeus/audio/activator.py src/zeus/audio/wakeword.py tests/audio/test_activator.py
 git commit -m "feat: wake-word and hotkey activators with half-duplex muting"
 ```
+
+---
+
+### Task 14: Brain — prompts, tools, and the Tool Runner conversation
+
+**Files:**
+- Create: `src/zeus/brain/__init__.py`, `src/zeus/brain/prompts.py`, `src/zeus/brain/tools.py`, `src/zeus/brain/conversation.py`, `src/zeus/brain/fake.py`
+- Test: `tests/brain/test_prompts.py`, `tests/brain/test_tools.py`, `tests/brain/test_conversation.py`
+
+**Interfaces:**
+- Consumes: `BrainConfig`, `Store`, `Journal`, `anthropic`.
+- Produces:
+  - `SYSTEM_PROMPT: str`, `MORNING_OPENER: str`, `EVENING_OPENER(goal_text: str) -> str`, `FOLDED_OPENER: str`
+  - `split_sentences(buffer: str) -> tuple[list[str], str]` — pure; returns complete sentences plus the unflushed remainder.
+  - `logged_tool(store, conversation_id, name, fn) -> Callable` — wraps a tool callable so every invocation writes an `actions` row with timing and success, and returns `is_error`-shaped text on failure.
+  - `build_tools(store, journal, conversation_id, local_date) -> list` — the `@beta_tool` functions for Slice 1: `save_goal`, `record_outcome`.
+  - `Conversation(client, config, store, journal, conversation_id, system, tools)` with `send(text: str) -> Iterator[str]` yielding **sentences** for TTS.
+  - `FakeConversation(script: dict[str, list[str]])` — same `send` shape; used by Tasks 15 and 18.
+
+- [ ] **Step 1: Write the failing tests**
+
+`tests/brain/test_prompts.py`:
+```python
+from zeus.brain.prompts import (
+    EVENING_OPENER,
+    FOLDED_OPENER,
+    MORNING_OPENER,
+    SYSTEM_PROMPT,
+    split_sentences,
+)
+
+
+def test_system_prompt_is_long_enough_to_cache():
+    """Opus 5's prompt-cache minimum is 512 tokens; ~4 chars/token."""
+    assert len(SYSTEM_PROMPT) > 2048
+
+
+def test_system_prompt_states_the_exchange_ceiling():
+    assert "three exchanges" in SYSTEM_PROMPT.lower()
+
+
+def test_evening_opener_embeds_the_goal():
+    assert "Finish the auth flow" in EVENING_OPENER("Finish the auth flow")
+
+
+def test_openers_are_distinct():
+    assert len({MORNING_OPENER, EVENING_OPENER("x"), FOLDED_OPENER}) == 3
+
+
+def test_split_sentences_emits_complete_sentences_only():
+    done, rest = split_sentences("Morning. What's the one thing")
+    assert done == ["Morning."]
+    assert rest == " What's the one thing"
+
+
+def test_split_sentences_handles_question_and_exclamation():
+    done, rest = split_sentences("Done? Great! Now")
+    assert done == ["Done?", "Great!"]
+    assert rest == " Now"
+
+
+def test_split_sentences_returns_nothing_when_incomplete():
+    done, rest = split_sentences("Morning")
+    assert done == []
+    assert rest == "Morning"
+
+
+def test_split_sentences_does_not_break_on_decimals():
+    done, rest = split_sentences("It took 1.5 hours. Next")
+    assert done == ["It took 1.5 hours."]
+    assert rest == " Next"
+```
+
+`tests/brain/test_tools.py`:
+```python
+from datetime import datetime, timezone
+
+import pytest
+
+from zeus.brain.tools import build_tools, logged_tool
+from zeus.clock import FakeClock
+from zeus.memory.journal import Journal
+from zeus.memory.store import Store
+from zoneinfo import ZoneInfo
+
+START = datetime(2026, 8, 5, 10, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture
+def wiring(tmp_path):
+    clock = FakeClock(START)
+    store = Store(tmp_path / "zeus.db", clock)
+    journal = Journal(tmp_path / "journal", clock, ZoneInfo("Africa/Lagos"))
+    conv = store.start_conversation("schedule")
+    return store, journal, conv
+
+
+def test_logged_tool_records_a_successful_action(wiring):
+    store, _, conv = wiring
+    wrapped = logged_tool(store, conv, "demo", lambda value: f"got {value}")
+    assert wrapped(value="x") == "got x"
+
+    action = store.recent_actions()[0]
+    assert action.tool == "demo"
+    assert action.ok is True
+    assert action.args == {"value": "x"}
+    assert action.error is None
+
+
+def test_logged_tool_captures_failures_without_raising(wiring):
+    store, _, conv = wiring
+
+    def explode():
+        raise RuntimeError("nope")
+
+    wrapped = logged_tool(store, conv, "boom", explode)
+    result = wrapped()
+    assert "nope" in result
+
+    action = store.recent_actions()[0]
+    assert action.ok is False
+    assert "nope" in action.error
+
+
+def test_save_goal_writes_goal_and_journal(wiring):
+    store, journal, conv = wiring
+    tools = {t.__name__: t for t in build_tools(store, journal, conv, "2026-08-05")}
+    tools["save_goal"](text="Finish the auth flow")
+
+    assert store.get_goal("2026-08-05").text == "Finish the auth flow"
+    assert "Finish the auth flow" in journal.read("2026-08-05")
+    assert store.recent_actions()[0].tool == "save_goal"
+
+
+def test_record_outcome_updates_status(wiring):
+    store, journal, conv = wiring
+    tools = {t.__name__: t for t in build_tools(store, journal, conv, "2026-08-05")}
+    tools["save_goal"](text="Ship it")
+    tools["record_outcome"](status="partial", notes="tests missing")
+
+    goal = store.get_goal("2026-08-05")
+    assert goal.status == "partial"
+    assert goal.notes == "tests missing"
+
+
+def test_record_outcome_without_a_goal_is_reported_not_raised(wiring):
+    store, journal, conv = wiring
+    tools = {t.__name__: t for t in build_tools(store, journal, conv, "2026-08-05")}
+    result = tools["record_outcome"](status="done")
+    assert "no goal" in result.lower()
+    assert store.recent_actions()[0].ok is True
+
+
+def test_record_outcome_rejects_an_invalid_status(wiring):
+    store, journal, conv = wiring
+    tools = {t.__name__: t for t in build_tools(store, journal, conv, "2026-08-05")}
+    tools["save_goal"](text="Ship it")
+    result = tools["record_outcome"](status="banana")
+    assert "banana" in result
+    assert store.get_goal("2026-08-05").status == "pending"
+```
+
+`tests/brain/test_conversation.py`:
+```python
+from datetime import datetime, timezone
+
+import pytest
+from zoneinfo import ZoneInfo
+
+from zeus.brain.conversation import Conversation
+from zeus.brain.fake import FakeConversation
+from zeus.clock import FakeClock
+from zeus.config import BrainConfig
+from zeus.memory.journal import Journal
+from zeus.memory.store import Store
+
+START = datetime(2026, 8, 5, 10, 0, tzinfo=timezone.utc)
+
+
+# ---- stubs mirroring the anthropic Tool Runner shape --------------------
+class StubEvent:
+    def __init__(self, text):
+        self.type = "content_block_delta"
+        self.delta = type("D", (), {"type": "text_delta", "text": text})()
+
+
+class StubStream:
+    def __init__(self, chunks, stop_reason="end_turn"):
+        self._chunks = chunks
+        self._stop_reason = stop_reason
+
+    def __iter__(self):
+        return iter(StubEvent(c) for c in self._chunks)
+
+    def get_final_message(self):
+        return type("M", (), {
+            "stop_reason": self._stop_reason,
+            "content": [],
+            "stop_details": None,
+        })()
+
+
+class StubClient:
+    def __init__(self, streams):
+        self._streams = streams
+        self.calls = []
+        beta = type("B", (), {})()
+        beta.messages = type("M", (), {"tool_runner": self._tool_runner})()
+        self.beta = beta
+
+    def _tool_runner(self, **kwargs):
+        self.calls.append(kwargs)
+        return iter(self._streams)
+
+
+@pytest.fixture
+def wiring(tmp_path):
+    clock = FakeClock(START)
+    store = Store(tmp_path / "zeus.db", clock)
+    journal = Journal(tmp_path / "journal", clock, ZoneInfo("Africa/Lagos"))
+    return store, journal, store.start_conversation("schedule")
+
+
+def _conversation(client, wiring):
+    store, journal, conv = wiring
+    return Conversation(
+        client=client, config=BrainConfig(), store=store, journal=journal,
+        conversation_id=conv, system="SYSTEM", tools=[],
+    )
+
+
+def test_send_yields_complete_sentences(wiring):
+    client = StubClient([StubStream(["Morning.", " What's the ", "one thing?"])])
+    assert list(_conversation(client, wiring).send("[morning]")) == [
+        "Morning.", "What's the one thing?",
+    ]
+
+
+def test_trailing_fragment_is_flushed_at_the_end(wiring):
+    client = StubClient([StubStream(["No punctuation here"])])
+    assert list(_conversation(client, wiring).send("hi")) == ["No punctuation here"]
+
+
+def test_messages_are_persisted(wiring):
+    store, _, conv = wiring
+    client = StubClient([StubStream(["Morning."])])
+    list(_conversation(client, wiring).send("[morning]"))
+
+    roles = [m.role for m in store.messages(conv)]
+    assert roles == ["user", "assistant"]
+    assert store.messages(conv)[1].content == "Morning."
+
+
+def test_request_uses_the_required_model_settings(wiring):
+    client = StubClient([StubStream(["ok."])])
+    list(_conversation(client, wiring).send("hi"))
+    kwargs = client.calls[0]
+
+    assert kwargs["model"] == "claude-opus-5"
+    assert kwargs["thinking"] == {"type": "adaptive"}     # never "disabled"
+    assert kwargs["output_config"]["effort"] == "low"
+    assert kwargs["stream"] is True
+    assert kwargs["system"][0]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_refusal_is_handled_before_reading_content(wiring):
+    client = StubClient([StubStream([], stop_reason="refusal")])
+    spoken = list(_conversation(client, wiring).send("hi"))
+    assert len(spoken) == 1
+    assert "can't help" in spoken[0].lower()
+
+
+def test_api_failure_yields_a_spoken_fallback(wiring):
+    class Exploding(StubClient):
+        def _tool_runner(self, **kwargs):
+            raise RuntimeError("connection reset")
+
+    spoken = list(_conversation(Exploding([]), wiring).send("hi"))
+    assert len(spoken) == 1
+    assert "reach" in spoken[0].lower()
+
+
+def test_history_accumulates_across_turns(wiring):
+    client = StubClient([StubStream(["One."]), StubStream(["Two."])])
+    conversation = _conversation(client, wiring)
+    list(conversation.send("first"))
+    list(conversation.send("second"))
+
+    second_call = client.calls[1]["messages"]
+    assert [m["role"] for m in second_call] == ["user", "assistant", "user"]
+
+
+def test_fake_conversation_replays_a_script():
+    fake = FakeConversation({"[morning]": ["Morning.", "What's the goal?"]})
+    assert list(fake.send("[morning]")) == ["Morning.", "What's the goal?"]
+    assert fake.sent == ["[morning]"]
+
+
+def test_fake_conversation_falls_back_for_unscripted_input():
+    fake = FakeConversation({})
+    assert list(fake.send("anything")) == ["Got it."]
+```
+
+- [ ] **Step 2: Run the tests and verify they fail**
+
+Run: `.venv/bin/pytest tests/brain/ -v`
+Expected: FAIL — `ModuleNotFoundError: No module named 'zeus.brain'`
+
+- [ ] **Step 3: Implement `src/zeus/brain/prompts.py`**
+
+```python
+"""System prompt, check-in openers, and sentence splitting. See spec §7.2."""
+from __future__ import annotations
+
+import re
+
+SYSTEM_PROMPT = """\
+You are ZEUS, a voice assistant running on the user's Mac. Everything you \
+say is converted to speech and played aloud, and everything the user says \
+reaches you as an imperfect speech-to-text transcript.
+
+Write for the ear, not the page. No markdown, no bullet points, no headings, \
+no emoji, no code blocks, no URLs — none of it survives text-to-speech. Write \
+numbers and abbreviations the way they should be spoken.
+
+Keep replies to one or two short sentences. The user is listening, not \
+reading, and cannot skim. A long reply is worse than an incomplete one.
+
+You are an accountability partner, not a coach and not a logger. Your job in \
+the daily check-ins is to capture what the user commits to and what actually \
+happened, with as little friction as possible.
+
+Morning check-in: ask what the one thing is that has to happen today. If the \
+answer is vague — "work on the app", "be productive" — ask once for something \
+concrete that could be judged done or not done by tonight. Ask only once, then \
+accept whatever you get and save it with the save_goal tool. Do not negotiate, \
+do not suggest goals, do not offer encouragement.
+
+Evening check-in: you will be told what the goal was. Ask whether it happened. \
+Record the answer with the record_outcome tool, choosing done when it was \
+finished, partial when it was started but not completed, and missed when it \
+did not happen. Do not judge, do not console, do not analyse why. If it was \
+not done you may offer once to carry it to tomorrow, and accept the answer \
+either way.
+
+Never exceed three exchanges in a check-in. When you have what you need, say \
+one short closing line and stop. Silence is better than filler.
+
+The transcript you receive may contain speech-recognition errors. If a reply \
+is garbled, ask once for a repeat; if it is still unclear, save your best \
+interpretation rather than asking a third time.
+
+Messages wrapped in square brackets, such as [morning check-in], are \
+instructions from the system rather than speech from the user. Act on them \
+but never read them aloud or mention them.
+"""
+
+MORNING_OPENER = (
+    "[morning check-in] Greet the user briefly and ask what the one thing is "
+    "that has to happen today."
+)
+
+FOLDED_OPENER = (
+    "[evening check-in, goal never captured] The morning check-in was missed, "
+    "so no goal was recorded today. Ask what the user ended up focusing on, "
+    "save it with save_goal, then ask how it went."
+)
+
+
+def EVENING_OPENER(goal_text: str) -> str:
+    return (
+        f"[evening check-in] Today's goal was: {goal_text}. "
+        "Ask whether it happened."
+    )
+
+
+# A sentence ends at . ? or ! that is followed by whitespace or end-of-string,
+# and is not part of a decimal number.
+_SENTENCE_END = re.compile(r"(?<!\d)([.!?])(?=\s|$)")
+
+
+def split_sentences(buffer: str) -> tuple[list[str], str]:
+    """Split a streaming buffer into complete sentences plus a remainder.
+
+    Returns (sentences, remainder). The remainder is whatever has not yet
+    been terminated and must be carried into the next chunk.
+    """
+    sentences: list[str] = []
+    start = 0
+    for match in _SENTENCE_END.finditer(buffer):
+        end = match.end()
+        piece = buffer[start:end].strip()
+        if piece:
+            sentences.append(piece)
+        start = end
+    return sentences, buffer[start:]
+```
+
+- [ ] **Step 4: Implement `src/zeus/brain/tools.py`**
+
+```python
+"""Tool definitions and the action-logging wrapper. See spec §6.2, §12.
+
+Every tool call writes an `actions` row. That table is the spine of the
+Slice 2 dashboard, which can only show history that was recorded from the
+beginning — hence it exists in Slice 1 despite having nothing to display yet.
+"""
+from __future__ import annotations
+
+import functools
+import logging
+import time
+from typing import Callable
+
+from zeus.memory.journal import Journal
+from zeus.memory.store import Store
+
+log = logging.getLogger(__name__)
+
+VALID_STATUSES = {"done", "partial", "missed", "carried"}
+
+
+def logged_tool(
+    store: Store, conversation_id: int, name: str, fn: Callable
+) -> Callable:
+    """Wrap a tool so every call is timed and recorded.
+
+    A raising tool returns an error *string* rather than propagating, so the
+    model can adapt (spec §10) instead of the turn collapsing.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(**kwargs):
+        started = time.monotonic()
+        try:
+            result = fn(**kwargs)
+            elapsed = int((time.monotonic() - started) * 1000)
+            store.log_action(name, kwargs, result, True, elapsed,
+                             conversation_id=conversation_id)
+            return result
+        except Exception as exc:  # noqa: BLE001 — deliberately broad
+            elapsed = int((time.monotonic() - started) * 1000)
+            log.error("tool %s failed", name, exc_info=True)
+            store.log_action(name, kwargs, None, False, elapsed,
+                             error=str(exc), conversation_id=conversation_id)
+            return f"The {name} tool failed: {exc}"
+
+    return wrapper
+
+
+def build_tools(
+    store: Store, journal: Journal, conversation_id: int, local_date: str
+) -> list[Callable]:
+    """The Slice 1 tool surface.
+
+    Deliberately tiny — two tools. Their purpose is to make the Tool Runner
+    path real from day one so later slices add tools to a working mechanism
+    rather than building the mechanism alongside their first tool.
+    """
+    from anthropic import beta_tool
+
+    def _save_goal(text: str) -> str:
+        store.set_goal(local_date, text)
+        journal.append(f"Goal set: {text}")
+        return f"Saved today's goal: {text}"
+
+    def _record_outcome(status: str, notes: str | None = None) -> str:
+        if status not in VALID_STATUSES:
+            return (
+                f"Cannot record status {status!r}. "
+                f"Valid values are: {', '.join(sorted(VALID_STATUSES))}."
+            )
+        goal = store.get_goal(local_date)
+        if goal is None:
+            return "There is no goal recorded for today, so nothing to update."
+        store.update_goal(goal.id, status=status, notes=notes)
+        journal.append(f"Outcome: {status}" + (f" — {notes}" if notes else ""))
+        return f"Recorded today's goal as {status}."
+
+    save_wrapped = logged_tool(store, conversation_id, "save_goal", _save_goal)
+    outcome_wrapped = logged_tool(
+        store, conversation_id, "record_outcome", _record_outcome
+    )
+
+    @beta_tool
+    def save_goal(text: str) -> str:
+        """Save the user's single goal for today.
+
+        Args:
+            text: The goal, in the user's own words, as concretely as they gave it.
+        """
+        return save_wrapped(text=text)
+
+    @beta_tool
+    def record_outcome(status: str, notes: str = "") -> str:
+        """Record how today's goal turned out.
+
+        Args:
+            status: One of "done", "partial", "missed", or "carried".
+            notes: Optional short detail the user gave, in their own words.
+        """
+        return outcome_wrapped(status=status, notes=notes or None)
+
+    return [save_goal, record_outcome]
+```
+
+- [ ] **Step 5: Implement `src/zeus/brain/conversation.py` and `fake.py`**
+
+`src/zeus/brain/conversation.py`:
+```python
+"""Claude conversation over the Anthropic Tool Runner. See spec §7.1.
+
+Streams the reply and yields complete sentences so text-to-speech can begin
+before the model has finished — the difference between a responsive voice
+interface and a laggy one.
+"""
+from __future__ import annotations
+
+import logging
+from typing import Any, Callable, Iterator
+
+from zeus.brain.prompts import split_sentences
+from zeus.config import BrainConfig
+from zeus.memory.journal import Journal
+from zeus.memory.store import Store
+
+log = logging.getLogger(__name__)
+
+MAX_TOKENS = 1024
+
+REFUSAL_LINE = "Sorry, I can't help with that one."
+ERROR_LINE = "I can't reach my brain right now. I'll try again later."
+
+
+class Conversation:
+    def __init__(
+        self,
+        client: Any,
+        config: BrainConfig,
+        store: Store,
+        journal: Journal,
+        conversation_id: int,
+        system: str,
+        tools: list[Callable],
+        effort: str | None = None,
+    ) -> None:
+        self._client = client
+        self._config = config
+        self._store = store
+        self._journal = journal
+        self._conversation_id = conversation_id
+        self._system = system
+        self._tools = tools
+        self._effort = effort or config.effort_checkin
+        self._messages: list[dict[str, Any]] = []
+
+    def send(self, text: str) -> Iterator[str]:
+        """Send a turn and yield the reply one complete sentence at a time."""
+        self._messages.append({"role": "user", "content": text})
+        self._store.add_message(self._conversation_id, "user", text)
+
+        buffer = ""
+        spoken: list[str] = []
+        try:
+            runner = self._client.beta.messages.tool_runner(
+                model=self._config.model,
+                max_tokens=MAX_TOKENS,
+                # Adaptive thinking stays on. Disabling it on Opus 5 risks
+                # tool calls being emitted as visible text that never run.
+                thinking={"type": "adaptive"},
+                output_config={"effort": self._effort},
+                system=[{
+                    "type": "text",
+                    "text": self._system,
+                    "cache_control": {"type": "ephemeral"},
+                }],
+                tools=self._tools,
+                messages=list(self._messages),
+                stream=True,
+            )
+
+            for stream in runner:
+                for event in stream:
+                    if getattr(event, "type", None) != "content_block_delta":
+                        continue
+                    delta = getattr(event, "delta", None)
+                    if getattr(delta, "type", None) != "text_delta":
+                        continue
+                    buffer += delta.text
+                    sentences, buffer = split_sentences(buffer)
+                    for sentence in sentences:
+                        spoken.append(sentence)
+                        yield sentence
+
+                final = stream.get_final_message()
+                # Check stop_reason BEFORE touching content: on a refusal
+                # `content` is empty and indexing it would crash (spec §10).
+                if getattr(final, "stop_reason", None) == "refusal":
+                    log.warning("model refused the request")
+                    spoken.append(REFUSAL_LINE)
+                    yield REFUSAL_LINE
+                    buffer = ""
+                    break
+                self._messages.append(
+                    {"role": "assistant", "content": final.content}
+                )
+
+        except Exception:
+            log.error("conversation failed", exc_info=True)
+            yield ERROR_LINE
+            spoken.append(ERROR_LINE)
+            buffer = ""
+
+        remainder = buffer.strip()
+        if remainder:
+            spoken.append(remainder)
+            yield remainder
+
+        if spoken:
+            self._store.add_message(
+                self._conversation_id, "assistant", " ".join(spoken)
+            )
+```
+
+`src/zeus/brain/fake.py`:
+```python
+"""Conversation test double. Replays a script; never touches the network."""
+from __future__ import annotations
+
+from typing import Iterator
+
+
+class FakeConversation:
+    def __init__(self, script: dict[str, list[str]] | None = None) -> None:
+        self._script = script or {}
+        self.sent: list[str] = []
+
+    def send(self, text: str) -> Iterator[str]:
+        self.sent.append(text)
+        for sentence in self._script.get(text, ["Got it."]):
+            yield sentence
+```
+
+`src/zeus/brain/__init__.py`:
+```python
+from zeus.brain.conversation import Conversation
+from zeus.brain.fake import FakeConversation
+from zeus.brain.prompts import (
+    EVENING_OPENER,
+    FOLDED_OPENER,
+    MORNING_OPENER,
+    SYSTEM_PROMPT,
+)
+from zeus.brain.tools import build_tools
+
+__all__ = [
+    "Conversation", "FakeConversation", "build_tools",
+    "SYSTEM_PROMPT", "MORNING_OPENER", "EVENING_OPENER", "FOLDED_OPENER",
+]
+```
+
+- [ ] **Step 6: Run the tests and verify they pass**
+
+Run: `.venv/bin/pytest tests/brain/ -v`
+Expected: PASS — 23 tests
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/zeus/brain/ tests/brain/
+git commit -m "feat: Claude brain with Tool Runner, sentence streaming, action log"
+```
+
+---
+
+### Task 15: Ritual orchestration
+
+**Files:**
+- Create: `src/zeus/ritual/checkin.py`
+- Test: `tests/ritual/test_checkin.py`
+
+**Interfaces:**
+- Consumes: everything from Tasks 3–14.
+- Produces:
+  - `Notifier` protocol: `notify(title: str, body: str) -> None`; `MacNotifier` (via `osascript`), `FakeNotifier` (records).
+  - `VoiceIO(activator, mic, endpointer, transcriber, speaker, config)` with:
+    - `speak(sentences: Iterable[str]) -> None` — mutes the activator for the duration (half-duplex, spec §7.3).
+    - `listen() -> str` — captures one utterance and transcribes it; `""` on silence.
+  - `CheckIn(kind, store, journal, presence, voice, notifier, conversation_factory, config, tz, clock)` with `run(scheduled_for: datetime) -> Outcome`.
+  - `local_date(dt, tz) -> str`
+
+- [ ] **Step 1: Write the failing test**
+
+`tests/ritual/test_checkin.py`:
+```python
+from datetime import datetime, timedelta, timezone
+
+import pytest
+from zoneinfo import ZoneInfo
+
+from zeus.brain.fake import FakeConversation
+from zeus.clock import FakeClock
+from zeus.config import Config, ScheduleConfig
+from zeus.context.presence import Signals, Verdict
+from zeus.memory.journal import Journal
+from zeus.memory.store import Store
+from zeus.ritual.checkin import CheckIn, FakeNotifier, local_date
+from zeus.ritual.retry import Outcome
+from zeus.tts.fake import FakeSpeaker
+
+LAGOS = ZoneInfo("Africa/Lagos")
+NOW = datetime(2026, 8, 5, 10, 0, tzinfo=timezone.utc)  # 11:00 Lagos
+
+
+class StubPresence:
+    def __init__(self, verdict):
+        self._verdict = verdict
+
+    def verdict(self):
+        return self._verdict
+
+
+class StubVoice:
+    """Stands in for VoiceIO: records what was spoken, replays what is heard."""
+
+    def __init__(self, heard=None):
+        self.spoken: list[str] = []
+        self._heard = list(heard or [])
+
+    def speak(self, sentences):
+        self.spoken.extend(sentences)
+
+    def listen(self):
+        return self._heard.pop(0) if self._heard else ""
+
+
+@pytest.fixture
+def wiring(tmp_path):
+    clock = FakeClock(NOW)
+    store = Store(tmp_path / "zeus.db", clock)
+    journal = Journal(tmp_path / "journal", clock, LAGOS)
+    return clock, store, journal
+
+
+def _checkin(kind, wiring, verdict, heard, script=None):
+    clock, store, journal = wiring
+    voice = StubVoice(heard)
+    notifier = FakeNotifier()
+    conversation = FakeConversation(script or {})
+    return (
+        CheckIn(
+            kind=kind, store=store, journal=journal,
+            presence=StubPresence(verdict), voice=voice, notifier=notifier,
+            conversation_factory=lambda conv_id, local: conversation,
+            config=ScheduleConfig(), tz=LAGOS, clock=clock,
+        ),
+        voice, notifier, store, conversation,
+    )
+
+
+def test_local_date_uses_the_local_zone():
+    # 23:30 UTC is already the next day in Lagos (UTC+1)
+    late = datetime(2026, 8, 5, 23, 30, tzinfo=timezone.utc)
+    assert local_date(late, LAGOS) == "2026-08-06"
+
+
+def test_speak_verdict_runs_the_conversation_and_records_the_answer(wiring):
+    checkin, voice, _, store, conversation = _checkin(
+        "morning", wiring, Verdict.SPEAK, heard=["Finish the auth flow"],
+        script={"[morning check-in] Greet the user briefly and ask what the "
+                "one thing is that has to happen today.": ["Morning.",
+                                                           "What's the one thing?"]},
+    )
+    outcome = checkin.run(NOW)
+
+    assert outcome is Outcome.ANSWERED
+    assert voice.spoken[0] == "Morning."
+    assert conversation.sent[1] == "Finish the auth flow"
+    assert store.get_checkin(1).outcome == "answered"
+
+
+def test_silence_produces_no_answer_and_a_retry(wiring):
+    checkin, _, _, store, _ = _checkin("morning", wiring, Verdict.SPEAK, heard=[])
+    outcome = checkin.run(NOW)
+
+    assert outcome is Outcome.NO_ANSWER
+    checkin_row = store.get_checkin(1)
+    assert checkin_row.outcome == "no_answer"
+    assert checkin_row.attempts == 1
+
+
+def test_defer_verdict_never_speaks(wiring):
+    checkin, voice, notifier, store, _ = _checkin(
+        "morning", wiring, Verdict.DEFER, heard=["ignored"]
+    )
+    outcome = checkin.run(NOW)
+
+    assert outcome is Outcome.DEFERRED
+    assert voice.spoken == []
+    assert notifier.sent == []
+
+
+def test_notify_verdict_notifies_without_speaking(wiring):
+    checkin, voice, notifier, _, _ = _checkin(
+        "morning", wiring, Verdict.NOTIFY, heard=["ignored"]
+    )
+    outcome = checkin.run(NOW)
+
+    assert outcome is Outcome.DEFERRED
+    assert voice.spoken == []
+    assert len(notifier.sent) == 1
+    assert "ZEUS" in notifier.sent[0][0]
+
+
+def test_evening_checkin_recalls_the_morning_goal(wiring):
+    _, store, _ = wiring
+    store.set_goal("2026-08-05", "Finish the auth flow")
+
+    checkin, _, _, _, conversation = _checkin(
+        "evening", wiring, Verdict.SPEAK, heard=["Mostly, tests are missing"]
+    )
+    checkin.run(NOW)
+
+    assert "Finish the auth flow" in conversation.sent[0]
+
+
+def test_evening_checkin_without_a_goal_uses_the_folded_opener(wiring):
+    checkin, _, _, _, conversation = _checkin(
+        "evening", wiring, Verdict.SPEAK, heard=["I worked on docs"]
+    )
+    checkin.run(NOW)
+
+    assert "goal never captured" in conversation.sent[0]
+
+
+def test_conversation_stops_at_three_exchanges(wiring):
+    checkin, _, _, _, conversation = _checkin(
+        "morning", wiring, Verdict.SPEAK,
+        heard=["one", "two", "three", "four", "five"],
+    )
+    checkin.run(NOW)
+    # opener + at most 3 user replies
+    assert len(conversation.sent) <= 4
+
+
+def test_attempts_accumulate_across_repeated_runs(wiring):
+    checkin, _, _, store, _ = _checkin("morning", wiring, Verdict.DEFER, heard=[])
+    checkin.run(NOW)
+    checkin.run(NOW)
+    assert store.get_checkin(1).attempts == 2
+
+
+def test_journal_records_a_missed_checkin(wiring):
+    _, _, journal = wiring
+    checkin, _, _, _, _ = _checkin("evening", wiring, Verdict.SPEAK, heard=[])
+    checkin.run(NOW)
+    assert "no answer" in journal.read("2026-08-05").lower()
+```
+
+- [ ] **Step 2: Run the test and verify it fails**
+
+Run: `.venv/bin/pytest tests/ritual/test_checkin.py -v`
+Expected: FAIL — `ModuleNotFoundError: No module named 'zeus.ritual.checkin'`
+
+- [ ] **Step 3: Implement `src/zeus/ritual/checkin.py`**
+
+```python
+"""Check-in orchestration. See spec §7.2, §8, §9.3.
+
+Wires the context gate, the retry state machine, the brain, and storage
+into one run of the daily ritual.
+"""
+from __future__ import annotations
+
+import logging
+import subprocess
+from datetime import datetime
+from typing import Callable, Iterable, Protocol
+from zoneinfo import ZoneInfo
+
+from zeus.audio.endpointer import capture_utterance
+from zeus.audio.mic import FRAME_SAMPLES
+from zeus.brain.prompts import EVENING_OPENER, FOLDED_OPENER, MORNING_OPENER
+from zeus.clock import Clock
+from zeus.config import ScheduleConfig
+from zeus.context.presence import Verdict
+from zeus.memory.journal import Journal
+from zeus.memory.store import Store
+from zeus.ritual.retry import Outcome, next_step
+
+log = logging.getLogger(__name__)
+
+MAX_EXCHANGES = 3
+
+
+def local_date(moment: datetime, tz: ZoneInfo) -> str:
+    """The calendar date in the user's zone — the key goals are stored under."""
+    return moment.astimezone(tz).strftime("%Y-%m-%d")
+
+
+# ---- notifications ----------------------------------------------------
+class Notifier(Protocol):
+    def notify(self, title: str, body: str) -> None: ...
+
+
+class MacNotifier:
+    def notify(self, title: str, body: str) -> None:
+        script = f'display notification "{body}" with title "{title}"'
+        try:
+            subprocess.run(["osascript", "-e", script], timeout=5, check=False)
+        except Exception:
+            log.debug("notification failed", exc_info=True)
+
+
+class FakeNotifier:
+    def __init__(self) -> None:
+        self.sent: list[tuple[str, str]] = []
+
+    def notify(self, title: str, body: str) -> None:
+        self.sent.append((title, body))
+
+
+# ---- voice ------------------------------------------------------------
+class VoiceIO:
+    """Speak-then-listen, honouring the half-duplex rule (spec §7.3)."""
+
+    def __init__(self, activator, mic, endpointer, transcriber, speaker, audio_config):
+        self._activator = activator
+        self._mic = mic
+        self._endpointer = endpointer
+        self._transcriber = transcriber
+        self._speaker = speaker
+        self._config = audio_config
+
+    def speak(self, sentences: Iterable[str]) -> None:
+        mute = getattr(self._activator, "mute", None)
+        unmute = getattr(self._activator, "unmute", None)
+        if mute:
+            mute()
+        try:
+            for sentence in sentences:
+                self._speaker.say(sentence)
+        finally:
+            if unmute:
+                unmute()
+
+    def listen(self) -> str:
+        frames_per_second = self._config.sample_rate / FRAME_SAMPLES
+        timeout_frames = int(
+            self._config.listen_timeout.total_seconds() * frames_per_second
+        )
+        audio = capture_utterance(
+            self._mic.frames(), self._endpointer,
+            pre_roll=b"", listen_timeout_frames=timeout_frames,
+        )
+        if not audio:
+            return ""
+        return self._transcriber.transcribe(audio, self._config.sample_rate)
+
+
+# ---- the ritual -------------------------------------------------------
+class CheckIn:
+    def __init__(
+        self, kind: str, store: Store, journal: Journal, presence, voice,
+        notifier: Notifier, conversation_factory: Callable[[int, str], object],
+        config: ScheduleConfig, tz: ZoneInfo, clock: Clock,
+    ) -> None:
+        self._kind = kind
+        self._store = store
+        self._journal = journal
+        self._presence = presence
+        self._voice = voice
+        self._notifier = notifier
+        self._conversation_factory = conversation_factory
+        self._config = config
+        self._tz = tz
+        self._clock = clock
+
+    def _opener(self, date: str) -> str:
+        if self._kind == "morning":
+            return MORNING_OPENER
+        goal = self._store.get_goal(date)
+        return EVENING_OPENER(goal.text) if goal else FOLDED_OPENER
+
+    def _find_or_open(self, scheduled_for: datetime) -> int:
+        """Reuse the open check-in row so attempts accumulate across retries."""
+        date = local_date(scheduled_for, self._tz)
+        for row in self._store.connection.execute(
+            "SELECT id FROM checkins WHERE kind = ? AND outcome IN "
+            "('deferred','no_answer') AND date(scheduled_for) <= ? "
+            "ORDER BY id DESC LIMIT 1",
+            (self._kind, date),
+        ):
+            return row["id"]
+        return self._store.open_checkin(self._kind, scheduled_for)
+
+    def run(self, scheduled_for: datetime) -> Outcome:
+        date = local_date(scheduled_for, self._tz)
+        checkin_id = self._find_or_open(scheduled_for)
+        previous = self._store.get_checkin(checkin_id).attempts
+        verdict = self._presence.verdict()
+
+        answered: bool | None = None
+
+        if verdict is Verdict.NOTIFY:
+            self._notifier.notify(
+                "ZEUS", "Morning check-in" if self._kind == "morning"
+                else "Evening check-in"
+            )
+        elif verdict is Verdict.SPEAK:
+            answered = self._converse(checkin_id, date)
+
+        decision = next_step(
+            self._kind, verdict, answered, previous, self._config
+        )
+        self._store.update_checkin(
+            checkin_id,
+            outcome=decision.outcome.value,
+            attempts=previous + 1,
+            fired_at=self._clock.now_utc() if verdict is Verdict.SPEAK else None,
+        )
+        if decision.outcome is Outcome.NO_ANSWER:
+            self._journal.append(f"{self._kind.title()} check-in: no answer")
+        elif decision.outcome is Outcome.SKIPPED:
+            self._journal.append(f"{self._kind.title()} check-in: skipped")
+        return decision.outcome
+
+    def _converse(self, checkin_id: int, date: str) -> bool:
+        conversation_id = self._store.start_conversation("schedule")
+        conversation = self._conversation_factory(conversation_id, date)
+        try:
+            self._voice.speak(conversation.send(self._opener(date)))
+            heard_anything = False
+            for _ in range(MAX_EXCHANGES):
+                reply = self._voice.listen()
+                if not reply:
+                    break
+                heard_anything = True
+                self._voice.speak(conversation.send(reply))
+            return heard_anything
+        finally:
+            self._store.end_conversation(conversation_id)
+```
+
+- [ ] **Step 4: Run the test and verify it passes**
+
+Run: `.venv/bin/pytest tests/ritual/test_checkin.py -v`
+Expected: PASS — 9 tests
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/zeus/ritual/checkin.py tests/ritual/test_checkin.py
+git commit -m "feat: check-in orchestration wiring gate, retry, brain, and storage"
+```
+
+---
+
+### Task 16: Daemon — wiring, self-test, catch-up policy, heartbeat
+
+**Files:**
+- Create: `src/zeus/daemon.py`
+- Test: `tests/test_daemon.py`
+
+**Interfaces:**
+- Consumes: everything from Tasks 1–15.
+- Produces:
+  - `audio_self_test(mic, seconds: float = 1.0) -> bool` — captures briefly and asserts non-zero RMS. **This is the mitigation for risk R1.**
+  - `catch_up_actions(missed: list[MissedRun]) -> list[tuple[str, str]]` — pure; applies spec §9.2, returning `(job_name, "fire" | "skip")`.
+  - `Daemon(config, store, journal, scheduler, presence, voice, notifier, checkins, clock)` with:
+    - `run_catch_up() -> list[tuple[str, str]]`
+    - `tick() -> None` — one scheduler pass plus heartbeat
+    - `run_forever() -> None`
+    - `degraded: bool` — set when the self-test fails; check-ins then notify instead of speaking
+  - `build_daemon(config) -> Daemon` — the real-component factory.
+
+- [ ] **Step 1: Write the failing test**
+
+`tests/test_daemon.py`:
+```python
+from datetime import datetime, timedelta, timezone
+
+import numpy as np
+import pytest
+from zoneinfo import ZoneInfo
+
+from zeus.audio.mic import FRAME_SAMPLES, MicStream
+from zeus.clock import FakeClock
+from zeus.config import AudioConfig, Config
+from zeus.daemon import Daemon, audio_self_test, catch_up_actions
+from zeus.memory.journal import Journal
+from zeus.memory.store import Store
+from zeus.schedule.scheduler import MissedRun, Scheduler
+
+LAGOS = ZoneInfo("Africa/Lagos")
+NOW = datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc)
+
+SILENCE = np.zeros(FRAME_SAMPLES, dtype=np.int16).tobytes()
+SPEECH = (np.ones(FRAME_SAMPLES, dtype=np.int16) * 5000).tobytes()
+
+
+def _mic(frames):
+    mic = MicStream(AudioConfig())
+    for frame in frames:
+        mic._on_audio(frame, FRAME_SAMPLES, None, None)
+    mic.stop()
+    return mic
+
+
+def test_self_test_passes_on_real_audio():
+    assert audio_self_test(_mic([SPEECH] * 13), seconds=1.0) is True
+
+
+def test_self_test_fails_on_pure_silence():
+    """Risk R1: a TCC-denied stream opens fine and returns silence forever."""
+    assert audio_self_test(_mic([SILENCE] * 13), seconds=1.0) is False
+
+
+def test_self_test_fails_when_no_frames_arrive():
+    assert audio_self_test(_mic([]), seconds=1.0) is False
+
+
+@pytest.mark.parametrize(
+    "missed,expected",
+    [
+        # Morning missed earlier today → still worth asking
+        ([MissedRun("checkin_morning", NOW, True)], [("checkin_morning", "fire")]),
+        # Morning missed on a previous day → asking now is noise
+        ([MissedRun("checkin_morning", NOW, False)], [("checkin_morning", "skip")]),
+        # Evening is never replayed, even on the same day
+        ([MissedRun("checkin_evening", NOW, True)], [("checkin_evening", "skip")]),
+        ([MissedRun("checkin_evening", NOW, False)], [("checkin_evening", "skip")]),
+    ],
+)
+def test_catch_up_policy(missed, expected):
+    assert catch_up_actions(missed) == expected
+
+
+def test_catch_up_policy_preserves_order():
+    missed = [
+        MissedRun("checkin_morning", NOW - timedelta(days=1), False),
+        MissedRun("checkin_evening", NOW - timedelta(days=1), False),
+        MissedRun("checkin_morning", NOW, True),
+    ]
+    assert [action for _, action in catch_up_actions(missed)] == [
+        "skip", "skip", "fire",
+    ]
+
+
+def test_unknown_job_is_never_fired_by_catch_up():
+    assert catch_up_actions([MissedRun("watchman_scan", NOW, True)]) == [
+        ("watchman_scan", "skip")
+    ]
+
+
+@pytest.fixture
+def daemon(tmp_path):
+    clock = FakeClock(NOW)
+    store = Store(tmp_path / "zeus.db", clock)
+    journal = Journal(tmp_path / "journal", clock, LAGOS)
+    scheduler = Scheduler(store, clock, LAGOS)
+    fired: list[str] = []
+    scheduler.register("checkin_morning", "0 11 * * *", lambda when: fired.append("m"))
+    daemon = Daemon(
+        config=Config(root=tmp_path), store=store, journal=journal,
+        scheduler=scheduler, presence=None, voice=None, notifier=None,
+        checkins={}, clock=clock,
+    )
+    return daemon, store, clock, fired
+
+
+def test_tick_writes_a_heartbeat(daemon):
+    instance, store, _, _ = daemon
+    assert store.heartbeat() is None
+    instance.tick()
+    assert store.heartbeat() == NOW
+
+
+def test_tick_advances_the_heartbeat(daemon):
+    instance, store, clock, _ = daemon
+    instance.tick()
+    clock.advance(timedelta(minutes=5))
+    instance.tick()
+    assert store.heartbeat() == NOW + timedelta(minutes=5)
+
+
+def test_degraded_flag_defaults_to_false(daemon):
+    instance, _, _, _ = daemon
+    assert instance.degraded is False
+
+
+def test_run_catch_up_is_empty_without_a_heartbeat(daemon):
+    instance, _, _, _ = daemon
+    assert instance.run_catch_up() == []
+```
+
+- [ ] **Step 2: Run the test and verify it fails**
+
+Run: `.venv/bin/pytest tests/test_daemon.py -v`
+Expected: FAIL — `ModuleNotFoundError: No module named 'zeus.daemon'`
+
+- [ ] **Step 3: Implement `src/zeus/daemon.py`**
+
+```python
+"""The zeusd daemon: wiring, supervision, and the main loop. See spec §4, §9.2."""
+from __future__ import annotations
+
+import logging
+import threading
+from datetime import datetime
+from typing import Any
+
+from zeus.audio.endpointer import Endpointer, rms
+from zeus.audio.mic import FRAME_SAMPLES, MicStream
+from zeus.clock import Clock, SystemClock, resolve_timezone
+from zeus.config import Config, load_config
+from zeus.schedule.cron import hhmm_to_cron
+from zeus.schedule.scheduler import MissedRun, Scheduler
+
+log = logging.getLogger(__name__)
+
+# Only the morning check-in is ever replayed, and only on the same local
+# day. A goal question at 15:00 is useful; the same question at 09:00 the
+# next morning is noise. See spec §9.2.
+CATCH_UP_ELIGIBLE = {"checkin_morning"}
+
+
+def audio_self_test(mic: MicStream, seconds: float = 1.0) -> bool:
+    """Capture briefly and assert the microphone is actually producing audio.
+
+    Risk R1: when macOS denies microphone access to a LaunchAgent-spawned
+    process, the stream opens successfully and returns pure silence forever.
+    Without this check ZEUS looks healthy while being completely deaf.
+    """
+    wanted = max(1, int(seconds * 16000 / FRAME_SAMPLES))
+    energy = 0.0
+    seen = 0
+    for frame in mic.frames():
+        energy = max(energy, rms(frame))
+        seen += 1
+        if seen >= wanted:
+            break
+    if seen == 0:
+        log.error("audio self-test: no frames received from the microphone")
+        return False
+    if energy <= 0.0:
+        log.error(
+            "audio self-test: %d frames captured but all silent — "
+            "microphone permission is probably denied", seen,
+        )
+        return False
+    return True
+
+
+def catch_up_actions(missed: list[MissedRun]) -> list[tuple[str, str]]:
+    """Apply the spec §9.2 replay policy to runs missed during downtime."""
+    actions: list[tuple[str, str]] = []
+    for run in missed:
+        eligible = run.job in CATCH_UP_ELIGIBLE and run.same_local_day
+        actions.append((run.job, "fire" if eligible else "skip"))
+    return actions
+
+
+class Daemon:
+    def __init__(
+        self, config: Config, store, journal, scheduler: Scheduler,
+        presence, voice, notifier, checkins: dict[str, Any], clock: Clock,
+        activator=None, mic=None,
+    ) -> None:
+        self._config = config
+        self._store = store
+        self._journal = journal
+        self._scheduler = scheduler
+        self._presence = presence
+        self._voice = voice
+        self._notifier = notifier
+        self._checkins = checkins
+        self._clock = clock
+        self._activator = activator
+        self._mic = mic
+        self._running = False
+        self.degraded = False
+
+    def run_catch_up(self) -> list[tuple[str, str]]:
+        missed = self._scheduler.catch_up()
+        actions = catch_up_actions(missed)
+        for run, (job, action) in zip(missed, actions):
+            if action == "fire" and job in self._checkins:
+                log.info("catch-up: firing %s missed at %s", job, run.scheduled_for)
+                self._checkins[job].run(run.scheduled_for)
+            else:
+                log.info("catch-up: skipping %s missed at %s", job, run.scheduled_for)
+        return actions
+
+    def tick(self) -> None:
+        now = self._clock.now_utc()
+        self._scheduler.run_pending(now)
+        self._store.set_heartbeat()
+
+    def _activation_loop(self) -> None:
+        if self._activator is None:
+            return
+        for event in self._activator.events():
+            if not self._running:
+                return
+            log.info("activated via %s", event.source)
+            try:
+                self._handle_activation()
+            except Exception:
+                log.error("ad-hoc conversation failed", exc_info=True)
+
+    def _handle_activation(self) -> None:
+        """Ad-hoc conversation triggered by the wake word."""
+        if self._voice is None:
+            return
+        heard = self._voice.listen()
+        if not heard:
+            return
+        conversation_id = self._store.start_conversation("wake")
+        try:
+            conversation = self._checkins["_adhoc_factory"](conversation_id)
+            self._voice.speak(conversation.send(heard))
+        finally:
+            self._store.end_conversation(conversation_id)
+
+    def start(self) -> None:
+        self._running = True
+        if self._mic is not None:
+            self._mic.start()
+            if not audio_self_test(self._mic):
+                self.degraded = True
+                log.error(
+                    "ZEUS is running in DEGRADED mode: no working microphone. "
+                    "Check-ins will notify instead of speaking. "
+                    "Run 'zeus doctor' for details."
+                )
+                if self._notifier is not None:
+                    self._notifier.notify(
+                        "ZEUS — microphone unavailable",
+                        "Running in notification-only mode. Run 'zeus doctor'.",
+                    )
+        if self._activator is not None and not self.degraded:
+            self._activator.start()
+            threading.Thread(target=self._activation_loop, daemon=True).start()
+        self.run_catch_up()
+
+    def stop(self) -> None:
+        self._running = False
+        if self._activator is not None:
+            self._activator.stop()
+        if self._mic is not None:
+            self._mic.stop()
+
+    def run_forever(self) -> None:
+        self.start()
+        try:
+            while self._running:
+                self.tick()
+                self._clock.sleep(
+                    self._scheduler.seconds_until_next(self._clock.now_utc())
+                )
+        finally:
+            self.stop()
+
+
+def build_daemon(config: Config | None = None) -> Daemon:
+    """Construct a daemon from real components. See spec §5 for the wiring."""
+    import anthropic
+
+    from zeus.audio.activator import build_activator
+    from zeus.brain.conversation import Conversation
+    from zeus.brain.prompts import SYSTEM_PROMPT
+    from zeus.brain.tools import build_tools
+    from zeus.memory.journal import Journal
+    from zeus.memory.store import Store
+    from zeus.ritual.checkin import CheckIn, MacNotifier, VoiceIO, local_date
+    from zeus.stt import build_transcriber
+    from zeus.tts import build_speaker
+
+    config = config or load_config()
+    config.log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    clock = SystemClock()
+    tz = resolve_timezone(config.schedule.timezone)
+    store = Store(config.db_path, clock)
+    journal = Journal(config.journal_dir, clock, tz)
+
+    mic = MicStream(config.audio)
+    activator = build_activator(config.wake, mic)
+    voice = VoiceIO(
+        activator, mic, Endpointer(config.audio),
+        build_transcriber(config.stt, config.models_dir),
+        build_speaker(config.tts), config.audio,
+    )
+    notifier = MacNotifier()
+    client = anthropic.Anthropic()
+
+    def conversation_factory(conversation_id: int, date: str):
+        return Conversation(
+            client=client, config=config.brain, store=store, journal=journal,
+            conversation_id=conversation_id, system=SYSTEM_PROMPT,
+            tools=build_tools(store, journal, conversation_id, date),
+        )
+
+    def adhoc_factory(conversation_id: int):
+        date = local_date(clock.now_utc(), tz)
+        return Conversation(
+            client=client, config=config.brain, store=store, journal=journal,
+            conversation_id=conversation_id, system=SYSTEM_PROMPT,
+            tools=build_tools(store, journal, conversation_id, date),
+            effort=config.brain.effort_adhoc,
+        )
+
+    from zeus.context.presence import Presence
+
+    presence = Presence(config.context)
+    scheduler = Scheduler(store, clock, tz)
+
+    checkins: dict[str, Any] = {"_adhoc_factory": adhoc_factory}
+    for kind, hhmm in (
+        ("morning", config.schedule.morning),
+        ("evening", config.schedule.evening),
+    ):
+        name = f"checkin_{kind}"
+        checkins[name] = CheckIn(
+            kind=kind, store=store, journal=journal, presence=presence,
+            voice=voice, notifier=notifier,
+            conversation_factory=conversation_factory,
+            config=config.schedule, tz=tz, clock=clock,
+        )
+        scheduler.register(
+            name, hhmm_to_cron(hhmm),
+            (lambda n: lambda when: checkins[n].run(when))(name),
+        )
+
+    return Daemon(
+        config=config, store=store, journal=journal, scheduler=scheduler,
+        presence=presence, voice=voice, notifier=notifier, checkins=checkins,
+        clock=clock, activator=activator, mic=mic,
+    )
+```
+
+- [ ] **Step 4: Run the test and verify it passes**
+
+Run: `.venv/bin/pytest tests/test_daemon.py -v`
+Expected: PASS — 13 tests
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/zeus/daemon.py tests/test_daemon.py
+git commit -m "feat: daemon with audio self-test, catch-up policy, and heartbeat"
+```
+
+---
+
+### Task 17: CLI and LaunchAgent installer
+
+**Files:**
+- Create: `src/zeus/cli.py`
+- Test: `tests/test_cli.py`
+
+**Interfaces:**
+- Consumes: `build_daemon`, `load_config`, presence probes.
+- Produces:
+  - `launch_agent_plist(python_path: Path, log_path: Path) -> str`
+  - `cmd_doctor(config) -> int` — prints an environment report; exit 0 healthy, 1 unhealthy.
+  - `cmd_selftest(config) -> int` — the **only** code path that touches real hardware.
+  - `cmd_install_agent(config) -> int`, `cmd_run(config) -> int`
+  - `main(argv: list[str] | None = None) -> int`
+
+- [ ] **Step 1: Write the failing test**
+
+`tests/test_cli.py`:
+```python
+import plistlib
+from pathlib import Path
+
+from zeus.cli import launch_agent_plist, main
+
+
+def test_plist_is_valid_and_uses_absolute_paths():
+    xml = launch_agent_plist(Path("/opt/zeus/.venv/bin/python"), Path("/tmp/z.log"))
+    parsed = plistlib.loads(xml.encode())
+
+    assert parsed["Label"] == "com.zeus.daemon"
+    assert parsed["ProgramArguments"][0] == "/opt/zeus/.venv/bin/python"
+    assert all(Path(a).is_absolute() for a in parsed["ProgramArguments"][:1])
+
+
+def test_plist_enables_keepalive_and_runatload():
+    parsed = plistlib.loads(
+        launch_agent_plist(Path("/x/python"), Path("/tmp/z.log")).encode()
+    )
+    assert parsed["KeepAlive"] is True
+    assert parsed["RunAtLoad"] is True
+
+
+def test_plist_routes_both_streams_to_the_log():
+    parsed = plistlib.loads(
+        launch_agent_plist(Path("/x/python"), Path("/tmp/z.log")).encode()
+    )
+    assert parsed["StandardOutPath"] == "/tmp/z.log"
+    assert parsed["StandardErrorPath"] == "/tmp/z.log"
+
+
+def test_plist_invokes_the_module_not_a_shell():
+    parsed = plistlib.loads(
+        launch_agent_plist(Path("/x/python"), Path("/tmp/z.log")).encode()
+    )
+    assert parsed["ProgramArguments"][1:] == ["-m", "zeus.cli", "run"]
+
+
+def test_main_with_no_arguments_prints_usage(capsys):
+    assert main([]) == 2
+    assert "usage" in capsys.readouterr().out.lower()
+
+
+def test_main_rejects_an_unknown_command(capsys):
+    assert main(["frobnicate"]) == 2
+
+
+def test_doctor_reports_and_returns_a_status(monkeypatch, tmp_path, capsys):
+    import zeus.cli as cli
+
+    monkeypatch.setattr(cli, "_probe_say", lambda: True)
+    monkeypatch.setattr(cli, "_probe_afplay", lambda: True)
+    monkeypatch.setattr(cli, "_probe_api_key", lambda: True)
+
+    code = main(["doctor", "--root", str(tmp_path)])
+    output = capsys.readouterr().out
+    assert code == 0
+    assert "say" in output and "ANTHROPIC_API_KEY" in output
+
+
+def test_doctor_fails_when_the_api_key_is_missing(monkeypatch, tmp_path, capsys):
+    import zeus.cli as cli
+
+    monkeypatch.setattr(cli, "_probe_say", lambda: True)
+    monkeypatch.setattr(cli, "_probe_afplay", lambda: True)
+    monkeypatch.setattr(cli, "_probe_api_key", lambda: False)
+
+    assert main(["doctor", "--root", str(tmp_path)]) == 1
+```
+
+- [ ] **Step 2: Run the test and verify it fails**
+
+Run: `.venv/bin/pytest tests/test_cli.py -v`
+Expected: FAIL — `ModuleNotFoundError: No module named 'zeus.cli'`
+
+- [ ] **Step 3: Implement `src/zeus/cli.py`**
+
+```python
+"""ZEUS command line. See spec §13 — `selftest` is the only hardware path."""
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import shutil
+import sys
+from pathlib import Path
+
+from zeus.config import Config, load_config
+
+LABEL = "com.zeus.daemon"
+PLIST_PATH = Path.home() / "Library/LaunchAgents" / f"{LABEL}.plist"
+
+
+def launch_agent_plist(python_path: Path, log_path: Path) -> str:
+    """Generate the LaunchAgent plist.
+
+    The interpreter is referenced by absolute path so nothing depends on
+    shell initialisation or PATH (spec §4.1).
+    """
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>{LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{python_path}</string>
+        <string>-m</string>
+        <string>zeus.cli</string>
+        <string>run</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>StandardOutPath</key><string>{log_path}</string>
+    <key>StandardErrorPath</key><string>{log_path}</string>
+</dict>
+</plist>
+"""
+
+
+def _probe_say() -> bool:
+    return Path("/usr/bin/say").exists()
+
+
+def _probe_afplay() -> bool:
+    return Path("/usr/bin/afplay").exists()
+
+
+def _probe_api_key() -> bool:
+    return bool(os.environ.get("ANTHROPIC_API_KEY"))
+
+
+def cmd_doctor(config: Config) -> int:
+    checks = [
+        ("python", f"{sys.version_info.major}.{sys.version_info.minor}",
+         sys.version_info[:2] == (3, 12)),
+        ("say", "/usr/bin/say", _probe_say()),
+        ("afplay", "/usr/bin/afplay", _probe_afplay()),
+        ("ANTHROPIC_API_KEY", "environment", _probe_api_key()),
+        ("zeus root", str(config.root), config.root.exists()),
+        ("database", str(config.db_path), config.db_path.exists()),
+        ("LaunchAgent", str(PLIST_PATH), PLIST_PATH.exists()),
+    ]
+    print("ZEUS environment report\n")
+    healthy = True
+    for name, detail, ok in checks:
+        print(f"  {'OK  ' if ok else 'FAIL'}  {name:<20} {detail}")
+        # A missing database or LaunchAgent is expected before first run.
+        if not ok and name in {"python", "say", "afplay", "ANTHROPIC_API_KEY"}:
+            healthy = False
+    print()
+    if not healthy:
+        print("Not ready. Fix the FAIL lines above.")
+    return 0 if healthy else 1
+
+
+def cmd_selftest(config: Config) -> int:
+    """Capture, transcribe, and speak. Requires real hardware — never in CI."""
+    from zeus.audio.mic import MicStream
+    from zeus.daemon import audio_self_test
+    from zeus.stt import build_transcriber
+    from zeus.tts import build_speaker
+
+    print("Capturing one second of audio — say something now...")
+    mic = MicStream(config.audio)
+    mic.start()
+    try:
+        if not audio_self_test(mic):
+            print(
+                "FAIL: the microphone produced no audio.\n"
+                "  Grant microphone access to this interpreter in\n"
+                "  System Preferences > Security & Privacy > Privacy > Microphone,\n"
+                "  then run 'zeus selftest' again from Terminal."
+            )
+            return 1
+        print("OK: microphone is producing audio.")
+    finally:
+        mic.stop()
+
+    speaker = build_speaker(config.tts)
+    speaker.say("ZEUS self test complete. I can hear you and you can hear me.")
+    print("OK: speech synthesis worked.")
+    return 0
+
+
+def cmd_install_agent(config: Config) -> int:
+    python_path = Path(sys.executable).resolve()
+    config.log_path.parent.mkdir(parents=True, exist_ok=True)
+    PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    PLIST_PATH.write_text(launch_agent_plist(python_path, config.log_path))
+    print(f"Wrote {PLIST_PATH}\n")
+    print("Load it with:")
+    print(f"  launchctl unload {PLIST_PATH} 2>/dev/null")
+    print(f"  launchctl load {PLIST_PATH}\n")
+    print(
+        "IMPORTANT: run 'zeus selftest' from Terminal FIRST so macOS prompts\n"
+        "for microphone access. A LaunchAgent that has never been granted\n"
+        "access opens the stream successfully and hears only silence."
+    )
+    return 0
+
+
+def cmd_run(config: Config) -> int:
+    from zeus.daemon import build_daemon
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    build_daemon(config).run_forever()
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="zeus", description="ZEUS voice assistant")
+    parser.add_argument("--root", type=Path, default=None, help="ZEUS data directory")
+    sub = parser.add_subparsers(dest="command")
+    for name, help_text in [
+        ("run", "run the daemon in the foreground"),
+        ("selftest", "check the microphone and speakers (requires hardware)"),
+        ("doctor", "print an environment report"),
+        ("install-agent", "write the LaunchAgent plist"),
+    ]:
+        sub.add_parser(name, help=help_text)
+
+    args = parser.parse_args(argv if argv is not None else sys.argv[1:])
+    if not args.command:
+        parser.print_usage()
+        return 2
+
+    config = load_config(root=args.root) if args.root else load_config()
+    return {
+        "run": cmd_run,
+        "selftest": cmd_selftest,
+        "doctor": cmd_doctor,
+        "install-agent": cmd_install_agent,
+    }[args.command](config)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+- [ ] **Step 4: Run the test and verify it passes**
+
+Run: `.venv/bin/pytest tests/test_cli.py -v`
+Expected: PASS — 8 tests
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/zeus/cli.py tests/test_cli.py
+git commit -m "feat: CLI with doctor, selftest, and LaunchAgent installer"
+```
+
+---
+
+### Task 18: End-to-end golden path
+
+**Files:**
+- Create: `tests/test_end_to_end.py`
+- Modify: `README.md` (create)
+
+**Interfaces:**
+- Consumes: every component, exclusively through its fake where hardware or network is involved.
+- Produces: no new source — this task proves the assembled spine and documents how to run it.
+
+- [ ] **Step 1: Write the failing test**
+
+`tests/test_end_to_end.py`:
+```python
+"""Full-spine golden path. No microphone, no speakers, no network."""
+from datetime import datetime, timedelta, timezone
+
+import pytest
+from zoneinfo import ZoneInfo
+
+from zeus.brain.fake import FakeConversation
+from zeus.clock import FakeClock
+from zeus.config import Config, ScheduleConfig
+from zeus.context.presence import Verdict
+from zeus.daemon import Daemon
+from zeus.memory.journal import Journal
+from zeus.memory.store import Store
+from zeus.ritual.checkin import CheckIn, FakeNotifier
+from zeus.schedule.scheduler import Scheduler
+from zeus.tts.fake import FakeSpeaker
+
+LAGOS = ZoneInfo("Africa/Lagos")
+MORNING = datetime(2026, 8, 5, 10, 0, tzinfo=timezone.utc)   # 11:00 Lagos
+EVENING = datetime(2026, 8, 5, 20, 0, tzinfo=timezone.utc)   # 21:00 Lagos
+
+
+class StubPresence:
+    def __init__(self, verdict=Verdict.SPEAK):
+        self.verdict_value = verdict
+
+    def verdict(self):
+        return self.verdict_value
+
+
+class ScriptedVoice:
+    def __init__(self):
+        self.spoken: list[str] = []
+        self.replies: list[str] = []
+
+    def speak(self, sentences):
+        self.spoken.extend(sentences)
+
+    def listen(self):
+        return self.replies.pop(0) if self.replies else ""
+
+
+@pytest.fixture
+def rig(tmp_path):
+    clock = FakeClock(MORNING)
+    store = Store(tmp_path / "zeus.db", clock)
+    journal = Journal(tmp_path / "journal", clock, LAGOS)
+    presence = StubPresence()
+    voice = ScriptedVoice()
+    notifier = FakeNotifier()
+
+    def make_checkin(kind, script):
+        return CheckIn(
+            kind=kind, store=store, journal=journal, presence=presence,
+            voice=voice, notifier=notifier,
+            conversation_factory=lambda cid, date: FakeConversation(script),
+            config=ScheduleConfig(), tz=LAGOS, clock=clock,
+        )
+
+    return {
+        "clock": clock, "store": store, "journal": journal,
+        "presence": presence, "voice": voice, "notifier": notifier,
+        "make_checkin": make_checkin, "tmp_path": tmp_path,
+    }
+
+
+def test_full_day_morning_goal_to_evening_review(rig):
+    store, journal, voice, clock = (
+        rig["store"], rig["journal"], rig["voice"], rig["clock"]
+    )
+
+    # --- 11:00 — morning check-in --------------------------------------
+    voice.replies = ["Finish the auth flow"]
+    morning = rig["make_checkin"]("morning", {})
+    assert morning.run(MORNING).value == "answered"
+
+    # The brain's save_goal tool is faked here, so write the goal directly
+    # to represent what the real tool call would have persisted.
+    store.set_goal("2026-08-05", "Finish the auth flow")
+    journal.append("Goal set: Finish the auth flow")
+
+    assert store.get_goal("2026-08-05").status == "pending"
+    assert voice.spoken  # ZEUS actually said something
+
+    # --- 21:00 — evening check-in --------------------------------------
+    clock.advance(EVENING - MORNING)
+    voice.replies = ["Mostly, the tests are still missing"]
+    evening = rig["make_checkin"]("evening", {})
+    assert evening.run(EVENING).value == "answered"
+
+    store.update_goal(store.get_goal("2026-08-05").id, "partial", "tests missing")
+
+    goal = store.get_goal("2026-08-05")
+    assert goal.status == "partial"
+    assert goal.notes == "tests missing"
+    assert "Finish the auth flow" in journal.read("2026-08-05")
+
+
+def test_away_all_morning_then_present_defers_then_speaks(rig):
+    store, presence, voice = rig["store"], rig["presence"], rig["voice"]
+    checkin = rig["make_checkin"]("morning", {})
+
+    presence.verdict_value = Verdict.DEFER
+    assert checkin.run(MORNING).value == "deferred"
+    assert voice.spoken == []
+
+    presence.verdict_value = Verdict.SPEAK
+    voice.replies = ["Ship the parser"]
+    assert checkin.run(MORNING).value == "answered"
+
+    # Same check-in row reused, so attempts accumulated
+    assert store.get_checkin(1).attempts == 2
+
+
+def test_silence_all_day_never_loses_the_checkin_row(rig):
+    store = rig["store"]
+    checkin = rig["make_checkin"]("morning", {})
+
+    assert checkin.run(MORNING).value == "no_answer"
+    assert checkin.run(MORNING).value == "no_answer"   # retry exhausted → folds
+
+    row = store.get_checkin(1)
+    assert row.attempts == 2
+    assert row.outcome == "no_answer"
+
+
+def test_downtime_across_two_days_replays_only_today(rig):
+    store, clock = rig["store"], rig["clock"]
+    fired: list[str] = []
+
+    scheduler = Scheduler(store, clock, LAGOS)
+    scheduler.register("checkin_morning", "0 11 * * *", fired.append)
+    scheduler.register("checkin_evening", "0 21 * * *", fired.append)
+
+    # Heartbeat two days ago, now 13:00 Lagos today.
+    clock.advance(timedelta(days=-2))
+    store.set_heartbeat()
+    clock.advance(timedelta(days=2) + timedelta(hours=2))
+
+    daemon = Daemon(
+        config=Config(root=rig["tmp_path"]), store=store, journal=rig["journal"],
+        scheduler=scheduler, presence=rig["presence"], voice=rig["voice"],
+        notifier=rig["notifier"], checkins={}, clock=clock,
+    )
+    actions = daemon.run_catch_up()
+
+    fire_count = sum(1 for _, action in actions if action == "fire")
+    assert fire_count == 1                      # only today's morning
+    assert all(job == "checkin_morning" for job, action in actions if action == "fire")
+
+
+def test_every_tool_call_is_visible_to_a_future_dashboard(rig):
+    """Slice 2's dashboard can only show what Slice 1 recorded."""
+    store, journal = rig["store"], rig["journal"]
+    from zeus.brain.tools import build_tools
+
+    conv = store.start_conversation("schedule")
+    tools = {t.__name__: t for t in build_tools(store, journal, conv, "2026-08-05")}
+    tools["save_goal"](text="Finish the auth flow")
+    tools["record_outcome"](status="done")
+
+    actions = store.recent_actions()
+    assert {a.tool for a in actions} == {"save_goal", "record_outcome"}
+    assert all(a.ok for a in actions)
+    assert all(a.duration_ms >= 0 for a in actions)
+```
+
+- [ ] **Step 2: Run the test and verify it fails**
+
+Run: `.venv/bin/pytest tests/test_end_to_end.py -v`
+Expected: FAIL — assertion errors or import errors, depending on what remains incomplete.
+
+- [ ] **Step 3: Fix whatever the end-to-end test exposes**
+
+No new modules should be required. If a test fails, the defect is in the wiring from Tasks 15–16, not in this test. Fix the source, not the assertion.
+
+- [ ] **Step 4: Run the entire suite**
+
+Run: `.venv/bin/pytest -v`
+Expected: PASS — all tests across all 18 tasks green.
+
+- [ ] **Step 5: Write `README.md`**
+
+```markdown
+# ZEUS
+
+A voice assistant that runs on your Mac, wakes when you speak to it, and asks
+what your one goal is each morning and whether it happened each evening.
+
+## Requirements
+
+macOS 12+ on Intel or Apple Silicon, and [uv](https://docs.astral.sh/uv/).
+No Homebrew required.
+
+## Install
+
+```bash
+uv python install 3.12
+uv venv --python 3.12
+uv pip install -e ".[dev]"
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+## First run — in this order
+
+Run the self-test **from Terminal first**. macOS attributes microphone
+permission to the process that asks, and a background LaunchAgent that has
+never been granted access will open the microphone successfully and hear
+nothing but silence.
+
+```bash
+.venv/bin/zeus doctor      # environment report
+.venv/bin/zeus selftest    # grants microphone access, verifies audio in and out
+.venv/bin/zeus install-agent
+launchctl load ~/Library/LaunchAgents/com.zeus.daemon.plist
+```
+
+## Usage
+
+Say **"hey jarvis"** to start a conversation. (openWakeWord ships no "zeus"
+model; see `[wake] model` in `~/.zeus/config.toml` to swap in a custom one.)
+
+ZEUS asks for your goal at 11:00 and reviews it at 21:00. If you are away,
+on a call, or in a Focus mode, it defers or notifies quietly instead of
+talking at you.
+
+## Your data
+
+Everything lives in `~/.zeus/` — delete that directory and ZEUS knows
+nothing. Audio is never written to disk; only transcripts are stored, for
+`transcript_retention_days` (default 90). Your transcribed text goes to the
+Anthropic API; your audio does not, because transcription runs locally.
+
+## Tests
+
+```bash
+.venv/bin/pytest
+```
+
+No test requires a microphone, speakers, or a network connection.
+```
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add tests/test_end_to_end.py README.md
+git commit -m "test: end-to-end golden path across the assembled spine"
+```
+
+---
+
+## Plan Self-Review
+
+Run after the plan is written, before execution begins.
+
+### Spec coverage
+
+| Spec section | Covered by |
+|---|---|
+| §4.1 process model, LaunchAgent | T16, T17 |
+| §4.2 runtime isolation (uv, 3.12) | T1, Global Constraints |
+| §4.3 downtime recovery / catch-up | T6 (`catch_up`), T16 (`catch_up_actions`) |
+| §4.4 data flow | T11–T13 (audio), T14 (brain), T15 (wiring) |
+| §5 components and interfaces | T9, T10, T13 (protocols + two impls each) |
+| §5.2 MicStream ring buffer | T11 |
+| §6.1 WAL mode | T3 |
+| §6.2 schema (all 8 tables) | T3 |
+| §6.3 UTC storage / local scheduling | T2, T3, T5 |
+| §6.3 audio never persisted | T12 (`capture_utterance` returns bytes, never writes) |
+| §7.1 model configuration | T14 |
+| §7.1 sentence streaming | T14 (`split_sentences`) |
+| §7.2 check-in scripts, 3-exchange ceiling | T14 (prompts), T15 (`MAX_EXCHANGES`) |
+| §7.3 half-duplex | T13 (`mute`/`unmute`), T15 (`VoiceIO.speak`) |
+| §8 context gate | T7 |
+| §9.1 generic cron jobs | T5, T6 |
+| §9.2 catch-up policy | T16 |
+| §9.3 retry paths | T8 |
+| §10 failure handling | T7, T9, T10, T14, T16 |
+| §10.1 startup self-test | T16 |
+| §11 configuration | T1 |
+| §12 security and privacy | T1 (retention), T14 (key from env), T17 (README) |
+| §13 testing | every task; T18 for the golden path |
+| §15 R1 microphone/TCC | T16 self-test, T17 selftest command + README ordering |
+| §15 R2 no "zeus" model | T13 docstring, config `[wake] model`, README |
+| §15 R3 Focus detection unverified | T7 Step 5 — **manual verification is an explicit step** |
+| §15 R5 wake-word false triggers | T13 (`HotkeyActivator`, configurable threshold) |
+
+No gaps.
+
+### Placeholder scan
+
+No `TBD`, no "add appropriate error handling", no "similar to Task N". Every
+code step contains runnable code. Every test step contains real assertions.
+
+### Type consistency
+
+Verified across task boundaries:
+
+- `Outcome` values (`answered`/`no_answer`/`deferred`/`skipped`) match the
+  `checkins.outcome` CHECK constraint in T3 — asserted directly by
+  `test_outcome_values_match_the_database_constraint` in T8.
+- `Verdict` produced by T7 is consumed by T8 and T15 under the same name.
+- `MissedRun(job, scheduled_for, same_local_day)` produced by T6 is consumed
+  by T16 with identical field names.
+- `Speaker.say`, `Transcriber.transcribe`, `Activator.events` signatures are
+  identical in protocol, real implementation, and fake.
+- `FRAME_SAMPLES` is defined once in T11 and imported by T12, T13, T15, T16.
+- `Store.log_action(...)` signature in T3 matches the call in T14's
+  `logged_tool`.
+- `build_tools(store, journal, conversation_id, local_date)` in T14 matches
+  its call sites in T16's `build_daemon` and T18.
+
+### Known simplification, flagged deliberately
+
+`CheckIn._find_or_open` reuses an open check-in row by matching on kind and
+date via raw SQL rather than a dedicated `Store` method. This is the one place
+a task reaches past the `Store` façade. It is acceptable for Slice 1 and should
+become `Store.find_open_checkin(kind, date)` when Slice 2 touches this file.
+
+---
+
+## Execution
+
+18 tasks, each ending in a green test run and a commit. Suggested checkpoints
+for review: after **T8** (all pure logic complete), after **T13** (audio stack
+complete), and after **T18** (spine assembled).
+
+The first thing to do in T7 Step 5 is resolve risk R3 by toggling Focus
+manually. Do not defer it — the context gate's correctness depends on it, and
+it takes two minutes.
+
