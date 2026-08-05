@@ -98,6 +98,37 @@ def test_unmute_restores_detection(monkeypatch):
     assert [e.source for e in events] == ["wake"]
 
 
+def test_mute_is_idempotent(monkeypatch):
+    mic = MicStream(AudioConfig())
+    activator = WakeWordActivator(mic, WakeConfig(), threshold=0.5)
+    monkeypatch.setattr(activator, "_load_model", lambda: DummyModel([0.9]))
+    activator.start()
+    events = activator.events()
+
+    activator.mute()
+    activator.mute()          # must not raise
+    activator.unmute()        # a single unmute must still restore detection
+    mic._on_audio(FRAME, FRAME_SAMPLES, None, None)
+    mic.stop()
+
+    assert [e.source for e in events] == ["wake"]
+
+
+def test_unmute_without_mute_is_safe(monkeypatch):
+    mic = MicStream(AudioConfig())
+    activator = WakeWordActivator(mic, WakeConfig(), threshold=0.5)
+    monkeypatch.setattr(activator, "_load_model", lambda: DummyModel([0.9]))
+    activator.start()
+    events = activator.events()
+
+    activator.unmute()        # never muted; must not raise, must not deafen
+    activator.unmute()        # and again
+    mic._on_audio(FRAME, FRAME_SAMPLES, None, None)
+    mic.stop()
+
+    assert [e.source for e in events] == ["wake"]
+
+
 class CountingModel:
     """Counts predict() calls; proves muted-and-discarded frames are never scored."""
 
