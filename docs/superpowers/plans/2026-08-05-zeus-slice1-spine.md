@@ -2109,7 +2109,11 @@ def next_step(
 - [ ] **Step 4: Run the test and verify it passes**
 
 Run: `.venv/bin/pytest tests/ritual/test_retry.py -v`
-Expected: PASS — 15 tests
+Expected: PASS — 14 tests (11 plain tests + `test_defer_retries_up_to_three_times`
+parametrized over 3 attempt counts. An earlier draft said 15; that was a
+miscount of the parametrize expansion, not a dropped case — the file covers
+both retry paths, both exhaustion branches for morning and evening, both
+NOTIFY branches, the DB-constraint match, and a custom-config case.)
 
 - [ ] **Step 5: Commit**
 
