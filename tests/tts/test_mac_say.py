@@ -1,3 +1,5 @@
+import subprocess
+
 import pytest
 
 from zeus.config import TtsConfig
@@ -11,7 +13,7 @@ def test_invokes_say_with_the_configured_voice(monkeypatch):
     class DummyProcess:
         returncode = 0
 
-        def wait(self):
+        def wait(self, timeout=None):
             return 0
 
         def terminate(self):
@@ -41,7 +43,7 @@ def test_stop_terminates_the_running_process(monkeypatch):
     class DummyProcess:
         returncode = None
 
-        def wait(self):
+        def wait(self, timeout=None):
             return 0
 
         def terminate(self):
@@ -54,6 +56,25 @@ def test_stop_terminates_the_running_process(monkeypatch):
     speaker.say("long sentence")
     speaker.stop()
     assert terminated == [True]
+
+
+def test_a_wedged_say_is_killed_not_swallowed(monkeypatch):
+    killed = []
+
+    class DummyProcess:
+        returncode = None
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired(cmd="say", timeout=120.0)
+
+        def kill(self):
+            killed.append(True)
+
+    monkeypatch.setattr(
+        "zeus.tts.mac_say.subprocess.Popen", lambda argv, **kw: DummyProcess()
+    )
+    MacSay(voice="Alex").say("anything")
+    assert killed == [True]
 
 
 def test_factory_builds_mac_say():
