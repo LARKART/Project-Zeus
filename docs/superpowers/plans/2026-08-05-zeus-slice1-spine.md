@@ -3183,9 +3183,15 @@ def test_muting_suppresses_detection(monkeypatch):
 def test_unmute_restores_detection(monkeypatch):
     activator = _wake_activator(monkeypatch, [0.9], 1)
     activator.start()
+    # events() is created BEFORE muting, as in production: the detector runs
+    # continuously and is already live long before ZEUS ever speaks. An
+    # earlier draft muted and unmuted before events() existed, which forced
+    # unmute()'s mic.drain() to be deleted to make it pass — reintroducing
+    # self-triggering. See the unmute() docstring below.
+    events = activator.events()
     activator.mute()
     activator.unmute()
-    assert [e.source for e in activator.events()] == ["wake"]
+    assert [e.source for e in events] == ["wake"]
 
 
 def test_factory_builds_wake_word_activator():
@@ -3344,6 +3350,18 @@ class WakeWordActivator:
         self._muted = True
 
     def unmute(self) -> None:
+        """Re-enable detection after ZEUS has finished speaking.
+
+        The drain is load-bearing, not tidiness. It is tempting to remove it
+        by arguing that events() keeps pulling frames and skipping them
+        while muted — but events() is a generator, and mid-conversation it
+        is SUSPENDED at its yield, consuming nothing. The queue therefore
+        fills with ZEUS's own voice, and without this drain the detector
+        scores all of it on resume and re-triggers itself. Measured against
+        a build with the drain removed: 51 frames of self-audio queued, all
+        51 scored after unmute. drain() on an empty queue is a no-op, so
+        unmute() without a prior mute() stays safe.
+        """
         self._muted = False
         self._mic.drain()
 
@@ -3368,7 +3386,11 @@ class WakeWordActivator:
 - [ ] **Step 4: Run the test and verify it passes**
 
 Run: `.venv/bin/pytest tests/audio/test_activator.py -v`
-Expected: PASS — 10 tests
+Expected: PASS — 10 tests (the Step 1 file collects 9; an earlier draft said
+10, miscounting. The tenth is `test_unmute_discards_audio_captured_while_speaking`,
+added in review to pin *why* unmute() drains — without it nothing
+distinguishes the correct implementation from one that lets ZEUS hear its
+own voice and re-trigger.)
 
 - [ ] **Step 5: Commit**
 
