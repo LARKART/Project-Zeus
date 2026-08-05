@@ -3604,9 +3604,15 @@ class StubEvent:
 
 
 class StubStream:
-    def __init__(self, chunks, stop_reason="end_turn"):
+    def __init__(self, chunks, stop_reason="end_turn", content=None):
         self._chunks = chunks
         self._stop_reason = stop_reason
+        # `content` defaults to [] so existing tests are unaffected, but it
+        # MUST be settable: an earlier draft hardcoded [], which made a
+        # malformed multi-round history structurally indistinguishable from a
+        # well-formed one and hid a Critical defect. A round that used a tool
+        # needs a real tool_use block here.
+        self._content = content if content is not None else []
 
     def __iter__(self):
         return iter(StubEvent(c) for c in self._chunks)
@@ -3614,7 +3620,7 @@ class StubStream:
     def get_final_message(self):
         return type("M", (), {
             "stop_reason": self._stop_reason,
-            "content": [],
+            "content": self._content,
             "stop_details": None,
         })()
 
@@ -4073,6 +4079,7 @@ class Conversation:
 
         buffer = ""
         spoken: list[str] = []
+        final_content = None
         try:
             runner = self._client.beta.messages.tool_runner(
                 model=self._config.model,
@@ -4113,15 +4120,33 @@ class Conversation:
                     yield REFUSAL_LINE
                     buffer = ""
                     break
-                self._messages.append(
-                    {"role": "assistant", "content": final.content}
-                )
+                # Keep only the LAST round's content, appended once after the
+                # loop. Appending per round produced consecutive assistant
+                # messages carrying an unresolved tool_use with no
+                # tool_result, which the API rejects with a 400 on the NEXT
+                # send() — and the broad except below then reported a fake
+                # outage right after the tool had actually succeeded. The
+                # evening check-in hits exactly that shape: record_outcome
+                # fires, then ZEUS asks whether to carry the goal forward.
+                #
+                # Safe because the runner COPIES the list we pass
+                # (`messages = list(self._params["messages"])` in anthropic
+                # 0.120.2) and resolves tool_use/tool_result internally. What
+                # we keep here is only what the NEXT turn replays, and one
+                # closing assistant message per turn keeps role alternation
+                # valid by construction — without reading SDK internals.
+                final_content = final.content
 
         except Exception:
             log.error("conversation failed", exc_info=True)
             yield ERROR_LINE
             spoken.append(ERROR_LINE)
             buffer = ""
+
+        if final_content is not None:
+            self._messages.append(
+                {"role": "assistant", "content": final_content}
+            )
 
         remainder = buffer.strip()
         if remainder:
@@ -4202,9 +4227,12 @@ __all__ = [
 - [ ] **Step 6: Run the tests and verify they pass**
 
 Run: `.venv/bin/pytest tests/brain/ -v`
-Expected: PASS — 28 tests (27 above, plus
-`test_a_single_turn_can_span_several_tool_runner_rounds`, added in review
-alongside the StubClient fix so the multi-round path keeps coverage.)
+Expected: PASS — 29 tests (27 above, plus two added in review:
+`test_a_single_turn_can_span_several_tool_runner_rounds`, alongside the
+StubClient fix so the multi-round path keeps coverage; and
+`test_a_tool_using_turn_leaves_history_alternating`, which pins the Critical
+— per-round appends produced consecutive assistant messages with a dangling
+tool_use, which the API rejects with a 400 on the next send().)
 
 - [ ] **Step 7: Commit**
 
