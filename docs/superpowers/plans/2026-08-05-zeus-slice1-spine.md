@@ -513,7 +513,12 @@ def resolve_timezone(name: str) -> ZoneInfo:
         parts = _LOCALTIME.resolve().parts
         index = len(parts) - 1 - parts[::-1].index("zoneinfo")
         return ZoneInfo("/".join(parts[index + 1 :]))
-    except (OSError, ValueError):
+    except (OSError, ValueError, KeyError):
+        # KeyError is required, not defensive padding: ZoneInfoNotFoundError
+        # subclasses KeyError, and it is exactly what ZoneInfo() raises when
+        # the symlink resolves through a `zoneinfo` directory but the trailing
+        # segment is not a valid IANA key. Without it a malformed system
+        # timezone raises straight past the TZ and UTC fallbacks below.
         pass
     env = os.environ.get("TZ")
     if env:
@@ -532,8 +537,17 @@ def to_utc_iso(dt: datetime) -> str:
 
 
 def from_utc_iso(text: str) -> datetime:
-    """Parse an ISO-8601 string back into an aware UTC datetime."""
-    return datetime.fromisoformat(text).astimezone(timezone.utc)
+    """Parse an ISO-8601 string back into an aware UTC datetime.
+
+    Rejects naive strings rather than converting them. `.astimezone()` on a
+    naive datetime silently interprets it in the *system local* zone, which
+    would quietly mis-time any row that ever lost its offset. The write side
+    already refuses naive input; the read side must match.
+    """
+    parsed = datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        raise ValueError(f"naive timestamp rejected: {text!r}")
+    return parsed.astimezone(timezone.utc)
 
 
 class Clock(Protocol):
@@ -572,7 +586,9 @@ class FakeClock:
 - [ ] **Step 4: Run the test and verify it passes**
 
 Run: `.venv/bin/pytest tests/test_clock.py -v`
-Expected: PASS — 8 tests
+Expected: PASS — 11 tests (8 above, plus 3 covering the two fallback/rejection
+paths added in review: a malformed `/etc/localtime` degrading to UTC rather
+than raising, and `from_utc_iso` rejecting a naive string.)
 
 - [ ] **Step 5: Commit**
 
