@@ -2803,6 +2803,14 @@ class MicStream:
     # -- audio path ----------------------------------------------------
     def _on_audio(self, indata, frames, time_info, status) -> None:
         """sounddevice callback. Must never raise — it runs on the audio thread."""
+        if self._stopping.is_set():
+            # Shutdown signalled: stop feeding the queue. frames() ends by
+            # draining to empty, so a producer still pushing after stop()
+            # starves it of that observation and hangs the consumer. The
+            # device close in stop() is best-effort and swallows exceptions,
+            # so we cannot assume the callback has actually ceased.
+            # Event.is_set() is a cheap non-blocking read — safe here.
+            return
         if status:
             log.debug("audio status: %s", status)
         frame = bytes(indata)
@@ -2818,12 +2826,20 @@ class MicStream:
         Polls with a short timeout rather than blocking indefinitely, so
         stop() is observed promptly without anything having to be pushed
         onto the queue.
+
+        The stop check sits in the `Empty` branch, NOT at the top of the
+        loop: this is drain-then-stop, not abandon-on-stop. Checking eagerly
+        would discard frames already queued when stop() was called, which is
+        what test_frames_iterator_yields_pushed_audio pins. Termination is
+        guaranteed by _on_audio refusing to push once _stopping is set —
+        the two halves only work together.
         """
-        while not self._stopping.is_set():
+        while True:
             try:
                 yield self._queue.get(timeout=_POLL_SECONDS)
             except queue.Empty:
-                continue
+                if self._stopping.is_set():
+                    return
 
     def pre_roll(self) -> bytes:
         """Audio captured just before now — prepended to a new utterance."""
@@ -2849,9 +2865,11 @@ failing test into a suite that never finishes.
 - [ ] **Step 4: Run the test and verify it passes**
 
 Run: `.venv/bin/pytest tests/audio/test_mic.py -v`
-Expected: PASS — 11 tests (8 above, plus 3 added in review: stop() must not
-block on a full queue, frames() must terminate after stop() with an empty
-queue, and a restart must not inherit the previous run's stop signal.)
+Expected: PASS — 12 tests (8 above, plus 4 added in review: stop() must not
+block on a full queue; frames() must terminate after stop() with an empty
+queue; a restart must not inherit the previous run's stop signal; and
+frames() must still terminate when the audio callback keeps firing after
+stop(), which is reachable because stop()'s device close is best-effort.)
 
 - [ ] **Step 5: Commit**
 
