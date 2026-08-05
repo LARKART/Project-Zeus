@@ -1,3 +1,5 @@
+import threading
+
 import pytest
 
 from zeus.audio.mic import FRAME_SAMPLES, MicStream, RingBuffer
@@ -66,3 +68,76 @@ def test_start_is_rejected_twice():
     stream._running = True
     with pytest.raises(RuntimeError, match="already running"):
         stream.start()
+
+
+# -- Task 11 review fixes: regression tests ----------------------------
+
+
+def test_stop_does_not_block_when_the_queue_is_full():
+    """F1 (CRITICAL): stop() must not deadlock when the audio queue is full.
+
+    A shutdown signal is out-of-band and must not be enqueued onto the
+    same bounded, in-band channel that carries audio frames.
+    """
+    stream = MicStream(AudioConfig())
+    for _ in range(stream._queue.maxsize):
+        stream._queue.put_nowait(FRAME)
+    assert stream._queue.full()
+
+    finished = threading.Event()
+
+    def run_stop():
+        stream.stop()
+        finished.set()
+
+    t = threading.Thread(target=run_stop, daemon=True)
+    t.start()
+    completed = finished.wait(2)
+
+    assert completed, "stop() did not return within 2s while the queue was full"
+
+
+def test_frames_terminates_after_stop_with_an_empty_queue():
+    """F1 corollary: the poll loop must observe shutdown without a queued item."""
+    stream = MicStream(AudioConfig())
+    stream._running = True
+    collected = []
+    finished = threading.Event()
+
+    def consume():
+        for item in stream.frames():
+            collected.append(item)
+        finished.set()
+
+    t = threading.Thread(target=consume, daemon=True)
+    t.start()
+    stream.stop()
+    completed = finished.wait(2)
+
+    assert completed, "frames() did not terminate within 2s after stop()"
+    assert collected == []
+
+
+def test_restart_does_not_inherit_the_previous_stop():
+    """F2 (IMPORTANT): a restarted stream must not inherit the prior shutdown
+    signal, and must not replay stale audio left over from the previous run.
+
+    Device-free: simulates what start() does (clear the stop signal, then
+    drain leftover frames) without opening a real sounddevice stream.
+    """
+    stream = MicStream(AudioConfig())
+    stream._running = True
+    stream._on_audio(FRAME, FRAME_SAMPLES, None, None)
+    stream.stop()
+    assert stream._stopping.is_set()
+
+    # Simulate what start() does on restart, without a real device.
+    stream._stopping.clear()
+    stream.drain()
+    stream._running = True
+
+    stream._on_audio(FRAME, FRAME_SAMPLES, None, None)
+    stream._on_audio(FRAME, FRAME_SAMPLES, None, None)
+    stream.stop()
+
+    assert list(stream.frames()) == [FRAME, FRAME]
