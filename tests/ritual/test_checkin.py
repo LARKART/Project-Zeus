@@ -1,16 +1,19 @@
 from datetime import datetime, timedelta, timezone
 
+import numpy as np
 import pytest
 from zoneinfo import ZoneInfo
 
+from zeus.audio.mic import FRAME_SAMPLES
 from zeus.brain.fake import FakeConversation
 from zeus.clock import FakeClock
 from zeus.config import Config, ScheduleConfig
 from zeus.context.presence import Signals, Verdict
 from zeus.memory.journal import Journal
 from zeus.memory.store import Store
-from zeus.ritual.checkin import CheckIn, FakeNotifier, local_date
+from zeus.ritual.checkin import CheckIn, FakeNotifier, VoiceIO, local_date
 from zeus.ritual.retry import Outcome
+from zeus.stt.fake import FakeTranscriber
 from zeus.tts.fake import FakeSpeaker
 
 LAGOS = ZoneInfo("Africa/Lagos")
@@ -160,3 +163,123 @@ def test_journal_records_a_missed_checkin(wiring):
     checkin, _, _, _, _ = _checkin("evening", wiring, Verdict.SPEAK, heard=[])
     checkin.run(NOW)
     assert "no answer" in journal.read("2026-08-05").lower()
+
+
+# ---- VoiceIO: the half-duplex seam --------------------------------------
+#
+# Everything above exercises CheckIn through StubVoice, which never touches
+# VoiceIO itself. That leaves the mute/unmute pairing unproven: if speak()'s
+# finally were ever weakened to a plain trailing unmute(), a raising
+# Speaker.say() would leave the wake detector muted forever with no code
+# path left to unmute it — ZEUS goes permanently deaf until the daemon is
+# restarted. These tests pin that seam directly.
+
+SILENCE = np.zeros(FRAME_SAMPLES, dtype=np.int16).tobytes()
+SPEECH = (np.ones(FRAME_SAMPLES, dtype=np.int16) * 8000).tobytes()
+
+
+class RecordingActivator:
+    """Records mute/unmute ordering. Not FakeActivator: that one ignores
+    start()/stop() and has no mute()/unmute() at all."""
+
+    def __init__(self):
+        self.events = []
+
+    def mute(self):
+        self.events.append("mute")
+
+    def unmute(self):
+        self.events.append("unmute")
+
+
+class BoomSpeaker:
+    def __init__(self):
+        self.said = []
+
+    def say(self, text):
+        self.said.append(text)
+        raise RuntimeError("audio device vanished mid-sentence")
+
+    def stop(self):
+        pass
+
+
+class _SilentMic:
+    """Yields only silence frames, then ends."""
+
+    def frames(self):
+        for _ in range(50):
+            yield SILENCE
+
+
+class _LoudMic:
+    """Yields loud frames without ever going quiet.
+
+    Capped at 2000 frames — far above the 375 the default config's listen
+    timeout should consume — so that a regression which fails to respect
+    the timeout ends the generator and fails the byte-count assertion below
+    instead of hanging the suite.
+    """
+
+    def frames(self):
+        for _ in range(2000):
+            yield SPEECH
+
+
+def _silent_mic():
+    return _SilentMic()
+
+
+def _loud_mic():
+    return _LoudMic()
+
+
+def _voice(activator, speaker, transcriber=None, mic=None):
+    from zeus.config import AudioConfig
+    from zeus.audio.endpointer import Endpointer
+    config = AudioConfig()
+    return VoiceIO(
+        activator, mic, Endpointer(config), transcriber, speaker, config
+    )
+
+
+def test_speak_brackets_the_utterance_in_mute_and_unmute():
+    activator, speaker = RecordingActivator(), FakeSpeaker()
+    _voice(activator, speaker).speak(["One.", "Two."])
+    assert activator.events == ["mute", "unmute"]
+    assert speaker.said == ["One.", "Two."]
+
+
+def test_speak_unmutes_even_when_the_speaker_raises():
+    """Without the finally, ZEUS stays muted forever and never wakes again."""
+    activator, speaker = RecordingActivator(), BoomSpeaker()
+    with pytest.raises(RuntimeError):
+        _voice(activator, speaker).speak(["One.", "Two."])
+    assert activator.events == ["mute", "unmute"]
+    assert speaker.said == ["One."]          # aborted at the first sentence
+
+
+def test_listen_returns_empty_when_nothing_was_heard():
+    activator = RecordingActivator()
+    mic = _silent_mic()            # yields only silence frames, then ends
+    voice = _voice(activator, FakeSpeaker(), FakeTranscriber([]), mic)
+    assert voice.listen() == ""
+
+
+def test_listen_stops_at_the_configured_timeout():
+    """30s listen window at 80ms/frame is 375 frames; a mic that never goes
+    quiet must still return rather than holding the microphone open."""
+    from zeus.config import AudioConfig
+
+    config = AudioConfig()
+    expected_frames = int(
+        config.listen_timeout.total_seconds() * config.sample_rate / FRAME_SAMPLES
+    )
+    activator = RecordingActivator()
+    transcriber = FakeTranscriber(["hello"])
+    voice = _voice(activator, FakeSpeaker(), transcriber, _loud_mic())
+
+    result = voice.listen()
+
+    assert result == "hello"
+    assert transcriber.calls == [expected_frames * FRAME_SAMPLES * 2]
