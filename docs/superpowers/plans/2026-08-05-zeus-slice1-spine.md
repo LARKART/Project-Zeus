@@ -122,7 +122,11 @@ T1 config ──┬── T2 clock ──┬── T3 store ── T4 journal
 3.12
 ```
 
-`.gitignore`:
+`.gitignore` — **already exists; verify, do not overwrite.** It was written
+before plan execution and additionally ignores `.worktrees/` and
+`.superpowers/`, which must survive. Confirm it contains every entry below
+and add any that are missing:
+
 ```
 .venv/
 __pycache__/
@@ -3227,9 +3231,10 @@ git commit -m "feat: wake-word and hotkey activators with half-duplex muting"
   - `SYSTEM_PROMPT: str`, `MORNING_OPENER: str`, `EVENING_OPENER(goal_text: str) -> str`, `FOLDED_OPENER: str`
   - `split_sentences(buffer: str) -> tuple[list[str], str]` — pure; returns complete sentences plus the unflushed remainder.
   - `logged_tool(store, conversation_id, name, fn) -> Callable` — wraps a tool callable so every invocation writes an `actions` row with timing and success, and returns `is_error`-shaped text on failure.
-  - `build_tools(store, journal, conversation_id, local_date) -> list` — the `@beta_tool` functions for Slice 1: `save_goal`, `record_outcome`.
+  - `build_tool_callables(store, journal, conversation_id, local_date) -> dict[str, Callable]` — the action-logged **plain** callables, keyed by tool name. Returned separately from `build_tools` so tests and `FakeConversation` can invoke the real tool bodies without depending on what the `@beta_tool` decorator does to `__name__` or to direct callability — neither is guaranteed by the SDK.
+  - `build_tools(store, journal, conversation_id, local_date) -> list` — the `@beta_tool`-decorated functions handed to the Tool Runner: `save_goal`, `record_outcome`. Thin wrappers over `build_tool_callables`.
   - `Conversation(client, config, store, journal, conversation_id, system, tools)` with `send(text: str) -> Iterator[str]` yielding **sentences** for TTS.
-  - `FakeConversation(script: dict[str, list[str]])` — same `send` shape; used by Tasks 15 and 18.
+  - `FakeConversation(script=None, tools=None, tool_calls=None)` — same `send` shape, and can invoke **real** tool callables so an end-to-end test exercises brain → tool → action log → database without a network call. `tools` is the dict from `build_tool_callables`; `tool_calls[i]` is the list of `(name, kwargs)` to invoke on the i-th `send()`. Exposes `sent` and `invoked`. Used by Tasks 15 and 18.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -3291,7 +3296,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from zeus.brain.tools import build_tools, logged_tool
+from zeus.brain.tools import build_tool_callables, build_tools, logged_tool
 from zeus.clock import FakeClock
 from zeus.memory.journal import Journal
 from zeus.memory.store import Store
@@ -3338,7 +3343,7 @@ def test_logged_tool_captures_failures_without_raising(wiring):
 
 def test_save_goal_writes_goal_and_journal(wiring):
     store, journal, conv = wiring
-    tools = {t.__name__: t for t in build_tools(store, journal, conv, "2026-08-05")}
+    tools = build_tool_callables(store, journal, conv, "2026-08-05")
     tools["save_goal"](text="Finish the auth flow")
 
     assert store.get_goal("2026-08-05").text == "Finish the auth flow"
@@ -3348,7 +3353,7 @@ def test_save_goal_writes_goal_and_journal(wiring):
 
 def test_record_outcome_updates_status(wiring):
     store, journal, conv = wiring
-    tools = {t.__name__: t for t in build_tools(store, journal, conv, "2026-08-05")}
+    tools = build_tool_callables(store, journal, conv, "2026-08-05")
     tools["save_goal"](text="Ship it")
     tools["record_outcome"](status="partial", notes="tests missing")
 
@@ -3359,7 +3364,7 @@ def test_record_outcome_updates_status(wiring):
 
 def test_record_outcome_without_a_goal_is_reported_not_raised(wiring):
     store, journal, conv = wiring
-    tools = {t.__name__: t for t in build_tools(store, journal, conv, "2026-08-05")}
+    tools = build_tool_callables(store, journal, conv, "2026-08-05")
     result = tools["record_outcome"](status="done")
     assert "no goal" in result.lower()
     assert store.recent_actions()[0].ok is True
@@ -3367,11 +3372,20 @@ def test_record_outcome_without_a_goal_is_reported_not_raised(wiring):
 
 def test_record_outcome_rejects_an_invalid_status(wiring):
     store, journal, conv = wiring
-    tools = {t.__name__: t for t in build_tools(store, journal, conv, "2026-08-05")}
+    tools = build_tool_callables(store, journal, conv, "2026-08-05")
     tools["save_goal"](text="Ship it")
     result = tools["record_outcome"](status="banana")
     assert "banana" in result
     assert store.get_goal("2026-08-05").status == "pending"
+
+
+def test_callables_and_decorated_tools_cover_the_same_surface(wiring):
+    """build_tools wraps exactly the callables build_tool_callables exposes."""
+    store, journal, conv = wiring
+    assert set(build_tool_callables(store, journal, conv, "2026-08-05")) == {
+        "save_goal", "record_outcome",
+    }
+    assert len(build_tools(store, journal, conv, "2026-08-05")) == 2
 ```
 
 `tests/brain/test_conversation.py`:
@@ -3513,6 +3527,52 @@ def test_fake_conversation_replays_a_script():
 def test_fake_conversation_falls_back_for_unscripted_input():
     fake = FakeConversation({})
     assert list(fake.send("anything")) == ["Got it."]
+
+
+def test_fake_conversation_invokes_real_tools(wiring):
+    """This is what lets the end-to-end test prove the real tool path."""
+    from zeus.brain.tools import build_tool_callables
+
+    store, journal, conv = wiring
+    tools = build_tool_callables(store, journal, conv, "2026-08-05")
+    fake = FakeConversation(
+        tools=tools,
+        tool_calls=[[("save_goal", {"text": "Finish the auth flow"})]],
+    )
+
+    list(fake.send("[morning]"))
+
+    assert store.get_goal("2026-08-05").text == "Finish the auth flow"
+    assert store.recent_actions()[0].tool == "save_goal"
+    assert fake.invoked == [("save_goal", {"text": "Finish the auth flow"})]
+
+
+def test_fake_conversation_invokes_tools_per_turn(wiring):
+    from zeus.brain.tools import build_tool_callables
+
+    store, journal, conv = wiring
+    tools = build_tool_callables(store, journal, conv, "2026-08-05")
+    fake = FakeConversation(
+        tools=tools,
+        tool_calls=[
+            [("save_goal", {"text": "Ship it"})],
+            [],
+            [("record_outcome", {"status": "done"})],
+        ],
+    )
+
+    list(fake.send("turn one"))
+    list(fake.send("turn two"))
+    list(fake.send("turn three"))
+
+    assert [name for name, _ in fake.invoked] == ["save_goal", "record_outcome"]
+    assert store.get_goal("2026-08-05").status == "done"
+
+
+def test_fake_conversation_rejects_an_unknown_tool():
+    fake = FakeConversation(tools={}, tool_calls=[[("nope", {})]])
+    with pytest.raises(KeyError, match="nope"):
+        list(fake.send("x"))
 ```
 
 - [ ] **Step 2: Run the tests and verify they fail**
@@ -3662,16 +3722,16 @@ def logged_tool(
     return wrapper
 
 
-def build_tools(
+def build_tool_callables(
     store: Store, journal: Journal, conversation_id: int, local_date: str
-) -> list[Callable]:
-    """The Slice 1 tool surface.
+) -> dict[str, Callable]:
+    """The action-logged tool bodies, keyed by tool name.
 
-    Deliberately tiny — two tools. Their purpose is to make the Tool Runner
-    path real from day one so later slices add tools to a working mechanism
-    rather than building the mechanism alongside their first tool.
+    Kept separate from `build_tools` so tests and FakeConversation can call
+    the real bodies directly. Depending on the @beta_tool decorator to
+    preserve __name__ or to stay callable is an SDK-internals assumption
+    this codebase does not make.
     """
-    from anthropic import beta_tool
 
     def _save_goal(text: str) -> str:
         store.set_goal(local_date, text)
@@ -3691,10 +3751,26 @@ def build_tools(
         journal.append(f"Outcome: {status}" + (f" — {notes}" if notes else ""))
         return f"Recorded today's goal as {status}."
 
-    save_wrapped = logged_tool(store, conversation_id, "save_goal", _save_goal)
-    outcome_wrapped = logged_tool(
-        store, conversation_id, "record_outcome", _record_outcome
-    )
+    return {
+        "save_goal": logged_tool(store, conversation_id, "save_goal", _save_goal),
+        "record_outcome": logged_tool(
+            store, conversation_id, "record_outcome", _record_outcome
+        ),
+    }
+
+
+def build_tools(
+    store: Store, journal: Journal, conversation_id: int, local_date: str
+) -> list[Callable]:
+    """The Slice 1 tool surface, decorated for the Tool Runner.
+
+    Deliberately tiny — two tools. Their purpose is to make the Tool Runner
+    path real from day one so later slices add tools to a working mechanism
+    rather than building the mechanism alongside their first tool.
+    """
+    from anthropic import beta_tool
+
+    callables = build_tool_callables(store, journal, conversation_id, local_date)
 
     @beta_tool
     def save_goal(text: str) -> str:
@@ -3703,7 +3779,7 @@ def build_tools(
         Args:
             text: The goal, in the user's own words, as concretely as they gave it.
         """
-        return save_wrapped(text=text)
+        return callables["save_goal"](text=text)
 
     @beta_tool
     def record_outcome(status: str, notes: str = "") -> str:
@@ -3713,7 +3789,7 @@ def build_tools(
             status: One of "done", "partial", "missed", or "carried".
             notes: Optional short detail the user gave, in their own words.
         """
-        return outcome_wrapped(status=status, notes=notes or None)
+        return callables["record_outcome"](status=status, notes=notes or None)
 
     return [save_goal, record_outcome]
 ```
@@ -3838,19 +3914,47 @@ class Conversation:
 
 `src/zeus/brain/fake.py`:
 ```python
-"""Conversation test double. Replays a script; never touches the network."""
+"""Conversation test double. Replays a script; never touches the network.
+
+Can also invoke real tool callables, so an end-to-end test exercises the
+genuine brain -> tool -> action log -> database path instead of writing the
+data it then asserts on.
+"""
 from __future__ import annotations
 
-from typing import Iterator
+from typing import Callable, Iterator
+
+ToolCall = tuple[str, dict]
 
 
 class FakeConversation:
-    def __init__(self, script: dict[str, list[str]] | None = None) -> None:
+    def __init__(
+        self,
+        script: dict[str, list[str]] | None = None,
+        tools: dict[str, Callable] | None = None,
+        tool_calls: list[list[ToolCall]] | None = None,
+    ) -> None:
         self._script = script or {}
+        self._tools = tools or {}
+        self._tool_calls = list(tool_calls or [])
         self.sent: list[str] = []
+        self.invoked: list[ToolCall] = []
 
     def send(self, text: str) -> Iterator[str]:
+        turn = len(self.sent)
         self.sent.append(text)
+
+        planned = self._tool_calls[turn] if turn < len(self._tool_calls) else []
+        for name, kwargs in planned:
+            tool = self._tools.get(name)
+            if tool is None:
+                raise KeyError(
+                    f"FakeConversation was asked to call {name!r} but was given "
+                    f"only {sorted(self._tools)}"
+                )
+            tool(**kwargs)
+            self.invoked.append((name, kwargs))
+
         for sentence in self._script.get(text, ["Got it."]):
             yield sentence
 ```
@@ -3876,7 +3980,7 @@ __all__ = [
 - [ ] **Step 6: Run the tests and verify they pass**
 
 Run: `.venv/bin/pytest tests/brain/ -v`
-Expected: PASS — 23 tests
+Expected: PASS — 27 tests
 
 - [ ] **Step 7: Commit**
 
@@ -4967,6 +5071,7 @@ import pytest
 from zoneinfo import ZoneInfo
 
 from zeus.brain.fake import FakeConversation
+from zeus.brain.tools import build_tool_callables
 from zeus.clock import FakeClock
 from zeus.config import Config, ScheduleConfig
 from zeus.context.presence import Verdict
@@ -5011,11 +5116,24 @@ def rig(tmp_path):
     voice = ScriptedVoice()
     notifier = FakeNotifier()
 
-    def make_checkin(kind, script):
+    def make_checkin(kind, script=None, tool_calls=None):
+        """Build a CheckIn whose fake brain drives the REAL tool callables.
+
+        The conversation is faked (no network), but save_goal and
+        record_outcome are the genuine action-logged implementations, so
+        the assertions below check data the production code wrote.
+        """
+
+        def factory(conversation_id, date):
+            return FakeConversation(
+                script=script,
+                tools=build_tool_callables(store, journal, conversation_id, date),
+                tool_calls=tool_calls,
+            )
+
         return CheckIn(
             kind=kind, store=store, journal=journal, presence=presence,
-            voice=voice, notifier=notifier,
-            conversation_factory=lambda cid, date: FakeConversation(script),
+            voice=voice, notifier=notifier, conversation_factory=factory,
             config=ScheduleConfig(), tz=LAGOS, clock=clock,
         )
 
@@ -5027,40 +5145,59 @@ def rig(tmp_path):
 
 
 def test_full_day_morning_goal_to_evening_review(rig):
+    """The golden path: nothing in this test writes the data it asserts on.
+
+    Turn 0 of each conversation is ZEUS's opener; turn 1 is its reply to the
+    user's answer, which is where the real tool fires.
+    """
     store, journal, voice, clock = (
         rig["store"], rig["journal"], rig["voice"], rig["clock"]
     )
 
     # --- 11:00 — morning check-in --------------------------------------
     voice.replies = ["Finish the auth flow"]
-    morning = rig["make_checkin"]("morning", {})
+    morning = rig["make_checkin"](
+        "morning",
+        tool_calls=[[], [("save_goal", {"text": "Finish the auth flow"})]],
+    )
     assert morning.run(MORNING).value == "answered"
 
-    # The brain's save_goal tool is faked here, so write the goal directly
-    # to represent what the real tool call would have persisted.
-    store.set_goal("2026-08-05", "Finish the auth flow")
-    journal.append("Goal set: Finish the auth flow")
+    # Written by the real save_goal tool, via the real action-log wrapper.
+    goal = store.get_goal("2026-08-05")
+    assert goal.text == "Finish the auth flow"
+    assert goal.status == "pending"
+    assert "Finish the auth flow" in journal.read("2026-08-05")
+    assert voice.spoken                     # ZEUS actually said something
 
-    assert store.get_goal("2026-08-05").status == "pending"
-    assert voice.spoken  # ZEUS actually said something
+    save_action = store.recent_actions()[0]
+    assert save_action.tool == "save_goal"
+    assert save_action.ok is True
 
     # --- 21:00 — evening check-in --------------------------------------
     clock.advance(EVENING - MORNING)
     voice.replies = ["Mostly, the tests are still missing"]
-    evening = rig["make_checkin"]("evening", {})
+    evening = rig["make_checkin"](
+        "evening",
+        tool_calls=[
+            [],
+            [("record_outcome", {"status": "partial", "notes": "tests missing"})],
+        ],
+    )
     assert evening.run(EVENING).value == "answered"
-
-    store.update_goal(store.get_goal("2026-08-05").id, "partial", "tests missing")
 
     goal = store.get_goal("2026-08-05")
     assert goal.status == "partial"
     assert goal.notes == "tests missing"
-    assert "Finish the auth flow" in journal.read("2026-08-05")
+    assert goal.reviewed_at is not None
+
+    assert [a.tool for a in store.recent_actions()] == [
+        "record_outcome", "save_goal",      # recent_actions is newest-first
+    ]
 
 
 def test_away_all_morning_then_present_defers_then_speaks(rig):
     store, presence, voice = rig["store"], rig["presence"], rig["voice"]
-    checkin = rig["make_checkin"]("morning", {})
+    checkin = rig["make_checkin"]("morning")
 
     presence.verdict_value = Verdict.DEFER
     assert checkin.run(MORNING).value == "deferred"
@@ -5076,7 +5213,7 @@ def test_away_all_morning_then_present_defers_then_speaks(rig):
 
 def test_silence_all_day_never_loses_the_checkin_row(rig):
     store = rig["store"]
-    checkin = rig["make_checkin"]("morning", {})
+    checkin = rig["make_checkin"]("morning")
 
     assert checkin.run(MORNING).value == "no_answer"
     assert checkin.run(MORNING).value == "no_answer"   # retry exhausted → folds
@@ -5114,10 +5251,9 @@ def test_downtime_across_two_days_replays_only_today(rig):
 def test_every_tool_call_is_visible_to_a_future_dashboard(rig):
     """Slice 2's dashboard can only show what Slice 1 recorded."""
     store, journal = rig["store"], rig["journal"]
-    from zeus.brain.tools import build_tools
 
     conv = store.start_conversation("schedule")
-    tools = {t.__name__: t for t in build_tools(store, journal, conv, "2026-08-05")}
+    tools = build_tool_callables(store, journal, conv, "2026-08-05")
     tools["save_goal"](text="Finish the auth flow")
     tools["record_outcome"](status="done")
 
@@ -5271,6 +5407,28 @@ Verified across task boundaries:
   `logged_tool`.
 - `build_tools(store, journal, conversation_id, local_date)` in T14 matches
   its call sites in T16's `build_daemon` and T18.
+
+### Amendments made before execution
+
+Two defects found in the pre-flight scan and fixed in this document before
+Task 1 was dispatched:
+
+1. **Task 18's golden path asserted on data the test itself wrote.** Because
+   `FakeConversation` could not invoke tools, the end-to-end test called
+   `store.set_goal(...)` and then asserted the goal existed — proving
+   nothing. `FakeConversation` now accepts real tool callables and a
+   per-turn `tool_calls` list, so the golden path exercises the genuine
+   brain → tool → action log → database chain. Nothing in that test now
+   writes the data it checks.
+2. **Tests assumed `@beta_tool` preserves `__name__` and direct
+   callability.** Several tests did `{t.__name__: t for t in build_tools(...)}`,
+   which depends on undocumented SDK decorator behaviour. `build_tools` is
+   now a thin wrapper over a new `build_tool_callables`, which returns the
+   plain action-logged bodies keyed by name. Tests and `FakeConversation`
+   use the callables; only the Tool Runner gets the decorated versions.
+
+`.gitignore` also already exists (it ignores `.worktrees/` and
+`.superpowers/`), so Task 1 verifies and extends it rather than creating it.
 
 ### Known simplification, flagged deliberately
 
