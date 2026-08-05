@@ -2708,8 +2708,16 @@ log = logging.getLogger(__name__)
 
 FRAME_SAMPLES = 1280        # 80 ms at 16 kHz — openWakeWord's expected chunk
 BYTES_PER_SAMPLE = 2        # int16
-_QUEUE_MAX = 256
-_SENTINEL = object()
+_QUEUE_MAX = 256            # 20.5 s of audio
+_POLL_SECONDS = 0.1         # how promptly frames() notices stop()
+
+# NOTE: an earlier draft signalled shutdown by pushing a module-level
+# _SENTINEL onto _queue. That deadlocked: _queue is bounded, so a blocking
+# put() on a full queue hangs stop() forever — and a full queue is exactly
+# the state after ~20 s of unconsumed audio, e.g. the half-duplex window
+# while ZEUS is speaking. It also leaked across restarts, because the
+# sentinel was never cleared, so the next frames() after a restart consumed
+# it and silently returned. Shutdown is out-of-band and now uses an Event.
 
 
 class RingBuffer:
@@ -2740,14 +2748,27 @@ class MicStream:
         self._queue: queue.Queue = queue.Queue(maxsize=_QUEUE_MAX)
         self._stream = None
         self._running = False
+        self._stopping = threading.Event()
+        self._lifecycle = threading.Lock()
         self.dropped = 0
 
     # -- lifecycle -----------------------------------------------------
     def start(self) -> None:
-        if self._running:
-            raise RuntimeError("MicStream already running")
+        # Locked check-and-set: without it two callers can both pass the
+        # guard and each open a RawInputStream, breaking the single-owner
+        # invariant this class exists to enforce. The lock is deliberately
+        # NOT taken in _on_audio — that runs on the real-time audio thread
+        # and must never contend with a slow caller.
+        with self._lifecycle:
+            if self._running:
+                raise RuntimeError("MicStream already running")
+            self._running = True
         import sounddevice as sd
 
+        # A restarted stream must inherit neither the previous run's shutdown
+        # signal nor its stale audio.
+        self._stopping.clear()
+        self.drain()
         self._stream = sd.RawInputStream(
             samplerate=self._config.sample_rate,
             channels=1,
@@ -2756,11 +2777,14 @@ class MicStream:
             callback=self._on_audio,
         )
         self._stream.start()
-        self._running = True
         log.info("microphone stream started at %d Hz", self._config.sample_rate)
 
     def stop(self) -> None:
-        self._running = False
+        with self._lifecycle:
+            self._running = False
+        # Set BEFORE closing the device, so a consumer blocked in frames() is
+        # released even if the close path raises.
+        self._stopping.set()
         if self._stream is not None:
             try:
                 self._stream.stop()
@@ -2768,7 +2792,6 @@ class MicStream:
             except Exception:
                 log.debug("error closing stream", exc_info=True)
             self._stream = None
-        self._queue.put(_SENTINEL)
 
     def __enter__(self) -> "MicStream":
         self.start()
@@ -2790,12 +2813,17 @@ class MicStream:
             self.dropped += 1
 
     def frames(self) -> Iterator[bytes]:
-        """Blocking iterator over live frames. Ends when stop() is called."""
-        while True:
-            item = self._queue.get()
-            if item is _SENTINEL:
-                return
-            yield item
+        """Blocking iterator over live frames. Ends when stop() is called.
+
+        Polls with a short timeout rather than blocking indefinitely, so
+        stop() is observed promptly without anything having to be pushed
+        onto the queue.
+        """
+        while not self._stopping.is_set():
+            try:
+                yield self._queue.get(timeout=_POLL_SECONDS)
+            except queue.Empty:
+                continue
 
     def pre_roll(self) -> bytes:
         """Audio captured just before now — prepended to a new utterance."""
@@ -2812,10 +2840,18 @@ class MicStream:
 
 Create `src/zeus/audio/__init__.py` (empty).
 
+**Testing the shutdown path safely:** the three shutdown/restart tests must
+never `join()` a thread without a timeout. Run `stop()` (or the `frames()`
+consumer) in a `daemon=True` thread and assert on `Event.wait(2)`. A
+regression in this exact area is a *hang*, and an unguarded join turns one
+failing test into a suite that never finishes.
+
 - [ ] **Step 4: Run the test and verify it passes**
 
 Run: `.venv/bin/pytest tests/audio/test_mic.py -v`
-Expected: PASS — 8 tests
+Expected: PASS — 11 tests (8 above, plus 3 added in review: stop() must not
+block on a full queue, frames() must terminate after stop() with an empty
+queue, and a restart must not inherit the previous run's stop signal.)
 
 - [ ] **Step 5: Commit**
 
