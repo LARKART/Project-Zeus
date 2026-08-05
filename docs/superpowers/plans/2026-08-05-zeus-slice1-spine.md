@@ -1112,7 +1112,9 @@ include = ["src/zeus/**/*.py", "src/zeus/**/*.sql"]
 - [ ] **Step 5: Run the test and verify it passes**
 
 Run: `.venv/bin/pytest tests/memory/test_store.py -v`
-Expected: PASS — 10 tests
+Expected: PASS — 15 tests (10 above, plus 5 added in review: the interleaved
+`set_goal` upsert-id test, three `find_open_checkin` tests including the
+local-vs-UTC date test, and the `update_goal` notes-preservation test.)
 
 - [ ] **Step 6: Commit**
 
