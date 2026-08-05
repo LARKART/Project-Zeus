@@ -1,4 +1,6 @@
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -57,3 +59,45 @@ def test_iso_normalises_non_utc_input_to_utc():
 def test_naive_datetime_is_rejected():
     with pytest.raises(ValueError):
         to_utc_iso(datetime(2026, 8, 5, 11, 0))
+
+
+def test_resolve_system_timezone_malformed_falls_back(monkeypatch):
+    """Malformed system timezone (invalid IANA key) falls back to UTC."""
+    with TemporaryDirectory() as tmpdir:
+        # Create a fake zoneinfo directory with an invalid zone key
+        zoneinfo_dir = Path(tmpdir) / "zoneinfo"
+        zoneinfo_dir.mkdir()
+        (zoneinfo_dir / "Bogus").mkdir()
+
+        # Create a symlink pointing to the invalid zone
+        broken_link = Path(tmpdir) / "localtime_broken"
+        broken_link.symlink_to(zoneinfo_dir / "Bogus" / "Zone")
+
+        # Patch _LOCALTIME to point to our broken symlink
+        monkeypatch.setattr("zeus.clock._LOCALTIME", broken_link)
+
+        # Should fall back to UTC instead of raising ZoneInfoNotFoundError
+        tz = resolve_timezone("system")
+        assert isinstance(tz, ZoneInfo)
+        assert tz.key == "UTC"
+
+
+def test_from_utc_iso_rejects_naive_string():
+    """Naive ISO strings (no offset) are rejected symmetrically with to_utc_iso."""
+    with pytest.raises(ValueError):
+        from_utc_iso("2026-08-05T11:00:00")
+
+
+def test_from_utc_iso_accepts_aware_strings():
+    """Aware ISO strings with any offset are accepted and normalized to UTC."""
+    # UTC offset
+    utc_str = "2026-08-05T11:00:00+00:00"
+    result = from_utc_iso(utc_str)
+    assert result.tzinfo is timezone.utc
+    assert result == datetime(2026, 8, 5, 11, 0, tzinfo=timezone.utc)
+
+    # Non-UTC offset (Lagos is UTC+1)
+    lagos_str = "2026-08-05T12:00:00+01:00"
+    result = from_utc_iso(lagos_str)
+    assert result.tzinfo is timezone.utc
+    assert result == datetime(2026, 8, 5, 11, 0, tzinfo=timezone.utc)

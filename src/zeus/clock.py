@@ -24,7 +24,7 @@ def resolve_timezone(name: str) -> ZoneInfo:
         parts = _LOCALTIME.resolve().parts
         index = len(parts) - 1 - parts[::-1].index("zoneinfo")
         return ZoneInfo("/".join(parts[index + 1 :]))
-    except (OSError, ValueError):
+    except (OSError, ValueError, KeyError):
         pass
     env = os.environ.get("TZ")
     if env:
@@ -44,7 +44,10 @@ def to_utc_iso(dt: datetime) -> str:
 
 def from_utc_iso(text: str) -> datetime:
     """Parse an ISO-8601 string back into an aware UTC datetime."""
-    return datetime.fromisoformat(text).astimezone(timezone.utc)
+    dt = datetime.fromisoformat(text)
+    if dt.tzinfo is None:
+        raise ValueError("naive datetime rejected; all timestamps must be aware")
+    return dt.astimezone(timezone.utc)
 
 
 class Clock(Protocol):
