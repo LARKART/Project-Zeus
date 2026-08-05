@@ -1,0 +1,15 @@
+# --- workspace isolation (must stay; added before plan execution) ---
+.worktrees/
+.superpowers/
+
+# --- python ---
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# --- zeus runtime artifacts ---
+models/
+*.db
+*.db-wal
+*.db-shm
