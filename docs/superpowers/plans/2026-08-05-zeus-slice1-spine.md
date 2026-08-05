@@ -1537,6 +1537,7 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'zeus.schedule.schedule
 """Generic recurring-job scheduler with startup catch-up. See spec §9."""
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable
@@ -1549,6 +1550,7 @@ from zeus.schedule.cron import next_occurrence, occurrences_between
 Handler = Callable[[datetime], None]
 
 _MAX_SLEEP = 60.0
+_log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -1611,8 +1613,17 @@ class Scheduler:
                 continue
             due = next_occurrence(expression, baseline, self._tz)
             if due <= now_utc:
+                # set_job_run BEFORE the handler, deliberately: the occurrence
+                # is consumed whether or not the handler succeeds. Persisting
+                # after would make a permanently-failing job re-fire on every
+                # poll. Retry policy for check-ins lives in the Task 8 state
+                # machine, not here.
                 self._store.set_job_run(name, due)
-                self._handlers[name](due)
+                try:
+                    self._handlers[name](due)
+                except Exception:
+                    # One job must never abort the sweep for the jobs after it.
+                    _log.exception("scheduled job %r failed at %s", name, due)
                 fired.append(name)
         return fired
 
@@ -1631,7 +1642,11 @@ class Scheduler:
 - [ ] **Step 4: Run the test and verify it passes**
 
 Run: `.venv/bin/pytest tests/schedule/test_scheduler.py -v`
-Expected: PASS — 7 tests
+Expected: PASS — 10 tests (7 above, plus 3 added in review: a raising handler
+must not abort the sweep; `seconds_until_next` must return a real sub-cap
+interval, not just the 60 s cap; and `same_local_day` must be pinned at a
+timestamp where the local and UTC dates genuinely diverge — 00:30 Lagos is
+23:30 UTC the previous day.)
 
 - [ ] **Step 5: Commit**
 
