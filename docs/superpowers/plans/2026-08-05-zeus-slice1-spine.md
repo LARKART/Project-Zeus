@@ -3612,6 +3612,20 @@ class StubStream:
 
 class StubClient:
     def __init__(self, streams):
+        """streams[i] is turn i's response.
+
+        A bare StubStream means that turn is a single round. A LIST of
+        StubStreams means the Tool Runner yielded several rounds within that
+        one turn — model call, tool execution, model call again — which is
+        what the real runner does whenever a tool is used.
+
+        An earlier draft returned the whole list on every call, conflating
+        "later turns" with "more rounds in this turn". A two-turn test then
+        had both streams consumed inside the FIRST send(), so
+        test_history_accumulates_across_turns saw
+        [user, assistant, assistant, user] and failed against the plan's own
+        Conversation.
+        """
         self._streams = streams
         self.calls = []
         beta = type("B", (), {})()
@@ -3620,7 +3634,10 @@ class StubClient:
 
     def _tool_runner(self, **kwargs):
         self.calls.append(kwargs)
-        return iter(self._streams)
+        turn = self._streams[len(self.calls) - 1]
+        # IndexError on more calls than turns is deliberate: loud beats a
+        # silent replay of an earlier turn's stream.
+        return iter(turn if isinstance(turn, list) else [turn])
 
 
 @pytest.fixture
@@ -3698,6 +3715,20 @@ def test_history_accumulates_across_turns(wiring):
 
     second_call = client.calls[1]["messages"]
     assert [m["role"] for m in second_call] == ["user", "assistant", "user"]
+
+
+def test_a_single_turn_can_span_several_tool_runner_rounds(wiring):
+    """The real runner yields one stream per round whenever a tool is used;
+    send() must surface sentences from every round, not just the first.
+
+    Added in review: fixing StubClient to hand out one turn per call would
+    otherwise have left this path — the whole reason send() iterates the
+    runner rather than reading a single response — with no coverage at all.
+    """
+    client = StubClient([[StubStream(["Saving that."]), StubStream(["Done."])]])
+    assert list(_conversation(client, wiring).send("[morning]")) == [
+        "Saving that.", "Done.",
+    ]
 
 
 def test_fake_conversation_replays_a_script():
@@ -4162,7 +4193,9 @@ __all__ = [
 - [ ] **Step 6: Run the tests and verify they pass**
 
 Run: `.venv/bin/pytest tests/brain/ -v`
-Expected: PASS — 27 tests
+Expected: PASS — 28 tests (27 above, plus
+`test_a_single_turn_can_span_several_tool_runner_rounds`, added in review
+alongside the StubClient fix so the multi-round path keeps coverage.)
 
 - [ ] **Step 7: Commit**
 
