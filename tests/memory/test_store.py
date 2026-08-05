@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -32,6 +33,21 @@ def test_set_goal_replaces_same_day(store):
     assert store.get_goal("2026-08-05").text == "Second"
 
 
+def test_set_goal_returns_updated_row_id(store):
+    # Regression for F1: cur.lastrowid is only bumped by a real INSERT, so on
+    # the ON CONFLICT DO UPDATE branch it silently returns the id of whatever
+    # row was last *inserted* on this connection -- not the row that was just
+    # updated. Interleave a second date's insert so a stale lastrowid would
+    # be caught: without the fix, re-setting A after inserting B returns B's
+    # id instead of A's.
+    a_id = store.set_goal("2026-08-05", "A")
+    b_id = store.set_goal("2026-08-06", "B")
+    updated_id = store.set_goal("2026-08-05", "A v2")
+    assert updated_id == a_id
+    assert updated_id != b_id
+    assert store.get_goal("2026-08-05").id == a_id
+
+
 def test_update_goal_status(store):
     goal_id = store.set_goal("2026-08-05", "Ship it")
     store.update_goal(goal_id, status="partial", notes="tests missing")
@@ -47,6 +63,18 @@ def test_invalid_goal_status_rejected(store):
         store.update_goal(goal_id, status="banana")
 
 
+def test_update_goal_preserves_existing_notes(store):
+    # Regression for F3: update_goal wrote notes unconditionally, so calling
+    # it without the optional notes arg (its own default invites this)
+    # clobbered notes from an earlier review.
+    goal_id = store.set_goal("2026-08-05", "Ship it")
+    store.update_goal(goal_id, status="partial", notes="went well")
+    store.update_goal(goal_id, status="missed")
+    goal = store.get_goal("2026-08-05")
+    assert goal.notes == "went well"
+    assert goal.status == "missed"
+
+
 def test_checkin_lifecycle(store):
     cid = store.open_checkin("morning", START)
     assert store.get_checkin(cid).outcome == "deferred"
@@ -55,6 +83,36 @@ def test_checkin_lifecycle(store):
     assert checkin.outcome == "answered"
     assert checkin.attempts == 1
     assert checkin.fired_at == START
+
+
+def test_find_open_checkin_returns_unresolved(store):
+    cid = store.open_checkin("morning", START)
+    found = store.find_open_checkin("morning", "2026-08-05")
+    assert found is not None
+    assert found.id == cid
+
+
+def test_find_open_checkin_ignores_settled(store):
+    answered_id = store.open_checkin("morning", START)
+    store.update_checkin(answered_id, outcome="answered", attempts=1)
+    assert store.find_open_checkin("morning", "2026-08-05") is None
+
+    no_answer_id = store.open_checkin("morning", START)
+    store.update_checkin(no_answer_id, outcome="no_answer", attempts=1)
+    found = store.find_open_checkin("morning", "2026-08-05")
+    assert found is not None
+    assert found.id == no_answer_id
+
+
+def test_find_open_checkin_uses_local_not_utc_date(store):
+    # 21:00 local in America/New_York (EDT, UTC-4 in August) is 01:00 UTC the
+    # *next* day. checkins.scheduled_for is stored as UTC, so a lookup that
+    # compared date(scheduled_for) against the local calendar date would
+    # miss this check-in entirely -- it must be keyed on local_date instead.
+    local_dt = datetime(2026, 8, 5, 21, 0, tzinfo=ZoneInfo("America/New_York"))
+    store.open_checkin("evening", local_dt)
+    assert store.find_open_checkin("evening", "2026-08-05") is not None
+    assert store.find_open_checkin("evening", "2026-08-06") is None
 
 
 def test_action_log(store):

@@ -32,6 +32,7 @@ class Goal:
 class CheckIn:
     id: int
     kind: str
+    local_date: str
     scheduled_for: datetime
     fired_at: datetime | None
     outcome: str
@@ -85,16 +86,18 @@ class Store:
 
     # ---- goals -------------------------------------------------------
     def set_goal(self, date: str, text: str) -> int:
-        cur = self.connection.execute(
+        # RETURNING, not cur.lastrowid: last_insert_rowid() is only updated by a
+        # real insert, so on the ON CONFLICT DO UPDATE branch lastrowid silently
+        # returns the id of whatever row was last inserted on this connection.
+        row = self.connection.execute(
             "INSERT INTO goals (date, text, set_at) VALUES (?, ?, ?) "
             "ON CONFLICT(date) DO UPDATE SET text = excluded.text, "
             "set_at = excluded.set_at, status = 'pending', "
-            "reviewed_at = NULL, notes = NULL",
+            "reviewed_at = NULL, notes = NULL "
+            "RETURNING id",
             (date, text, self._now()),
-        )
-        if cur.lastrowid:
-            return cur.lastrowid
-        return self.get_goal(date).id  # type: ignore[union-attr]
+        ).fetchone()
+        return int(row["id"])
 
     def get_goal(self, date: str) -> Goal | None:
         row = self.connection.execute(
@@ -109,16 +112,23 @@ class Store:
         )
 
     def update_goal(self, goal_id: int, status: str, notes: str | None = None) -> None:
+        # COALESCE, matching update_checkin's fired_at: omitting the optional
+        # notes arg must not erase notes written by an earlier review. Clearing
+        # notes is still reachable -- set_goal's upsert resets them to NULL.
         self.connection.execute(
-            "UPDATE goals SET status = ?, notes = ?, reviewed_at = ? WHERE id = ?",
+            "UPDATE goals SET status = ?, notes = COALESCE(?, notes), "
+            "reviewed_at = ? WHERE id = ?",
             (status, notes, self._now(), goal_id),
         )
 
     # ---- check-ins ---------------------------------------------------
     def open_checkin(self, kind: str, scheduled_for: datetime) -> int:
+        # scheduled_for is aware and carries the *local* zone the scheduler built
+        # it in, so .date() is the local calendar day. Reading it before
+        # to_utc_iso() converts is what keeps Store timezone-free.
         cur = self.connection.execute(
-            "INSERT INTO checkins (kind, scheduled_for) VALUES (?, ?)",
-            (kind, to_utc_iso(scheduled_for)),
+            "INSERT INTO checkins (kind, local_date, scheduled_for) VALUES (?, ?, ?)",
+            (kind, scheduled_for.date().isoformat(), to_utc_iso(scheduled_for)),
         )
         return int(cur.lastrowid)
 
@@ -127,7 +137,29 @@ class Store:
             "SELECT * FROM checkins WHERE id = ?", (checkin_id,)
         ).fetchone()
         return CheckIn(
-            id=row["id"], kind=row["kind"],
+            id=row["id"], kind=row["kind"], local_date=row["local_date"],
+            scheduled_for=from_utc_iso(row["scheduled_for"]),
+            fired_at=_dt(row["fired_at"]), outcome=row["outcome"],
+            attempts=row["attempts"],
+        )
+
+    def find_open_checkin(self, kind: str, date: str) -> CheckIn | None:
+        """The unresolved check-in of this kind on this local date, if any.
+
+        "Open" means not yet terminal: 'answered' and 'skipped' are settled
+        outcomes, while 'deferred' and 'no_answer' are both still eligible for
+        a retry and so still count as open.
+        """
+        row = self.connection.execute(
+            "SELECT * FROM checkins WHERE kind = ? AND local_date = ? "
+            "AND outcome NOT IN ('answered','skipped') "
+            "ORDER BY id DESC LIMIT 1",
+            (kind, date),
+        ).fetchone()
+        if row is None:
+            return None
+        return CheckIn(
+            id=row["id"], kind=row["kind"], local_date=row["local_date"],
             scheduled_for=from_utc_iso(row["scheduled_for"]),
             fired_at=_dt(row["fired_at"]), outcome=row["outcome"],
             attempts=row["attempts"],

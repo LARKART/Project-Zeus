@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS goals (
 CREATE TABLE IF NOT EXISTS checkins (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     kind          TEXT NOT NULL CHECK (kind IN ('morning','evening')),
+    local_date    TEXT NOT NULL,                 -- local YYYY-MM-DD, same convention as goals.date
     scheduled_for TEXT NOT NULL,
     fired_at      TEXT,
     outcome       TEXT NOT NULL DEFAULT 'deferred'
@@ -22,6 +23,7 @@ CREATE TABLE IF NOT EXISTS checkins (
     attempts      INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_checkins_sched ON checkins (scheduled_for);
+CREATE INDEX IF NOT EXISTS idx_checkins_local_date ON checkins (local_date, kind);
 
 CREATE TABLE IF NOT EXISTS conversations (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
