@@ -47,16 +47,17 @@ class WakeWordActivator:
         self._muted = True
 
     def unmute(self) -> None:
-        # No mic.drain() here: while muted, events() keeps pulling frames
-        # off the mic queue via the `for frame in self._mic.frames()` loop
-        # below and simply skips scoring them (`if self._muted: continue`),
-        # so no backlog accumulates during a normal mute/unmute cycle where
-        # events() is being iterated throughout. Draining on unmute would
-        # instead discard whatever frame is sitting in the queue at the
-        # moment unmute() runs, regardless of whether it arrived before
-        # mute() or during it — including genuine audio that was queued
-        # before events() ever started consuming.
+        """Re-enable detection after ZEUS has finished speaking.
+
+        Drains the mic queue first. While muted, events() is typically
+        suspended at its yield mid-conversation rather than consuming
+        frames, so the queue holds ZEUS's own voice. Without this drain the
+        detector scores all of it on resume and re-triggers itself — the
+        exact feedback loop muting exists to prevent. Measured: 51 queued
+        frames of self-audio, all 51 scored after unmute.
+        """
         self._muted = False
+        self._mic.drain()
 
     def events(self) -> Iterator[ActivationEvent]:
         if self._model is None:

@@ -74,11 +74,65 @@ def test_muting_suppresses_detection(monkeypatch):
 
 
 def test_unmute_restores_detection(monkeypatch):
-    activator = _wake_activator(monkeypatch, [0.9], 1)
+    """unmute() must not leave the detector permanently deaf.
+
+    Written standalone rather than via _wake_activator: that helper stops
+    the mic before returning, and _on_audio() silently drops frames once
+    stopped, so it cannot model a frame arriving after unmute() the way
+    production does (detector already live, mute/unmute happen while ZEUS
+    speaks, then real audio follows). Here the wake frame is queued only
+    after unmute(), so unmute()'s drain (which empties the queue while it
+    holds nothing) cannot be confused with discarding it.
+    """
+    mic = MicStream(AudioConfig())
+    activator = WakeWordActivator(mic, WakeConfig(), threshold=0.5)
+    monkeypatch.setattr(activator, "_load_model", lambda: DummyModel([0.9]))
     activator.start()
+    events = activator.events()  # detector is already live, as in production
+
     activator.mute()
     activator.unmute()
-    assert [e.source for e in activator.events()] == ["wake"]
+    mic._on_audio(FRAME, FRAME_SAMPLES, None, None)  # real audio, after unmute
+    mic.stop()  # sentinel terminates frames()
+
+    assert [e.source for e in events] == ["wake"]
+
+
+class CountingModel:
+    """Counts predict() calls; proves muted-and-discarded frames are never scored."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def predict(self, samples):
+        self.calls += 1
+        return {"hey_jarvis": 0.0}
+
+
+def test_unmute_discards_audio_captured_while_speaking(monkeypatch):
+    """Regression: unmute() must drain frames queued while ZEUS was speaking.
+
+    events() is a generator; mid-conversation it is suspended at its yield
+    while the daemon speaks, so nothing is consuming the mic queue during
+    that window. Without a drain in unmute(), all of ZEUS's own speech
+    queued during mute gets scored the instant detection resumes — the
+    exact feedback loop mute() exists to prevent.
+    """
+    mic = MicStream(AudioConfig())
+    model = CountingModel()
+    activator = WakeWordActivator(mic, WakeConfig(), threshold=0.5)
+    monkeypatch.setattr(activator, "_load_model", lambda: model)
+    activator.start()
+    events = activator.events()  # detector is already live, as in production
+
+    activator.mute()
+    for _ in range(20):
+        mic._on_audio(FRAME, FRAME_SAMPLES, None, None)  # ZEUS's own voice
+    activator.unmute()
+
+    mic.stop()  # sentinel terminates frames()
+    assert list(events) == []
+    assert model.calls == 0
 
 
 def test_factory_builds_wake_word_activator():
