@@ -21,9 +21,10 @@ class StubEvent:
 
 
 class StubStream:
-    def __init__(self, chunks, stop_reason="end_turn"):
+    def __init__(self, chunks, stop_reason="end_turn", content=None):
         self._chunks = chunks
         self._stop_reason = stop_reason
+        self._content = content if content is not None else []
 
     def __iter__(self):
         return iter(StubEvent(c) for c in self._chunks)
@@ -31,7 +32,7 @@ class StubStream:
     def get_final_message(self):
         return type("M", (), {
             "stop_reason": self._stop_reason,
-            "content": [],
+            "content": self._content,
             "stop_details": None,
         })()
 
@@ -144,6 +145,43 @@ def test_a_single_turn_can_span_several_tool_runner_rounds(wiring):
     assert list(_conversation(client, wiring).send("[morning]")) == [
         "Saving that.", "Done.",
     ]
+
+
+def test_a_tool_using_turn_leaves_history_alternating(wiring):
+    """A turn where the model calls a tool is >1 round: a tool_use round,
+    then a text round. Appending an assistant message per round (instead of
+    once per turn) leaves two consecutive assistant messages in history with
+    no tool_result between them, which the real API rejects with a 400 on
+    the NEXT send() — degrading a successful tool call into "I can't reach
+    my brain right now" right after it worked."""
+    tool_use_round = StubStream(
+        [], stop_reason="tool_use",
+        content=[{
+            "type": "tool_use", "id": "toolu_1",
+            "name": "record_outcome", "input": {},
+        }],
+    )
+    text_round = StubStream(["Got it."])
+    client = StubClient([
+        [tool_use_round, text_round],
+        StubStream(["Anything else?"]),
+    ])
+    conversation = _conversation(client, wiring)
+    list(conversation.send("first"))
+    list(conversation.send("second"))
+
+    submitted = client.calls[1]["messages"]
+    roles = [m["role"] for m in submitted]
+    assert all(roles[i] != roles[i + 1] for i in range(len(roles) - 1)), roles
+
+    def _has_tool_use(message):
+        content = message["content"]
+        return isinstance(content, list) and any(
+            isinstance(block, dict) and block.get("type") == "tool_use"
+            for block in content
+        )
+
+    assert not any(_has_tool_use(m) for m in submitted)
 
 
 def test_fake_conversation_replays_a_script():

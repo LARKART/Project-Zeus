@@ -51,6 +51,7 @@ class Conversation:
 
         buffer = ""
         spoken: list[str] = []
+        final_content = None
         try:
             runner = self._client.beta.messages.tool_runner(
                 model=self._config.model,
@@ -91,15 +92,28 @@ class Conversation:
                     yield REFUSAL_LINE
                     buffer = ""
                     break
-                self._messages.append(
-                    {"role": "assistant", "content": final.content}
-                )
+                # Keep only the LAST round's content. A turn that uses a
+                # tool is >1 round (tool_use, then text); appending per
+                # round left two consecutive assistant messages with an
+                # unresolved tool_use and no tool_result, which the API
+                # rejects with a 400 on the NEXT send(). The runner already
+                # handles tool_use/tool_result correctly inside the turn —
+                # it copies our list rather than mutating it (anthropic
+                # 0.120.2), so what we keep here is only what the next turn
+                # replays, and one closing assistant message per turn keeps
+                # role alternation valid by construction.
+                final_content = final.content
 
         except Exception:
             log.error("conversation failed", exc_info=True)
             yield ERROR_LINE
             spoken.append(ERROR_LINE)
             buffer = ""
+
+        if final_content is not None:
+            self._messages.append(
+                {"role": "assistant", "content": final_content}
+            )
 
         remainder = buffer.strip()
         if remainder:
