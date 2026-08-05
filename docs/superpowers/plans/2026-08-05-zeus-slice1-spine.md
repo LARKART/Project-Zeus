@@ -28,6 +28,7 @@ Every task's requirements implicitly include this section.
 - **No automated test may require a microphone, speakers, or a network call.** Hardware checks live only in the manual `zeus selftest` command.
 - **Audio format throughout: 16 kHz, mono, `int16`.** openWakeWord consumes 1280-sample (80 ms) chunks.
 - **Every commit runs `pytest` green before being made.**
+- **Test directories carry no `__init__.py`, and `pyproject.toml` sets `addopts = ["--import-mode=importlib"]`.** These two go together and both are required. This plan gives several tasks a test file named `test_fake.py` in its own subdirectory (`tests/tts/`, `tests/stt/`, …). Under pytest's legacy `prepend` import mode, same-basename test modules in `__init__.py`-less directories collide and the suite fails to *collect at all* — `import file mismatch: imported module 'test_fake' has this __file__ attribute …`. Discovered in T10, when `tests/stt/test_fake.py` met T9's `tests/tts/test_fake.py`. `importlib` mode resolves it without `__init__.py` files and without renaming any file the plan declares.
 
 ---
 
@@ -2365,6 +2366,7 @@ git commit -m "feat: Speaker protocol with macOS say and fake implementations"
 
 **Files:**
 - Create: `src/zeus/stt/__init__.py`, `src/zeus/stt/base.py`, `src/zeus/stt/local_whisper.py`, `src/zeus/stt/fake.py`
+- Modify: `pyproject.toml` — add `addopts = ["--import-mode=importlib"]` under `[tool.pytest.ini_options]`. Required, not optional: `tests/stt/test_fake.py` shares a basename with T9's `tests/tts/test_fake.py`, and with no `__init__.py` in either directory the legacy `prepend` import mode makes the whole suite fail to collect. See Global Constraints.
 - Test: `tests/stt/test_fake.py`, `tests/stt/test_local_whisper.py`
 
 **Interfaces:**
