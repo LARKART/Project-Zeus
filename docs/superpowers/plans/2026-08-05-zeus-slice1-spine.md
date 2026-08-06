@@ -1158,7 +1158,7 @@ include = ["src/zeus/**/*.py", "src/zeus/**/*.sql"]
 - [ ] **Step 5: Run the test and verify it passes**
 
 Run: `.venv/bin/pytest tests/memory/test_store.py -v`
-Expected: PASS — 15 tests (10 above, plus 5 added in review: the interleaved
+Expected: PASS — 14 tests (10 above, plus 5 added in review: the interleaved
 `set_goal` upsert-id test, three `find_open_checkin` tests including the
 local-vs-UTC date test, and the `update_goal` notes-preservation test.)
 
@@ -5842,7 +5842,21 @@ def main(argv: list[str] | None = None) -> int:
         ("doctor", "print an environment report"),
         ("install-agent", "write the LaunchAgent plist"),
     ]:
-        sub.add_parser(name, help=help_text)
+        subparser = sub.add_parser(name, help=help_text)
+        # `--root` is declared on the TOP-level parser above, but argparse
+        # subparsers consume every token after the subcommand name and hand
+        # them to the chosen subparser — one that knows nothing about
+        # `--root`. So `zeus doctor --root DIR` (root AFTER the subcommand,
+        # the form every test below and every real invocation uses) raised
+        # "unrecognized arguments" and SystemExit(2), while
+        # `zeus --root DIR doctor` worked. Mirroring the flag fixes it.
+        # default=argparse.SUPPRESS, NOT None: a subparser re-applies its own
+        # defaults onto the shared namespace after parsing, so default=None
+        # here would silently clobber a --root the top-level parser had
+        # already captured when it appears BEFORE the subcommand.
+        subparser.add_argument(
+            "--root", type=Path, default=argparse.SUPPRESS, help="ZEUS data directory"
+        )
 
     # argparse RAISES SystemExit(2) on an unknown subcommand rather than
     # returning — so without this, main() only sometimes returns an int and
@@ -5874,7 +5888,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run the test and verify it passes**
 
 Run: `.venv/bin/pytest tests/test_cli.py -v`
-Expected: PASS — 15 tests
+Expected: PASS — 14 tests
 
 - [ ] **Step 5: Commit**
 
