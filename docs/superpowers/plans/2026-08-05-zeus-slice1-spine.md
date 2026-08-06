@@ -1217,6 +1217,7 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'zeus.memory.journal'`
 """Human-readable daily journal. See spec §6."""
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -1236,6 +1237,15 @@ class Journal:
         self._clock = clock
         self._tz = tz
         self._dir.mkdir(parents=True, exist_ok=True)
+        # append() is check-then-act: it tests for the file, writes a header
+        # if absent, then reopens for append. Two threads racing the FIRST
+        # write of a day can both see "absent", and the second write_text
+        # (mode "w") truncates the first's entry. T16's build_daemon wires
+        # the scheduler thread and the wake-word activation thread to the
+        # SAME Journal, so this is reachable, not theoretical — measured at
+        # 10 lost entries across 40 trials of 8 concurrent writers, with no
+        # error raised. The line simply is not there.
+        self._lock = threading.Lock()
 
     def _local_now(self):
         return self._clock.now_utc().astimezone(self._tz)
@@ -1244,13 +1254,14 @@ class Journal:
         return self._dir / f"{date}.md"
 
     def append(self, line: str) -> None:
-        now = self._local_now()
-        date = now.strftime("%Y-%m-%d")
-        path = self.path_for(date)
-        if not path.exists():
-            path.write_text(f"# {date}\n\n")
-        with path.open("a") as handle:
-            handle.write(f"- {now.strftime('%H:%M')} — {line}\n")
+        with self._lock:
+            now = self._local_now()
+            date = now.strftime("%Y-%m-%d")
+            path = self.path_for(date)
+            if not path.exists():
+                path.write_text(f"# {date}\n\n", encoding="utf-8")
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(f"- {now.strftime('%H:%M')} — {line}\n")
 
     def read(self, date: str) -> str:
         path = self.path_for(date)
@@ -1260,7 +1271,12 @@ class Journal:
 - [ ] **Step 4: Run the test and verify it passes**
 
 Run: `.venv/bin/pytest tests/memory/test_journal.py -v`
-Expected: PASS — 5 tests
+Expected: PASS — 6 tests (5 above, plus
+`test_concurrent_appends_do_not_lose_entries`, added in review. append() is
+check-then-act and T16's build_daemon gives the scheduler thread and the
+wake-word thread the SAME Journal: measured 10 lost entries across 40
+trials of 8 concurrent writers, silently — no error, the line is just
+absent.)
 
 - [ ] **Step 5: Commit**
 
@@ -5048,7 +5064,10 @@ def build_daemon(config: Config | None = None) -> Daemon:
 - [ ] **Step 4: Run the test and verify it passes**
 
 Run: `.venv/bin/pytest tests/test_daemon.py -v`
-Expected: PASS — 13 tests
+Expected: PASS — 14 tests (13 above, plus a shutdown test added in review:
+WakeWordActivator.events() only checks _running AFTER mic.frames() yields,
+so stopping the activator alone never terminates it — the daemon must stop
+the MIC too.)
 
 - [ ] **Step 5: Commit**
 
