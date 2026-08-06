@@ -59,7 +59,13 @@ def audio_self_test(mic: MicStream, seconds: float = 1.0) -> bool:
         done.set()
 
     threading.Thread(target=consume, daemon=True).start()
-    deadline = seconds * 2 + 1.0
+    # Budget generously at 5s: this measures TOTAL capture, not
+    # time-to-first-frame, and a Bluetooth input switching into its HFP
+    # profile can take seconds before the first callback arrives. Too tight
+    # a budget makes a slow device indistinguishable from a dead one -- and
+    # the consequence is sticky, because `degraded` is never re-tested or
+    # cleared, so ZEUS stays notification-only until the process restarts.
+    deadline = max(seconds * 5.0, 5.0)
     if not done.wait(timeout=deadline):
         log.error(
             "audio self-test: timed out after %.1fs waiting for %d frames "
@@ -148,15 +154,18 @@ class Daemon:
     def run_catch_up(self) -> list[tuple[str, str]]:
         missed = self._scheduler.catch_up()
         actions = catch_up_actions(missed)
-        # missed is sorted ascending by scheduled_for (Scheduler.catch_up),
-        # so a plain overwrite-on-duplicate dict comprehension leaves each
-        # job mapped to its LATEST occurrence. A job can appear more than
-        # once in `missed` (e.g. two stale mornings plus today's), and it
-        # must end up consuming its most recent occurrence, not an older
-        # one.
-        by_job = {run.job: run.scheduled_for for run in missed}
-        for job, action in actions:
-            when = by_job[job]
+        # zip, not a {job: latest} lookup. catch_up_actions returns ONE
+        # entry per missed RUN, so a job with several missed occurrences
+        # (two days of downtime gives morning@d1, evening@d1, morning@d2)
+        # gets several entries -- and a by-job dict resolved every one of
+        # them to that job's LATEST occurrence, so the morning@d1 entry
+        # logged and consumed the timestamp of the occurrence about to be
+        # fired two iterations later. The final set_job_run lands on the
+        # same value either way (missed is ascending, last write wins), so
+        # the durable state is unchanged; what was wrong was the timestamp
+        # each individual decision was reported and recorded against.
+        for run, (job, action) in zip(missed, actions):
+            when = run.scheduled_for
             if action == "fire" and job in self._checkins:
                 log.info("catch-up: firing %s missed at %s", job, when)
                 try:

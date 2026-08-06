@@ -1,4 +1,5 @@
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -16,6 +17,7 @@ from zeus.daemon import (
     DegradedPresence,
     SwitchablePresence,
     audio_self_test,
+    build_daemon,
     catch_up_actions,
 )
 from zeus.memory.journal import Journal
@@ -32,10 +34,31 @@ SPEECH = (np.ones(FRAME_SAMPLES, dtype=np.int16) * 5000).tobytes()
 
 
 def _mic(frames):
+    """A real MicStream that delivers `frames` to whoever subscribes next.
+
+    Frames can no longer be pre-loaded before a consumer exists: MicStream
+    fans out to per-subscriber queues and a fresh subscription starts empty
+    -- that emptiness is what stops the wake detector eating a check-in's
+    answer (round 4, C2). So the frames are pushed from a background thread
+    once a subscriber has appeared (audio_self_test subscribes when it
+    advances mic.frames()), then the stream is stopped so frames()
+    terminates. Daemon, not joined: if no subscriber ever appears the
+    thread simply gives up after its own deadline rather than holding the
+    suite.
+    """
     mic = MicStream(AudioConfig())
-    for frame in frames:
-        mic._on_audio(frame, FRAME_SAMPLES, None, None)
-    mic.stop()
+
+    def feed():
+        deadline = time.monotonic() + 5.0
+        while not mic._subscribers:
+            if time.monotonic() >= deadline:
+                return
+            time.sleep(0.005)
+        for frame in frames:
+            mic._on_audio(frame, FRAME_SAMPLES, None, None)
+        mic.stop()
+
+    threading.Thread(target=feed, daemon=True).start()
     return mic
 
 
@@ -89,6 +112,25 @@ class _MicThatGoesQuietMidCapture:
         yield SPEECH
         yield SPEECH
         threading.Event().wait()
+
+
+class _SlowToStartMic:
+    """Delivers nothing for a while, then real audio.
+
+    Models the case M2 is about: a Bluetooth input switching into its HFP
+    profile can take seconds before the first callback arrives. The
+    self-test's deadline measures TOTAL capture, not time-to-first-frame,
+    so too tight a budget makes a slow device indistinguishable from a dead
+    one -- and the consequence is sticky, because `degraded` is never
+    re-tested or cleared.
+    """
+
+    def __init__(self, delay: float) -> None:
+        self._delay = delay
+
+    def frames(self):
+        time.sleep(self._delay)
+        yield SPEECH
 
 
 class _StubPresence:
@@ -148,6 +190,12 @@ def test_self_test_times_out_when_audio_stops_mid_capture():
     body), not a substitute for the fix: if audio_self_test regressed back
     to hanging forever, this thread would never finish either, and the
     assertion below would fail cleanly instead of hanging the suite.
+
+    The safety net waits 10s because audio_self_test's own deadline is
+    max(seconds * 5.0, 5.0) == 5.0s here (round 4, M2: the 5s budget is
+    ruled, and a Bluetooth input's HFP profile switch is why). A net that
+    is not strictly longer than the deadline it is guarding turns a passing
+    fix into a failing test.
     """
     result: dict[str, bool] = {}
     finished = threading.Event()
@@ -159,13 +207,39 @@ def test_self_test_times_out_when_audio_stops_mid_capture():
         finished.set()
 
     threading.Thread(target=run, daemon=True).start()
-    completed = finished.wait(timeout=5)
+    completed = finished.wait(timeout=10)
 
     assert completed, (
-        "audio_self_test did not return within 5s -- the mid-capture "
+        "audio_self_test did not return within 10s -- the mid-capture "
         "deadline regressed"
     )
     assert result["value"] is False
+
+
+def test_the_self_test_deadline_tolerates_a_slow_device():
+    """M2 (round 4): the ruled deadline is max(seconds * 5.0, 5.0); the code
+    had quietly tightened it to seconds * 2 + 1.0.
+
+    seconds=0.1 wants a single frame and puts the two budgets far apart --
+    1.2s under the tightened rule, 5.0s under the ruled one -- so a device
+    that takes 1.5s to produce its first frame is judged DEAD by the
+    tightened deadline and healthy by the ruled one. Picking that gap keeps
+    the test's own cost to ~1.5s rather than the ~3.5s a `seconds=1.0`
+    version would need.
+    """
+    result: dict[str, bool] = {}
+    finished = threading.Event()
+
+    def run() -> None:
+        result["value"] = audio_self_test(_SlowToStartMic(1.5), seconds=0.1)
+        finished.set()
+
+    threading.Thread(target=run, daemon=True).start()
+    assert finished.wait(timeout=10), "audio_self_test never returned"
+    assert result["value"] is True, (
+        "a device that took 1.5s to deliver its first frame was reported as "
+        "a dead microphone -- the self-test deadline is too tight"
+    )
 
 
 @pytest.mark.parametrize(
@@ -497,3 +571,92 @@ def test_a_failed_self_test_makes_check_ins_notify_instead_of_speak(tmp_path):
     assert notifier.sent[-1] == ("ZEUS", "Morning check-in")
     assert voice.spoken == []
     assert outcome is Outcome.DEFERRED
+
+
+def test_each_catch_up_decision_consumes_its_own_occurrence(tmp_path):
+    """M1 (round 4): catch_up_actions returns one entry per missed RUN, so a
+    job with several missed occurrences produces several entries. Resolving
+    each entry's timestamp through a {job: latest_occurrence} dict gave
+    every one of them that job's LATEST occurrence -- so the skip of
+    yesterday's morning logged and consumed the timestamp of the occurrence
+    about to be FIRED two iterations later.
+
+    Two days of downtime, one daily job: catch_up() returns yesterday's
+    morning (a different local day, so "skip") and today's ("fire"). Each
+    decision must be recorded against the occurrence it is actually about.
+    The durable end state is the same either way -- `missed` is ascending
+    and the last write wins -- so the assertion is on the sequence, which
+    is the only place the defect is visible.
+    """
+    clock = FakeClock(datetime(2026, 8, 3, 12, 0, tzinfo=timezone.utc))
+    store = Store(tmp_path / "zeus.db", clock)
+    journal = Journal(tmp_path / "journal", clock, LAGOS)
+    scheduler = Scheduler(store, clock, LAGOS)
+    fired: list[datetime] = []
+
+    class _RecordingCheckIn:
+        def run(self, scheduled_for):
+            fired.append(scheduled_for)
+
+    checkin = _RecordingCheckIn()
+    scheduler.register("checkin_morning", "0 11 * * *", checkin.run)
+    store.set_heartbeat()
+
+    consumed: list[tuple[str, datetime]] = []
+    real_set_job_run = store.set_job_run
+
+    def recording_set_job_run(name, last_run_at):
+        consumed.append((name, last_run_at))
+        real_set_job_run(name, last_run_at)
+
+    store.set_job_run = recording_set_job_run
+
+    # Two days down: 11:00 Lagos == 10:00 UTC on the 4th and the 5th.
+    clock.advance(timedelta(days=2))  # 2026-08-05 12:00 UTC
+    instance = Daemon(
+        config=Config(root=tmp_path), store=store, journal=journal,
+        scheduler=scheduler, presence=None, voice=None, notifier=None,
+        checkins={"checkin_morning": checkin}, clock=clock,
+    )
+
+    yesterday = datetime(2026, 8, 4, 10, 0, tzinfo=timezone.utc)
+    today = datetime(2026, 8, 5, 10, 0, tzinfo=timezone.utc)
+
+    actions = instance.run_catch_up()
+
+    assert actions == [("checkin_morning", "skip"), ("checkin_morning", "fire")]
+    assert fired == [today]
+    assert consumed == [("checkin_morning", yesterday), ("checkin_morning", today)], (
+        "a catch-up decision was recorded against an occurrence other than "
+        "the one it was made about"
+    )
+
+
+def test_build_daemon_wraps_presence_so_a_failed_self_test_can_degrade_it(
+    monkeypatch, tmp_path
+):
+    """M3 (round 4): both other wiring tests construct the SwitchablePresence
+    themselves, so nothing pinned that build_daemon() wraps Presence at all
+    -- and Daemon.start() calls self._presence.degrade() unconditionally on
+    a failed self-test, which a bare Presence does not have.
+
+    Runs the real factory. No microphone, no speaker and no network are
+    touched: MicStream/WakeWordActivator/LocalWhisper/MacSay all defer their
+    device and model work to first use, and anthropic.Anthropic() only reads
+    the key. The key is set here rather than read from the environment so
+    the test neither depends on nor consumes a real one.
+    """
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-never-sent")
+
+    instance = build_daemon(Config(root=tmp_path))
+
+    assert isinstance(instance._presence, SwitchablePresence)
+    # The same object reaches every CheckIn -- that shared identity is what
+    # makes one degrade() call downgrade all of them.
+    for name in ("checkin_morning", "checkin_evening"):
+        assert instance._checkins[name]._presence is instance._presence
+    # And one mic, fanned out to both consumers (round 4, C2): the detector
+    # and VoiceIO must share the single CoreAudio stream, not open two.
+    assert instance._voice._mic is instance._mic
+    assert instance._activator._mic is instance._mic
+    instance._store.close()
