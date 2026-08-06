@@ -10,6 +10,7 @@ from zeus.audio.endpointer import Endpointer, rms
 from zeus.audio.mic import FRAME_SAMPLES, MicStream
 from zeus.clock import Clock, SystemClock, resolve_timezone
 from zeus.config import Config, load_config
+from zeus.context.presence import Verdict
 from zeus.schedule.cron import hhmm_to_cron
 from zeus.schedule.scheduler import MissedRun, Scheduler
 
@@ -27,15 +28,45 @@ def audio_self_test(mic: MicStream, seconds: float = 1.0) -> bool:
     Risk R1: when macOS denies microphone access to a LaunchAgent-spawned
     process, the stream opens successfully and returns pure silence forever.
     Without this check ZEUS looks healthy while being completely deaf.
+
+    `seconds` bounds a FRAME COUNT (roughly `seconds` of audio at 16kHz), not
+    wall-clock time. MicStream.frames() polls its own queue internally and
+    only returns control once its `_stopping` Event is set -- nothing sets
+    that during a self-test. So if the audio callback stops firing
+    mid-capture -- a plausible dead-hardware variant of R1, distinct from
+    "never produced audio at all" -- the `for` loop below would never see
+    another frame and would block forever: a generator only hands control
+    back to its caller at a `yield`, and with the callback dead there is no
+    further one coming, so no code here would ever run again to notice.
+    Consuming on a background thread is what makes a real deadline possible
+    even though that thread itself may never return: Event.wait(timeout) is
+    backed by a monotonic clock, so it can never be defeated by a backward
+    wall-clock jump (an NTP correction, a DST transition) the way a
+    datetime.now()-based elapsed-time check could be.
     """
     wanted = max(1, int(seconds * 16000 / FRAME_SAMPLES))
     energy = 0.0
     seen = 0
-    for frame in mic.frames():
-        energy = max(energy, rms(frame))
-        seen += 1
-        if seen >= wanted:
-            break
+    done = threading.Event()
+
+    def consume() -> None:
+        nonlocal energy, seen
+        for frame in mic.frames():
+            energy = max(energy, rms(frame))
+            seen += 1
+            if seen >= wanted:
+                break
+        done.set()
+
+    threading.Thread(target=consume, daemon=True).start()
+    deadline = seconds * 2 + 1.0
+    if not done.wait(timeout=deadline):
+        log.error(
+            "audio self-test: timed out after %.1fs waiting for %d frames "
+            "(got %d so far) — the microphone may have stopped producing "
+            "audio mid-capture", deadline, wanted, seen,
+        )
+        return False
     if seen == 0:
         log.error("audio self-test: no frames received from the microphone")
         return False
@@ -55,6 +86,24 @@ def catch_up_actions(missed: list[MissedRun]) -> list[tuple[str, str]]:
         eligible = run.job in CATCH_UP_ELIGIBLE and run.same_local_day
         actions.append((run.job, "fire" if eligible else "skip"))
     return actions
+
+
+class DegradedPresence:
+    """Presence adapter used when the mic self-test failed.
+
+    Speaking is pointless when the microphone is dead — ZEUS would talk into
+    a void, hear nothing, and record NO_ANSWER, which is exactly the outcome
+    audio_self_test exists to prevent (risk R1). So SPEAK becomes NOTIFY.
+    DEFER passes through untouched: being locked or idle still means defer,
+    regardless of microphone health.
+    """
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+
+    def verdict(self) -> Verdict:
+        verdict = self._inner.verdict()
+        return Verdict.NOTIFY if verdict is Verdict.SPEAK else verdict
 
 
 class Daemon:
@@ -80,11 +129,19 @@ class Daemon:
     def run_catch_up(self) -> list[tuple[str, str]]:
         missed = self._scheduler.catch_up()
         actions = catch_up_actions(missed)
-        for run, (job, action) in zip(missed, actions):
+        # missed is sorted ascending by scheduled_for (Scheduler.catch_up),
+        # so a plain overwrite-on-duplicate dict comprehension leaves each
+        # job mapped to its LATEST occurrence. A job can appear more than
+        # once in `missed` (e.g. two stale mornings plus today's), and it
+        # must end up consuming its most recent occurrence, not an older
+        # one.
+        by_job = {run.job: run.scheduled_for for run in missed}
+        for job, action in actions:
+            when = by_job[job]
             if action == "fire" and job in self._checkins:
-                log.info("catch-up: firing %s missed at %s", job, run.scheduled_for)
+                log.info("catch-up: firing %s missed at %s", job, when)
                 try:
-                    self._checkins[job].run(run.scheduled_for)
+                    self._checkins[job].run(when)
                 except Exception:
                     # Mirrors the isolation Scheduler.run_pending already
                     # gives the regular tick path (Task 6): one missed
@@ -92,12 +149,23 @@ class Daemon:
                     # unreachable) must not abort catch-up for the runs
                     # after it, and must never crash start()/run_forever()
                     # before the daemon has ticked even once. See Finding #4.
-                    log.error(
-                        "catch-up: %s failed at %s", job, run.scheduled_for,
-                        exc_info=True,
-                    )
+                    log.exception("catch-up run for %r failed", job)
             else:
-                log.info("catch-up: skipping %s missed at %s", job, run.scheduled_for)
+                log.info("catch-up: skipping %s missed at %s", job, when)
+            # Consume the occurrence either way — fired OR skipped.
+            # Scheduler.catch_up() reads the heartbeat while run_pending()
+            # reads each job's last_run_at; they are separate state, so
+            # without this the very next tick() recomputes from a stale
+            # last_run_at and overrides the decision just made -- an
+            # eligible "fire" gets re-run a second time (CheckIn either
+            # reopens the same row and re-converses, or opens a second row
+            # and asks again), and a "skip" gets un-skipped and asked about
+            # anyway. Only reproducible after a restart, when the job row
+            # already carries a last_run_at; a fresh store's first
+            # run_pending merely seeds the baseline and fires nothing,
+            # which is why this was invisible to every test until now.
+            # See review round 2, Critical #1.
+            self._store.set_job_run(job, when)
         return actions
 
     def tick(self) -> None:
@@ -131,12 +199,37 @@ class Daemon:
         finally:
             self._store.end_conversation(conversation_id)
 
+    def _degrade_presence(self) -> None:
+        """Wrap presence so SPEAK becomes NOTIFY once the mic has failed
+        its self-test.
+
+        self._checkins already holds fully-built CheckIn instances by the
+        time start() runs -- build_daemon() constructs them before the
+        daemon exists at all, and Daemon.__init__'s `checkins` parameter
+        must stay dict[str, CheckIn] since Tasks 17/18 are written against
+        that signature. Restructuring so the self-test result were known
+        before CheckIn construction would mean either running mic.start()
+        and audio_self_test() inside build_daemon() (a build-time function
+        starting the microphone as a side effect) or turning `checkins`
+        into a factory instead of a dict (a signature change). Swapping
+        each already-built CheckIn's presence reference in place, here, is
+        the smaller change: every CheckIn was built from -- and points at
+        -- the SAME presence object build_daemon() also handed to this
+        Daemon, so wrapping self._presence once and repointing each
+        CheckIn at that one wrapped instance keeps them all consistent.
+        """
+        self._presence = DegradedPresence(self._presence)
+        for checkin in self._checkins.values():
+            if hasattr(checkin, "_presence"):
+                checkin._presence = self._presence
+
     def start(self) -> None:
         self._running = True
         if self._mic is not None:
             self._mic.start()
             if not audio_self_test(self._mic):
                 self.degraded = True
+                self._degrade_presence()
                 log.error(
                     "ZEUS is running in DEGRADED mode: no working microphone. "
                     "Check-ins will notify instead of speaking. "
