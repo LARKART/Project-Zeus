@@ -107,6 +107,18 @@ class Config:
     def log_path(self) -> Path:
         return self.root / "logs" / "zeusd.log"
 
+    @property
+    def env_path(self) -> Path:
+        """Where the API key lives for launchd's benefit.
+
+        NOT config.toml, and never written by ZEUS — it holds a secret, and
+        the spec says the key is environment-only. cmd_run loads this file
+        into os.environ at startup because launchd inherits no shell
+        environment; the LaunchAgent plist carries only this PATH, never the
+        key itself.
+        """
+        return self.root / "env"
+
 
 def _apply(section: Any, values: dict[str, Any]) -> None:
     """Overlay TOML values onto a dataclass, converting duration strings."""
