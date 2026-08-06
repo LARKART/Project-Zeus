@@ -1158,9 +1158,13 @@ include = ["src/zeus/**/*.py", "src/zeus/**/*.sql"]
 - [ ] **Step 5: Run the test and verify it passes**
 
 Run: `.venv/bin/pytest tests/memory/test_store.py -v`
-Expected: PASS — 14 tests (10 above, plus 5 added in review: the interleaved
+Expected: PASS — 15 tests at the end of THIS task (10 above, plus 5 added in
+review: the interleaved
 `set_goal` upsert-id test, three `find_open_checkin` tests including the
 local-vs-UTC date test, and the `update_goal` notes-preservation test.)
+The file ends up with 17: Task 16's round-4 fix added two thread-safety
+tests, because the daemon writes to this Store from both the main thread and
+the wake-word thread.
 
 - [ ] **Step 6: Commit**
 
@@ -5614,31 +5618,33 @@ def launch_agent_plist(python_path: Path, log_path: Path, env_path: Path) -> str
     the key file; cmd_run loads it (see _load_env_file). launchctl setenv
     was the other candidate and was rejected: it does not survive a reboot,
     so ZEUS would come back deaf to its own API after every restart.
+
+    BUILT WITH plistlib, NOT AN f-STRING. Interpolating paths into XML by
+    hand breaks on any path containing an XML metacharacter: a checkout
+    under /Users/me/R&D/zeus produced "ExpatError: not well-formed" and a
+    plist launchctl refuses to load, while cmd_install_agent still printed
+    "Wrote ..." and the load instructions. A path containing < produced
+    "mismatched tag".
+
+    It is also a security property, not just robustness. With hand-built
+    XML, a crafted path can CLOSE the surrounding element and inject its
+    own — a review demonstrated an env_path that produced a *valid* plist
+    carrying EnvironmentVariables -> ANTHROPIC_API_KEY: sk-ant-pwned. That
+    turns "the plist never holds the key" from an invariant into a property
+    of whichever inputs the tests happen to use. plistlib escapes by
+    construction, so the guarantee holds for every input.
     """
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key><string>{LABEL}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{python_path}</string>
-        <string>-m</string>
-        <string>zeus.cli</string>
-        <string>run</string>
-    </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>ZEUS_ENV_FILE</key><string>{env_path}</string>
-    </dict>
-    <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key><true/>
-    <key>StandardOutPath</key><string>{log_path}</string>
-    <key>StandardErrorPath</key><string>{log_path}</string>
-</dict>
-</plist>
-"""
+    return plistlib.dumps(
+        {
+            "Label": LABEL,
+            "ProgramArguments": [str(python_path), "-m", "zeus.cli", "run"],
+            "EnvironmentVariables": {"ZEUS_ENV_FILE": str(env_path)},
+            "RunAtLoad": True,
+            "KeepAlive": True,
+            "StandardOutPath": str(log_path),
+            "StandardErrorPath": str(log_path),
+        }
+    ).decode()
 
 
 def _load_env_file(path: Path) -> int:
@@ -5652,19 +5658,49 @@ def _load_env_file(path: Path) -> int:
     that already exported ANTHROPIC_API_KEY behaves the same as launchd
     loading it from the file.
     """
-    if not path.exists():
+    # is_file(), not exists(): a directory passes exists() and then
+    # read_text() raises IsADirectoryError. ZEUS_ENV_FILE="" resolves to
+    # Path(".") and hits exactly that.
+    if not path.is_file():
+        return 0
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        # A mode-000 file, a non-UTF-8 file, a dangling symlink. Degrade the
+        # way cmd_run already degrades when the key is simply absent: log and
+        # carry on. Raising here would propagate out of cmd_run, and under
+        # launchd with KeepAlive:true that is a respawn loop.
+        log.error("could not read %s; continuing without it", path, exc_info=True)
         return 0
     loaded = 0
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
+    for line in text.splitlines():
+        line = line.strip().lstrip("\ufeff")     # a UTF-8 BOM would become
+        if not line or line.startswith("#") or "=" not in line:  # part of key 1
             continue
         key, _, value = line.partition("=")
         key = key.strip()
-        if key and key not in os.environ:
+        # Skip keys with whitespace instead of setting them. `export FOO=bar`
+        # would otherwise create a variable literally named "export FOO" and
+        # report success while the real key stays unset — the worst shape,
+        # since it looks like it worked. The docstring says `export` is
+        # unsupported; this makes the code agree.
+        if not key or " " in key or "\t" in key:
+            continue
+        if key not in os.environ:
             os.environ[key] = value.strip().strip("'\"")
             loaded += 1
     return loaded
+
+
+def _probe_python() -> bool:
+    """A function, not an inline expression, so a test can monkeypatch it.
+
+    Inline, the check can only ever be tested against the interpreter
+    running the tests — so `== (3, 12)` and `>= (3, 11)` are
+    indistinguishable on a 3.12 venv, and the test that exists to pin the
+    floor pins nothing.
+    """
+    return sys.version_info[:2] >= (3, 11)
 
 
 def _probe_say() -> bool:
@@ -5691,20 +5727,40 @@ def _probe_transcriber() -> bool:
     return importlib.util.find_spec("faster_whisper") is not None
 
 
+def _probe_sounddevice() -> bool:
+    """Hard import inside MicStream.start(); without it ZEUS cannot hear."""
+    return importlib.util.find_spec("sounddevice") is not None
+
+
+def _probe_openwakeword() -> bool:
+    """Hard import when the wake detector loads its model."""
+    return importlib.util.find_spec("openwakeword") is not None
+
+
 def cmd_doctor(config: Config) -> int:
     # >= (3, 11), not == (3, 12): Global Constraints say Python 3.11+, so
     # exact equality would report a FAILURE on 3.11 or 3.13 while ZEUS runs
     # perfectly well on both. A doctor that lies about health is worse than
     # no doctor.
+    # Load the env file FIRST, exactly as cmd_run does. Without this, doctor
+    # reads only os.environ: a key exported in ~/.zshrc makes doctor report
+    # all-OK, and then the LaunchAgent — which inherits no shell environment —
+    # starts with no key and fails every brain call, with one line in
+    # zeusd.log as the only signal. Being blind to that is being blind to the
+    # exact failure ZEUS_ENV_FILE exists to prevent.
+    _load_env_file(Path(os.environ.get("ZEUS_ENV_FILE", config.env_path)))
     checks = [
         ("python", f"{sys.version_info.major}.{sys.version_info.minor}",
-         sys.version_info[:2] >= (3, 11)),
+         _probe_python()),
         ("say", "/usr/bin/say", _probe_say()),
-        ("afplay", "/usr/bin/afplay", _probe_afplay()),
-        ("ANTHROPIC_API_KEY", "environment", _probe_api_key()),
+        ("ANTHROPIC_API_KEY", "environment or env file", _probe_api_key()),
         ("transcriber", "faster_whisper", _probe_transcriber()),
+        ("audio input", "sounddevice", _probe_sounddevice()),
+        ("wake word", "openwakeword", _probe_openwakeword()),
         ("zeus root", str(config.root), config.root.exists()),
         ("database", str(config.db_path), config.db_path.exists()),
+        ("env file", str(config.env_path), config.env_path.is_file()),
+        ("afplay", "/usr/bin/afplay", _probe_afplay()),
         ("LaunchAgent", str(PLIST_PATH), PLIST_PATH.exists()),
     ]
     print("ZEUS environment report\n")
@@ -5712,8 +5768,15 @@ def cmd_doctor(config: Config) -> int:
     for name, detail, ok in checks:
         print(f"  {'OK  ' if ok else 'FAIL'}  {name:<20} {detail}")
         # A missing database or LaunchAgent is expected before first run.
+        # FATAL = things that stop ZEUS working. afplay is NOT one: nothing
+        # in src/ invokes it (TTS goes through /usr/bin/say), so it is
+        # reported and ignored. sounddevice and openwakeword ARE fatal —
+        # both are hard imports on the capture path, and neither was checked
+        # at all before. A missing database, env file, or LaunchAgent is
+        # expected before first run.
         if not ok and name in {
-            "python", "say", "afplay", "ANTHROPIC_API_KEY", "transcriber",
+            "python", "say", "ANTHROPIC_API_KEY", "transcriber",
+            "audio input", "wake word",
         }:
             healthy = False
     print()
@@ -5783,7 +5846,17 @@ def cmd_selftest(config: Config) -> int:
 
 
 def cmd_install_agent(config: Config) -> int:
-    python_path = Path(sys.executable).resolve()
+    # sys.executable AS-IS. It is already absolute, and NOT .resolve()d:
+    # .resolve() follows the venv symlink out of the venv, to the real
+    # interpreter behind it. Measured here:
+    #   sys.executable  .../.venv/bin/python                -> imports zeus
+    #   .resolve()      ~/.local/share/uv/python/.../python3.12
+    #                                                       -> ModuleNotFoundError
+    # A venv works by the PATH the interpreter is invoked through, so the
+    # resolved binary has none of the venv's site-packages. The plist would
+    # name an interpreter that cannot run `-m zeus.cli`, and KeepAlive:true
+    # turns that into an infinite respawn loop.
+    python_path = Path(sys.executable)
     config.log_path.parent.mkdir(parents=True, exist_ok=True)
     PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
     PLIST_PATH.write_text(
