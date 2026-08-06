@@ -885,13 +885,34 @@ class Store:
     def __init__(self, db_path: Path, clock: Clock) -> None:
         self._clock = clock
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.connection = sqlite3.connect(db_path, isolation_level=None)
+        # check_same_thread=False because the daemon writes to this Store
+        # from TWO threads: the main thread (scheduled check-ins) and the
+        # wake-word activation thread (_handle_activation ->
+        # start_conversation). sqlite3's default binds the connection to its
+        # creating thread and raises ProgrammingError anywhere else -- and
+        # the daemon's activation loop catches Exception broadly, so the
+        # error is swallowed and EVERY wake-word conversation dies leaving
+        # nothing in the database. Verified: the wake-thread write raised
+        # "SQLite objects created in a thread can only be used in that same
+        # thread" and `select count(*) from conversations` stayed at 0.
+        #
+        # Turning the check off makes the connection usable across threads
+        # but NOT safe on its own, hence _lock below: every method that
+        # touches the connection takes it, so two threads cannot interleave.
+        # This mirrors the lock Journal.append() already carries for the
+        # exact same wiring -- the daemon hands one Journal AND one Store to
+        # both threads.
+        self.connection = sqlite3.connect(
+            db_path, isolation_level=None, check_same_thread=False
+        )
+        self._lock = threading.Lock()
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA busy_timeout = 5000")
         self.connection.executescript(_SCHEMA.read_text())
 
     def close(self) -> None:
-        self.connection.close()
+        with self._lock:
+            self.connection.close()
 
     def _now(self) -> str:
         return to_utc_iso(self._clock.now_utc())
@@ -2773,12 +2794,48 @@ class MicStream:
         self._config = config
         frames_per_second = config.sample_rate / FRAME_SAMPLES
         self._ring = RingBuffer(int(config.ring_seconds * frames_per_second))
-        self._queue: queue.Queue = queue.Queue(maxsize=_QUEUE_MAX)
+        # ONE QUEUE PER CONSUMER, not one queue for the stream. A single
+        # shared queue is a hand-off, not a fan-out: queue.get() removes the
+        # frame, so with two consumers each frame reaches exactly ONE of
+        # them. The daemon has exactly that wiring -- the wake detector
+        # iterates frames() forever on its own thread while a check-in calls
+        # frames() on the main thread -- so the detector would eat roughly
+        # half of the user's spoken answer and hand Whisper non-contiguous
+        # 80 ms chunks. Measured before the fix: 20 frames pushed, consumer A
+        # saw 20, consumer B saw 0, and ZERO frames reached both.
+        #
+        # Copy-on-write list: _on_audio runs on the real-time audio thread
+        # and must never take a lock, so subscribe/_unsubscribe REPLACE the
+        # list rather than mutating it, and _on_audio just reads the
+        # attribute once (an atomic read of an immutable list).
+        self._subscribers: list["Subscription"] = []
+        self._subscriber_lock = threading.Lock()
         self._stream = None
         self._running = False
         self._stopping = threading.Event()
         self._lifecycle = threading.Lock()
         self.dropped = 0
+
+    # -- fan-out -------------------------------------------------------
+    def subscribe(self) -> "Subscription":
+        """A private frame queue for one consumer.
+
+        A fresh subscription starts EMPTY, which is why utterance capture no
+        longer needs a drain() before listening: it cannot inherit the audio
+        of ZEUS's own speech, because that audio went to queues that existed
+        while ZEUS was speaking. Long-lived consumers (the wake detector)
+        still need drain(), since their queue does accumulate.
+        """
+        subscription = Subscription(self)
+        with self._subscriber_lock:
+            self._subscribers = [*self._subscribers, subscription]
+        return subscription
+
+    def _unsubscribe(self, subscription: "Subscription") -> None:
+        with self._subscriber_lock:
+            self._subscribers = [
+                s for s in self._subscribers if s is not subscription
+            ]
 
     # -- lifecycle -----------------------------------------------------
     def start(self) -> None:
@@ -2794,9 +2851,13 @@ class MicStream:
         import sounddevice as sd
 
         # A restarted stream must inherit neither the previous run's shutdown
-        # signal nor its stale audio.
+        # signal nor its stale audio. Clearing EVERY subscriber is safe here
+        # and only here: the device is not running yet, so no capture can be
+        # in flight to lose. Never do this while running — that is exactly
+        # the stream-wide drain that would delete an in-flight answer.
         self._stopping.clear()
-        self.drain()
+        for subscription in self._subscribers:
+            subscription.drain()
         self._stream = sd.RawInputStream(
             samplerate=self._config.sample_rate,
             channels=1,
@@ -2843,10 +2904,46 @@ class MicStream:
             log.debug("audio status: %s", status)
         frame = bytes(indata)
         self._ring.push(frame)
-        try:
-            self._queue.put_nowait(frame)
-        except queue.Full:
-            self.dropped += 1
+        # Broadcast: every subscriber gets its OWN copy of every frame.
+        # Read the list once into a local — subscribe() may replace the
+        # attribute concurrently, and iterating the local keeps this loop
+        # over a stable snapshot without a lock.
+        for subscription in self._subscribers:
+            try:
+                subscription._queue.put_nowait(frame)
+            except queue.Full:
+                subscription.dropped += 1
+                self.dropped += 1
+
+    def frames(self) -> Iterator[bytes]:
+        """One-off subscription for a single consumer, closed on exit.
+
+        Convenience for consumers that iterate once and stop — utterance
+        capture and the audio self-test. The wake detector must NOT use this:
+        it needs a stable handle so unmute() can drain its own queue, so it
+        calls subscribe() and holds the Subscription.
+        """
+        with self.subscribe() as subscription:
+            yield from subscription.frames()
+
+    def pre_roll(self) -> bytes:
+        """Audio captured just before now — prepended to a new utterance."""
+        return self._ring.snapshot()
+
+
+class Subscription:
+    """One consumer's private view of the microphone.
+
+    Holds its own queue, so what this consumer reads is unaffected by any
+    other consumer's reads. Closing it unregisters the queue — without that,
+    every finished check-in would leave a queue behind that _on_audio keeps
+    filling forever.
+    """
+
+    def __init__(self, mic: MicStream) -> None:
+        self._mic = mic
+        self._queue: queue.Queue = queue.Queue(maxsize=_QUEUE_MAX)
+        self.dropped = 0
 
     def frames(self) -> Iterator[bytes]:
         """Blocking iterator over live frames. Ends when stop() is called.
@@ -2866,20 +2963,30 @@ class MicStream:
             try:
                 yield self._queue.get(timeout=_POLL_SECONDS)
             except queue.Empty:
-                if self._stopping.is_set():
+                if self._mic._stopping.is_set():
                     return
 
-    def pre_roll(self) -> bytes:
-        """Audio captured just before now — prepended to a new utterance."""
-        return self._ring.snapshot()
-
     def drain(self) -> None:
-        """Discard queued frames, e.g. after ZEUS finishes speaking."""
+        """Discard THIS consumer's queued frames.
+
+        Only the caller's own queue: draining every subscriber would let the
+        wake detector's unmute() wipe the audio of an in-flight check-in
+        answer, which is the bug the fan-out exists to prevent.
+        """
         while True:
             try:
                 self._queue.get_nowait()
             except queue.Empty:
                 return
+
+    def close(self) -> None:
+        self._mic._unsubscribe(self)
+
+    def __enter__(self) -> "Subscription":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.close()
 ```
 
 Create `src/zeus/audio/__init__.py` (empty).
@@ -3356,6 +3463,8 @@ class WakeWordActivator:
         self._model = None
         self._muted = False
         self._running = False
+        # Set while events() is iterating; unmute() drains through it.
+        self._subscription = None
 
     def _load_model(self):
         import openwakeword
@@ -3389,14 +3498,31 @@ class WakeWordActivator:
         a build with the drain removed: 51 frames of self-audio queued, all
         51 scored after unmute. drain() on an empty queue is a no-op, so
         unmute() without a prior mute() stays safe.
+
+        Drains THIS detector's own subscription, never the whole stream: a
+        scheduled check-in capturing an answer on the main thread holds its
+        own subscription, and a stream-wide drain would delete the user's
+        in-flight reply.
         """
         self._muted = False
-        self._mic.drain()
+        if self._subscription is not None:
+            self._subscription.drain()
 
     def events(self) -> Iterator[ActivationEvent]:
         if self._model is None:
             self._model = self._load_model()
-        for frame in self._mic.frames():
+        # subscribe() rather than mic.frames(): the detector is a long-lived
+        # consumer that needs a stable handle for unmute() to drain. Closing
+        # it on exit stops _on_audio filling a queue nobody reads.
+        with self._mic.subscribe() as subscription:
+            self._subscription = subscription
+            try:
+                yield from self._detect(subscription)
+            finally:
+                self._subscription = None
+
+    def _detect(self, subscription) -> Iterator[ActivationEvent]:
+        for frame in subscription.frames():
             if not self._running:
                 return
             if self._muted:
@@ -4543,22 +4669,38 @@ class VoiceIO:
                 unmute()
 
     def listen(self) -> str:
-        # Drain here rather than relying on WakeWordActivator.unmute() having
-        # done it. HotkeyActivator — a documented production fallback — has no
-        # mute/unmute at all, so with that activator the queue would still hold
-        # ZEUS's own speech and the endpointer would read it as the start of
-        # the user's reply. Draining twice is harmless; drain() on an empty
-        # queue is a no-op. VoiceIO should own what it depends on.
-        if self._mic is not None:
-            self._mic.drain()
-        frames_per_second = self._config.sample_rate / FRAME_SAMPLES
-        timeout_frames = int(
-            self._config.listen_timeout.total_seconds() * frames_per_second
-        )
-        audio = capture_utterance(
-            self._mic.frames(), self._endpointer,
-            pre_roll=b"", listen_timeout_frames=timeout_frames,
-        )
+        """Capture one utterance with the wake detector held muted.
+
+        No drain() is needed any more: mic.frames() opens a FRESH
+        subscription whose queue starts empty, so it cannot inherit the
+        audio of ZEUS's own speech the way the old single shared queue
+        could. That also fixes it for HotkeyActivator, which has no
+        mute/unmute at all — the emptiness is structural now, not something
+        an activator has to remember to do.
+
+        The mute is the other half of the fan-out fix. Once every consumer
+        gets its own copy of every frame, the detector no longer steals the
+        user's answer — but it now HEARS all of it, and a "hey zeus" spoken
+        mid-answer would launch an ad-hoc conversation on top of the running
+        check-in. Muting for the whole listen window closes that. speak()
+        mutes for its own duration; this covers the rest of the turn.
+        """
+        mute = getattr(self._activator, "mute", None)
+        unmute = getattr(self._activator, "unmute", None)
+        if mute:
+            mute()
+        try:
+            frames_per_second = self._config.sample_rate / FRAME_SAMPLES
+            timeout_frames = int(
+                self._config.listen_timeout.total_seconds() * frames_per_second
+            )
+            audio = capture_utterance(
+                self._mic.frames(), self._endpointer,
+                pre_roll=b"", listen_timeout_frames=timeout_frames,
+            )
+        finally:
+            if unmute:
+                unmute()
         if not audio:
             return ""
         return self._transcriber.transcribe(audio, self._config.sample_rate)
@@ -4903,27 +5045,41 @@ def audio_self_test(mic: MicStream, seconds: float = 1.0) -> bool:
     wanted = max(1, int(seconds * 16000 / FRAME_SAMPLES))
     energy = 0.0
     seen = 0
-    # A wall-clock deadline as well as a frame count. `wanted` alone bounds
-    # how many frames we want, not how long we will wait for them:
-    # mic.frames() blocks on queue.get(timeout=0.1) and only returns once
-    # _stopping is set, which nothing does during the self-test. A mic that
-    # goes silent PARTWAY through — a dead-hardware variant of R1, distinct
-    # from the "opens fine, silent forever" TCC case — would otherwise hang
-    # here forever, so Daemon.start() never returns and the tick loop never
-    # begins. monotonic(), not datetime.now(): this must not move if the
-    # wall clock is adjusted.
-    deadline = time.monotonic() + max(seconds * 5.0, 5.0)
-    for frame in mic.frames():
-        energy = max(energy, rms(frame))
-        seen += 1
-        if seen >= wanted:
-            break
-        if time.monotonic() >= deadline:
-            log.error(
-                "audio self-test: only %d of %d frames arrived before the "
-                "deadline — the microphone stopped delivering audio", seen, wanted,
-            )
-            return False
+    done = threading.Event()
+
+    # CONSUME ON A BACKGROUND THREAD. An in-loop deadline check cannot work
+    # here, however natural it looks: `for frame in mic.frames()` only runs
+    # the loop body when the generator YIELDS, and a microphone that has
+    # gone silent mid-capture never yields again. The check would sit in
+    # code that is never reached, Daemon.start() would never return, and the
+    # tick loop would never begin. An earlier draft of this plan had exactly
+    # that bug; the implementer caught it. Waiting on an Event is what makes
+    # the deadline real even though the consuming thread itself may block
+    # forever — the thread is a daemon thread, so it cannot hold up exit.
+    def consume() -> None:
+        nonlocal energy, seen
+        for frame in mic.frames():
+            energy = max(energy, rms(frame))
+            seen += 1
+            if seen >= wanted:
+                break
+        done.set()
+
+    threading.Thread(target=consume, daemon=True).start()
+    # Event.wait is backed by a monotonic clock, so no wall-clock adjustment
+    # (an NTP correction, a DST transition) can defeat it. Budget generously
+    # at 5s: this measures TOTAL capture, not time-to-first-frame, and a
+    # Bluetooth input switching into its HFP profile can take seconds before
+    # the first callback arrives. Too tight a budget makes a slow device
+    # indistinguishable from a dead one — and the consequence is sticky,
+    # because `degraded` is never re-tested or cleared, so ZEUS stays
+    # notification-only until the process restarts.
+    if not done.wait(timeout=max(seconds * 5.0, 5.0)):
+        log.error(
+            "audio self-test: timed out waiting for %d frames (got %d) — "
+            "the microphone stopped delivering audio", wanted, seen,
+        )
+        return False
     if seen == 0:
         log.error("audio self-test: no frames received from the microphone")
         return False
