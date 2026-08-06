@@ -1,5 +1,7 @@
+import sys
 import threading
 import time
+import types
 
 import pytest
 
@@ -156,6 +158,56 @@ def test_restart_does_not_inherit_the_previous_stop():
     stream.stop()
 
     assert list(subscription.frames()) == [FRAME, FRAME]
+
+
+def test_start_drains_stale_audio_before_it_starts_the_device(monkeypatch):
+    """F4 (round 5): the stream-wide drain in start() must run BEFORE the
+    device does.
+
+    start() used to drain after self._stream.start(), under a comment
+    reading "the device is not running yet, so no capture can be in flight
+    to lose". That comment was false, and it is the only thing telling a
+    future reader when a stream-wide drain is safe -- everywhere else one is
+    the bug that deletes an in-flight answer. Harmless today only because
+    nothing is subscribed at mic.start(); the ordering is what makes the
+    rule true, so the ordering is what gets pinned.
+
+    No hardware: sounddevice is imported inside start(), so a fake module
+    stands in and records the queue depth at the moment the device starts.
+    """
+    observed = {}
+
+    class _FakeDevice:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self):
+            observed["queued_at_device_start"] = subscription._queue.qsize()
+
+        def stop(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sounddevice",
+        types.SimpleNamespace(RawInputStream=lambda **kw: _FakeDevice(**kw)),
+    )
+
+    stream = MicStream(AudioConfig())
+    subscription = stream.subscribe()
+    subscription._queue.put_nowait(FRAME)   # stale audio from the last run
+
+    stream.start()
+    stream.stop()
+
+    assert observed["queued_at_device_start"] == 0, (
+        "start() began capturing before it drained, so the drain now runs "
+        "against a live device -- exactly the stream-wide drain the comment "
+        "says is never safe while running"
+    )
 
 
 def test_frames_terminates_even_if_the_callback_keeps_firing():

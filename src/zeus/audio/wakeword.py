@@ -7,6 +7,7 @@ custom model is a config edit rather than a code change.
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Iterator
 
 import numpy as np
@@ -27,6 +28,9 @@ class WakeWordActivator:
         self._running = False
         # Set while events() is iterating; unmute() drains through it.
         self._subscription = None
+        # Depth, not a flag: mute windows nest across two threads.
+        self._mute_depth = 0
+        self._mute_lock = threading.Lock()
 
     def _load_model(self):
         import openwakeword
@@ -45,7 +49,21 @@ class WakeWordActivator:
         self._running = False
 
     def mute(self) -> None:
-        """Suppress detection while ZEUS is speaking (spec §7.3, half-duplex)."""
+        """Suppress detection while ZEUS is speaking (spec §7.3, half-duplex).
+
+        A DEPTH COUNTER, not a boolean. The daemon shares one VoiceIO and
+        one activator between the main thread (scheduled check-ins) and the
+        wake thread (ad-hoc conversations), and they overlap in practice:
+        the user says "hey zeus" at 08:59:55, listen() mutes and opens a
+        window of up to 30s; the morning check-in fires at 09:00:00 on the
+        main thread, speaks its opener, and its `finally: unmute()` clears
+        the mute while the wake thread is STILL capturing. Reproduced: the
+        detector scored 5 of 5 frames of the user's in-flight answer. With
+        a counter, the inner unmute decrements to 1 and the detector stays
+        muted until the outer window closes.
+        """
+        with self._mute_lock:
+            self._mute_depth += 1
         self._muted = True
 
     def unmute(self) -> None:
@@ -62,8 +80,17 @@ class WakeWordActivator:
         scheduled check-in capturing an answer on the main thread holds its
         own subscription, and a stream-wide drain would delete the user's
         in-flight reply.
+
+        Only the OUTERMOST unmute actually unmutes — see mute() for why.
+        Clamped at zero so an unmute() without a matching mute() stays safe,
+        which VoiceIO relies on: it calls unmute() in a `finally` whether or
+        not the paired mute() ran.
         """
-        self._muted = False
+        with self._mute_lock:
+            self._mute_depth = max(0, self._mute_depth - 1)
+            if self._mute_depth > 0:
+                return
+            self._muted = False
         if self._subscription is not None:
             self._subscription.drain()
 

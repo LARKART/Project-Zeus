@@ -393,13 +393,15 @@ def test_listen_does_not_inherit_audio_buffered_before_it_was_called():
     assert transcriber.calls == [3 * FRAME_SAMPLES * 2]
 
 
-def test_listen_holds_the_detector_muted_for_the_whole_window():
-    """The other half of the fan-out ruling. Once every consumer gets its
-    own copy of every frame the detector no longer STEALS the user's
-    answer -- but it now hears all of it, and a "hey zeus" spoken
-    mid-answer would launch an ad-hoc conversation on top of the running
-    check-in. speak() mutes for its own duration; listen() must cover the
-    rest of the turn.
+def test_listen_brackets_the_capture_in_mute_and_unmute():
+    """RENAMED from test_listen_holds_the_detector_muted_for_the_whole_window,
+    which claimed a property it did not test: `events == ["mute", "unmute"]`
+    is equally satisfied by a listen() that calls mute() and unmute() back
+    to back and then captures with the detector fully live. That mutant
+    passed all 223 tests. What this test actually pins is the PAIRING -- both
+    calls happen, in that order, exactly once. The window itself is pinned
+    by test_a_live_wake_detector_cannot_fire_during_the_listen_window below,
+    against a real WakeWordActivator and a model that does fire.
     """
     activator = RecordingActivator()
     voice = _voice(activator, FakeSpeaker(), FakeTranscriber([]), _silent_mic())
@@ -425,30 +427,51 @@ def test_listen_unmutes_even_when_capture_raises():
     assert activator.events == ["mute", "unmute"]
 
 
-def test_a_live_wake_detector_does_not_eat_the_users_answer(monkeypatch):
-    """C2 (round 4), across the real wiring build_daemon() builds.
+def test_a_live_wake_detector_cannot_fire_during_the_listen_window(monkeypatch):
+    """C2 (round 4), BOTH halves, across the real wiring build_daemon() builds.
 
     ONE MicStream is shared by the wake detector (its own thread, running
     forever) and VoiceIO.listen() (the main thread, during a check-in).
-    With a single shared queue, queue.get() removed the frame, so the
-    detector took roughly half the user's answer and Whisper received
-    non-contiguous 80 ms chunks -- recorded as NO_ANSWER or garbage.
-    Every frame produced during the listen window must reach the
+
+    First half -- the fan-out. With a single shared queue, queue.get()
+    removed the frame, so the detector took roughly half the user's answer
+    and Whisper received non-contiguous 80 ms chunks, recorded as NO_ANSWER
+    or garbage. Every frame produced during the listen window must reach the
     transcriber whole.
+
+    Second half -- the mute (F2, round 5). The detector now HEARS all of the
+    user's answer, so a "hey zeus" inside it would launch an ad-hoc
+    conversation on top of the running check-in. This test used to run a
+    _NeverFires model, which proves nothing about muting: a fully live
+    detector fires nothing either. Mutating listen() to `mute(); unmute();`
+    followed by an unguarded capture -- the ruling exactly inverted -- passed
+    all 223 tests. The model below scores ABOVE threshold on every frame, so
+    a detector that is live for any part of the window fires, and the
+    assertions are that it did not: no events, and not one frame scored.
     """
     from zeus.audio.wakeword import WakeWordActivator
     from zeus.config import AudioConfig, WakeConfig
 
-    class _NeverFires:
-        def predict(self, samples):
-            return {"hey_jarvis": 0.0}
+    class _AlwaysFires:
+        """Every frame is a wake word. If the detector is listening at all
+        during the window, this makes it impossible to miss."""
 
+        def __init__(self):
+            self.calls = 0
+
+        def predict(self, samples):
+            self.calls += 1
+            return {"hey_jarvis": 0.99}
+
+    model = _AlwaysFires()
     mic = MicStream(AudioConfig())
     activator = WakeWordActivator(mic, WakeConfig(), threshold=0.5)
-    monkeypatch.setattr(activator, "_load_model", lambda: _NeverFires())
+    monkeypatch.setattr(activator, "_load_model", lambda: model)
     activator.start()
+
+    fired = []
     threading.Thread(
-        target=lambda: list(activator.events()), daemon=True
+        target=lambda: fired.extend(activator.events()), daemon=True
     ).start()
     _await(
         lambda: activator._subscription is not None,
@@ -471,10 +494,29 @@ def test_a_live_wake_detector_does_not_eat_the_users_answer(monkeypatch):
     spoken_frames = 10
     for _ in range(spoken_frames):
         mic._on_audio(SPEECH, FRAME_SAMPLES, None, None)
+
+    # Let the detector actually reach every frame while the window is still
+    # open. Without this the frames could still be sitting in its queue when
+    # listen() returns, and "no events" would be a statement about timing
+    # rather than about muting.
+    _await(
+        lambda: activator._subscription._queue.empty(),
+        "the wake detector never consumed the answer",
+    )
     mic.stop()
 
     assert finished.wait(5), "listen() did not return within 5s"
     assert outcome["text"] == "the whole answer"
     assert transcriber.calls == [spoken_frames * FRAME_SAMPLES * 2], (
         "the wake detector consumed part of the user's answer"
+    )
+    assert fired == [], (
+        f"the wake detector fired {len(fired)} time(s) inside the listen "
+        "window -- a 'hey zeus' in the user's answer would start a second "
+        "conversation on top of the running check-in"
+    )
+    assert model.calls == 0, (
+        f"{model.calls} frames of the user's answer were scored by the wake "
+        "model during the listen window; the detector must be muted for all "
+        "of it, not merely at the start and end"
     )

@@ -153,20 +153,96 @@ def test_unmute_restores_detection(monkeypatch):
     assert [e.source for e in collected] == ["wake"]
 
 
-def test_mute_is_idempotent(monkeypatch):
+def test_a_nested_mute_survives_the_inner_unmute(monkeypatch):
+    """F1 (round 5): mute is a DEPTH COUNTER, so the inner window closing
+    must not unmute the outer one.
+
+    REPLACES test_mute_is_idempotent, which asserted the opposite -- that a
+    single unmute() after two mute() calls restores detection. That was the
+    bug, not the contract: the daemon shares one activator between the main
+    thread and the wake thread, and their windows overlap. "Hey zeus" at
+    08:59:55 opens listen()'s mute for up to 30s; the 09:00 check-in speaks
+    on the main thread and its `finally: unmute()` fired the inner unmute
+    while the wake thread was still capturing. Measured before this fix: the
+    detector scored 5 of 5 frames of the user's in-flight answer.
+
+    Two mute() calls must still not raise -- that part of the old test's
+    intent survives -- but the second no longer disarms the first.
+    """
+    mic = MicStream(AudioConfig())
+    model = CountingModel(scores=[0.9, 0.9, 0.9])
+    activator = WakeWordActivator(mic, WakeConfig(), threshold=0.5)
+    monkeypatch.setattr(activator, "_load_model", lambda: model)
+    activator.start()
+    collected, finished = _live_detector(activator)
+
+    activator.mute()          # outer: listen() on the wake thread
+    activator.mute()          # inner: speak() on the main thread
+    activator.unmute()        # inner closes -- the outer window is still open
+
+    _feed(mic, 3)             # the user's in-flight answer, "hey zeus" in it
+    mic.stop()
+
+    assert finished.wait(5)
+    assert collected == [], (
+        "the inner unmute() cleared a mute window that was still open -- a "
+        "concurrent conversation can start on top of the running check-in"
+    )
+    # Not merely "no event": frames inside a live mute window are never scored.
+    assert model.calls == 0
+
+
+def test_matched_unmutes_restore_detection(monkeypatch):
+    """The counter must come back down. Nesting that never fully unwinds
+    would leave ZEUS permanently deaf, which is the failure the old
+    test_mute_is_idempotent was really guarding against."""
     mic = MicStream(AudioConfig())
     activator = _wake_activator(monkeypatch, mic, [0.9])
     activator.start()
     collected, finished = _live_detector(activator)
 
     activator.mute()
-    activator.mute()          # must not raise
-    activator.unmute()        # a single unmute must still restore detection
+    activator.mute()
+    activator.unmute()
+    activator.unmute()        # the outermost -- detection resumes here
     _feed(mic, 1)
     mic.stop()
 
     assert finished.wait(5)
     assert [e.source for e in collected] == ["wake"]
+
+
+def test_a_stray_unmute_cannot_undermine_a_later_mute_window(monkeypatch):
+    """Why the counter is clamped at zero.
+
+    VoiceIO calls unmute() in a `finally` whether or not the paired mute()
+    ran -- HotkeyActivator has no mute at all, and speak() unmutes even when
+    say() raises before anything was muted. Unclamped, one stray unmute
+    leaves the depth at -1, and the NEXT nested window then unwinds one
+    level early: the inner unmute drops the depth to 0 and unmutes while the
+    outer window is still open. Clamping keeps a stray unmute a no-op.
+    """
+    mic = MicStream(AudioConfig())
+    model = CountingModel(scores=[0.9, 0.9, 0.9])
+    activator = WakeWordActivator(mic, WakeConfig(), threshold=0.5)
+    monkeypatch.setattr(activator, "_load_model", lambda: model)
+    activator.start()
+    collected, finished = _live_detector(activator)
+
+    activator.unmute()        # unpaired: a `finally` with no mute before it
+    activator.mute()          # outer
+    activator.mute()          # inner
+    activator.unmute()        # inner closes
+
+    _feed(mic, 3)
+    mic.stop()
+
+    assert finished.wait(5)
+    assert collected == [], (
+        "an earlier unpaired unmute() left the depth negative, so a later "
+        "nested window unmuted one level too early"
+    )
+    assert model.calls == 0
 
 
 def test_unmute_without_mute_is_safe(monkeypatch):
@@ -262,6 +338,43 @@ def test_unmute_discards_audio_captured_while_speaking(monkeypatch):
         f"unmute() left {model.calls - 1} frames of ZEUS's own speech to be "
         "scored on resume — the feedback loop mute() exists to prevent"
     )
+
+
+def test_unmute_drains_its_own_queue_and_never_the_whole_stream(monkeypatch):
+    """F3 (round 5): the drain in unmute() must go through THIS detector's
+    subscription, not every subscriber on the stream.
+
+    tests/audio/test_mic.py::test_drain_empties_only_the_callers_own_queue
+    pins the Subscription.drain() primitive but never unmute() as its
+    caller, so reverting unmute() to `for s in self._mic._subscribers:
+    s.drain()` passed the whole suite. That revert is the ruled-out
+    stream-wide drain: while ZEUS speaks its next sentence mid-check-in,
+    the main thread is holding a subscription full of the user's answer,
+    and unmute() would delete it -- the exact bug the fan-out exists to
+    prevent, reintroduced from the other end.
+
+    So: a SECOND live subscription, holding queued frames, must come
+    through unmute() untouched.
+    """
+    mic = MicStream(AudioConfig())
+    activator = _wake_activator(monkeypatch, mic, [])
+    activator.start()
+    collected, finished = _live_detector(activator)
+
+    with mic.subscribe() as listener:   # the check-in capturing an answer
+        activator.mute()
+        _feed(mic, 5)                   # the user's reply, queued on both
+        activator.unmute()
+
+        mic.stop()
+        assert finished.wait(5)
+        answer = list(listener.frames())
+
+    assert answer == [FRAME] * 5, (
+        f"unmute() drained a subscription it does not own: {len(answer)} of "
+        "5 frames of the user's in-flight answer survived"
+    )
+    assert collected == []
 
 
 def test_factory_builds_wake_word_activator():

@@ -104,9 +104,19 @@ class MicStream:
                 raise RuntimeError("MicStream already running")
             import sounddevice as sd
 
-            # Cleared here, not in stop(): a restarted stream must not
-            # inherit the previous run's shutdown signal.
+            # A restarted stream must inherit neither the previous run's
+            # shutdown signal nor its stale audio. Clearing EVERY subscriber
+            # is safe here and ONLY here — but only because this runs BEFORE
+            # the device is started below, so no capture can be in flight to
+            # lose. Keep it before self._stream.start(); moving it after
+            # would make this comment a lie and open a window where a live
+            # callback's frames are discarded. Never drain stream-wide while
+            # running — that is exactly what would delete an in-flight
+            # answer. Cleared here rather than in stop() for the same
+            # reason: it is the restart that must start clean.
             self._stopping.clear()
+            for subscription in self._subscribers:
+                subscription.drain()
             self._stream = sd.RawInputStream(
                 samplerate=self._config.sample_rate,
                 channels=1,
@@ -116,13 +126,6 @@ class MicStream:
             )
             self._stream.start()
             self._running = True
-        # A restarted stream must not replay stale audio left over from
-        # the previous run. Clearing EVERY subscriber is safe here and only
-        # here: the device is not running yet, so no capture can be in
-        # flight to lose. Never do this while running — that is exactly the
-        # stream-wide drain that would delete an in-flight answer.
-        for subscription in self._subscribers:
-            subscription.drain()
         log.info("microphone stream started at %d Hz", self._config.sample_rate)
 
     def stop(self) -> None:
