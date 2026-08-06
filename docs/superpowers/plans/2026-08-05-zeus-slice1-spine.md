@@ -355,6 +355,18 @@ class Config:
     def log_path(self) -> Path:
         return self.root / "logs" / "zeusd.log"
 
+    @property
+    def env_path(self) -> Path:
+        """Where the API key lives for launchd's benefit.
+
+        NOT config.toml, and never written by ZEUS — it holds a secret, and
+        the spec says the key is environment-only. cmd_run loads this file
+        into os.environ at startup because launchd inherits no shell
+        environment; the LaunchAgent plist carries only this PATH, never the
+        key itself.
+        """
+        return self.root / "env"
+
 
 def _apply(section: Any, values: dict[str, Any]) -> None:
     """Overlay TOML values onto a dataclass, converting duration strings."""
@@ -2852,9 +2864,12 @@ class MicStream:
 
         # A restarted stream must inherit neither the previous run's shutdown
         # signal nor its stale audio. Clearing EVERY subscriber is safe here
-        # and only here: the device is not running yet, so no capture can be
-        # in flight to lose. Never do this while running — that is exactly
-        # the stream-wide drain that would delete an in-flight answer.
+        # and ONLY here — but only because this runs BEFORE the device is
+        # started below, so no capture can be in flight to lose. Keep it
+        # before self._stream.start(); moving it after would make the
+        # comment a lie and open a window where a live callback's frames are
+        # discarded. Never drain stream-wide while running — that is exactly
+        # what would delete an in-flight answer.
         self._stopping.clear()
         for subscription in self._subscribers:
             subscription.drain()
@@ -3465,6 +3480,9 @@ class WakeWordActivator:
         self._running = False
         # Set while events() is iterating; unmute() drains through it.
         self._subscription = None
+        # Depth, not a flag: mute windows nest across two threads.
+        self._mute_depth = 0
+        self._mute_lock = threading.Lock()
 
     def _load_model(self):
         import openwakeword
@@ -3483,7 +3501,21 @@ class WakeWordActivator:
         self._running = False
 
     def mute(self) -> None:
-        """Suppress detection while ZEUS is speaking (spec §7.3, half-duplex)."""
+        """Suppress detection while ZEUS is speaking (spec §7.3, half-duplex).
+
+        A DEPTH COUNTER, not a boolean. The daemon shares one VoiceIO and
+        one activator between the main thread (scheduled check-ins) and the
+        wake thread (ad-hoc conversations), and they overlap in practice:
+        the user says "hey zeus" at 08:59:55, listen() mutes and opens a
+        window of up to 30s; the morning check-in fires at 09:00:00 on the
+        main thread, speaks its opener, and its `finally: unmute()` clears
+        the mute while the wake thread is STILL capturing. Reproduced: the
+        detector scored 5 of 5 frames of the user's in-flight answer. With
+        a counter, the inner unmute decrements to 1 and the detector stays
+        muted until the outer window closes.
+        """
+        with self._mute_lock:
+            self._mute_depth += 1
         self._muted = True
 
     def unmute(self) -> None:
@@ -3503,8 +3535,17 @@ class WakeWordActivator:
         scheduled check-in capturing an answer on the main thread holds its
         own subscription, and a stream-wide drain would delete the user's
         in-flight reply.
+
+        Only the OUTERMOST unmute actually unmutes — see mute() for why.
+        Clamped at zero so an unmute() without a matching mute() stays safe,
+        which VoiceIO relies on: it calls unmute() in a `finally` whether or
+        not the paired mute() ran.
         """
-        self._muted = False
+        with self._mute_lock:
+            self._mute_depth = max(0, self._mute_depth - 1)
+            if self._mute_depth > 0:
+                return
+            self._muted = False
         if self._subscription is not None:
             self._subscription.drain()
 
@@ -5347,7 +5388,8 @@ git commit -m "feat: daemon with audio self-test, catch-up policy, and heartbeat
 **Interfaces:**
 - Consumes: `build_daemon`, `load_config`, presence probes.
 - Produces:
-  - `launch_agent_plist(python_path: Path, log_path: Path) -> str`
+  - `launch_agent_plist(python_path: Path, log_path: Path, env_path: Path) -> str`
+  - `_load_env_file(path: Path) -> int` — KEY=VALUE into os.environ; existing environment wins
   - `cmd_doctor(config) -> int` — prints an environment report; exit 0 healthy, 1 unhealthy.
   - `cmd_selftest(config) -> int` — the **only** code path that touches real hardware.
   - `cmd_install_agent(config) -> int`, `cmd_run(config) -> int`
@@ -5357,14 +5399,21 @@ git commit -m "feat: daemon with audio self-test, catch-up policy, and heartbeat
 
 `tests/test_cli.py`:
 ```python
+import os
 import plistlib
+import sys
 from pathlib import Path
 
 from zeus.cli import launch_agent_plist, main
 
 
+ENV = Path("/Users/x/.zeus/env")
+
+
 def test_plist_is_valid_and_uses_absolute_paths():
-    xml = launch_agent_plist(Path("/opt/zeus/.venv/bin/python"), Path("/tmp/z.log"))
+    xml = launch_agent_plist(
+        Path("/opt/zeus/.venv/bin/python"), Path("/tmp/z.log"), ENV
+    )
     parsed = plistlib.loads(xml.encode())
 
     assert parsed["Label"] == "com.zeus.daemon"
@@ -5374,7 +5423,7 @@ def test_plist_is_valid_and_uses_absolute_paths():
 
 def test_plist_enables_keepalive_and_runatload():
     parsed = plistlib.loads(
-        launch_agent_plist(Path("/x/python"), Path("/tmp/z.log")).encode()
+        launch_agent_plist(Path("/x/python"), Path("/tmp/z.log"), ENV).encode()
     )
     assert parsed["KeepAlive"] is True
     assert parsed["RunAtLoad"] is True
@@ -5382,7 +5431,7 @@ def test_plist_enables_keepalive_and_runatload():
 
 def test_plist_routes_both_streams_to_the_log():
     parsed = plistlib.loads(
-        launch_agent_plist(Path("/x/python"), Path("/tmp/z.log")).encode()
+        launch_agent_plist(Path("/x/python"), Path("/tmp/z.log"), ENV).encode()
     )
     assert parsed["StandardOutPath"] == "/tmp/z.log"
     assert parsed["StandardErrorPath"] == "/tmp/z.log"
@@ -5390,9 +5439,55 @@ def test_plist_routes_both_streams_to_the_log():
 
 def test_plist_invokes_the_module_not_a_shell():
     parsed = plistlib.loads(
-        launch_agent_plist(Path("/x/python"), Path("/tmp/z.log")).encode()
+        launch_agent_plist(Path("/x/python"), Path("/tmp/z.log"), ENV).encode()
     )
     assert parsed["ProgramArguments"][1:] == ["-m", "zeus.cli", "run"]
+
+
+def test_plist_points_at_the_env_file_and_never_holds_the_key():
+    """launchd inherits no shell environment, so the daemon needs SOME way
+    to find the key — but the spec says the key is environment-only and
+    never written to config, and this plist is config. The path is what the
+    plist may carry; the secret is not."""
+    xml = launch_agent_plist(Path("/x/python"), Path("/tmp/z.log"), ENV)
+    parsed = plistlib.loads(xml.encode())
+    assert parsed["EnvironmentVariables"]["ZEUS_ENV_FILE"] == str(ENV)
+    assert "ANTHROPIC_API_KEY" not in xml
+    assert "sk-ant" not in xml
+
+
+def test_env_file_is_loaded_into_the_environment(monkeypatch, tmp_path):
+    from zeus.cli import _load_env_file
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    env = tmp_path / "env"
+    env.write_text(
+        "# a comment\n"
+        "\n"
+        "ANTHROPIC_API_KEY=sk-ant-test-value\n"
+        'QUOTED="quoted-value"\n'
+    )
+    assert _load_env_file(env) == 2
+    assert os.environ["ANTHROPIC_API_KEY"] == "sk-ant-test-value"
+    assert os.environ["QUOTED"] == "quoted-value"
+
+
+def test_env_file_does_not_override_the_real_environment(monkeypatch, tmp_path):
+    """A key exported in the shell wins over the file, so running the daemon
+    by hand behaves the same as launchd loading it."""
+    from zeus.cli import _load_env_file
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "from-the-shell")
+    env = tmp_path / "env"
+    env.write_text("ANTHROPIC_API_KEY=from-the-file\n")
+    assert _load_env_file(env) == 0
+    assert os.environ["ANTHROPIC_API_KEY"] == "from-the-shell"
+
+
+def test_a_missing_env_file_is_not_an_error(tmp_path):
+    from zeus.cli import _load_env_file
+
+    assert _load_env_file(tmp_path / "nope") == 0
 
 
 def test_main_with_no_arguments_prints_usage(capsys):
@@ -5401,6 +5496,9 @@ def test_main_with_no_arguments_prints_usage(capsys):
 
 
 def test_main_rejects_an_unknown_command(capsys):
+    """RETURNS 2 — it does not raise. argparse calls parser.error() on an
+    invalid subparser choice, which raises SystemExit(2); main() catches it
+    so its declared `main(argv) -> int` contract holds on every path."""
     assert main(["frobnicate"]) == 2
 
 
@@ -5410,6 +5508,7 @@ def test_doctor_reports_and_returns_a_status(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(cli, "_probe_say", lambda: True)
     monkeypatch.setattr(cli, "_probe_afplay", lambda: True)
     monkeypatch.setattr(cli, "_probe_api_key", lambda: True)
+    monkeypatch.setattr(cli, "_probe_transcriber", lambda: True)
 
     code = main(["doctor", "--root", str(tmp_path)])
     output = capsys.readouterr().out
@@ -5417,11 +5516,38 @@ def test_doctor_reports_and_returns_a_status(monkeypatch, tmp_path, capsys):
     assert "say" in output and "ANTHROPIC_API_KEY" in output
 
 
+def test_doctor_accepts_any_supported_python(monkeypatch, tmp_path, capsys):
+    """Global Constraints say 3.11+, so doctor must not report a FAILURE on
+    3.11 or 3.13 merely because it was developed on 3.12."""
+    import zeus.cli as cli
+
+    for probe in ("_probe_say", "_probe_afplay", "_probe_api_key",
+                  "_probe_transcriber"):
+        monkeypatch.setattr(cli, probe, lambda: True)
+    assert sys.version_info[:2] >= (3, 11)
+    assert main(["doctor", "--root", str(tmp_path)]) == 0
+
+
+def test_doctor_fails_when_the_transcriber_is_missing(monkeypatch, tmp_path, capsys):
+    """A broken transcriber is silent at runtime — LocalWhisper.transcribe()
+    returns "" for every failure — so doctor is where it must surface."""
+    import zeus.cli as cli
+
+    monkeypatch.setattr(cli, "_probe_say", lambda: True)
+    monkeypatch.setattr(cli, "_probe_afplay", lambda: True)
+    monkeypatch.setattr(cli, "_probe_api_key", lambda: True)
+    monkeypatch.setattr(cli, "_probe_transcriber", lambda: False)
+
+    assert main(["doctor", "--root", str(tmp_path)]) == 1
+    assert "transcriber" in capsys.readouterr().out
+
+
 def test_doctor_fails_when_the_api_key_is_missing(monkeypatch, tmp_path, capsys):
     import zeus.cli as cli
 
     monkeypatch.setattr(cli, "_probe_say", lambda: True)
     monkeypatch.setattr(cli, "_probe_afplay", lambda: True)
+    monkeypatch.setattr(cli, "_probe_transcriber", lambda: True)
     monkeypatch.setattr(cli, "_probe_api_key", lambda: False)
 
     assert main(["doctor", "--root", str(tmp_path)]) == 1
@@ -5439,23 +5565,36 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'zeus.cli'`
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import logging
 import os
-import shutil
 import sys
 from pathlib import Path
 
 from zeus.config import Config, load_config
 
+log = logging.getLogger(__name__)
+
 LABEL = "com.zeus.daemon"
 PLIST_PATH = Path.home() / "Library/LaunchAgents" / f"{LABEL}.plist"
 
 
-def launch_agent_plist(python_path: Path, log_path: Path) -> str:
+def launch_agent_plist(python_path: Path, log_path: Path, env_path: Path) -> str:
     """Generate the LaunchAgent plist.
 
     The interpreter is referenced by absolute path so nothing depends on
     shell initialisation or PATH (spec §4.1).
+
+    ENV_PATH, NOT THE KEY ITSELF. launchd does not read .env, and a
+    LaunchAgent inherits none of your shell environment — so without this
+    the daemon starts with no ANTHROPIC_API_KEY and every brain call fails
+    at runtime, quietly. The obvious fix is an EnvironmentVariables entry
+    holding the key, but the spec says the key lives in the environment
+    only and is "never written to config or source", and a plist in
+    ~/Library/LaunchAgents is config. So the plist carries only a PATH to
+    the key file; cmd_run loads it (see _load_env_file). launchctl setenv
+    was the other candidate and was rejected: it does not survive a reboot,
+    so ZEUS would come back deaf to its own API after every restart.
     """
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -5470,6 +5609,10 @@ def launch_agent_plist(python_path: Path, log_path: Path) -> str:
         <string>zeus.cli</string>
         <string>run</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>ZEUS_ENV_FILE</key><string>{env_path}</string>
+    </dict>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
     <key>StandardOutPath</key><string>{log_path}</string>
@@ -5477,6 +5620,32 @@ def launch_agent_plist(python_path: Path, log_path: Path) -> str:
 </dict>
 </plist>
 """
+
+
+def _load_env_file(path: Path) -> int:
+    """Load KEY=VALUE lines into os.environ. Returns how many were set.
+
+    Ten lines of stdlib instead of python-dotenv: Global Constraints forbid
+    new dependencies. Deliberately minimal — no interpolation, no `export`
+    prefix, no multi-line values. It exists for one variable.
+
+    Existing environment wins, so running the daemon by hand from a shell
+    that already exported ANTHROPIC_API_KEY behaves the same as launchd
+    loading it from the file.
+    """
+    if not path.exists():
+        return 0
+    loaded = 0
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if key and key not in os.environ:
+            os.environ[key] = value.strip().strip("'\"")
+            loaded += 1
+    return loaded
 
 
 def _probe_say() -> bool:
@@ -5491,13 +5660,30 @@ def _probe_api_key() -> bool:
     return bool(os.environ.get("ANTHROPIC_API_KEY"))
 
 
+def _probe_transcriber() -> bool:
+    """Is the speech-to-text backend actually importable?
+
+    LocalWhisper.transcribe() catches Exception and returns "", so a missing
+    faster_whisper or a corrupt model is indistinguishable from a quiet room
+    — ZEUS just never hears anything and says so to nobody. This is the
+    cheap half of the check; cmd_selftest does the real one by transcribing
+    audio it actually captured.
+    """
+    return importlib.util.find_spec("faster_whisper") is not None
+
+
 def cmd_doctor(config: Config) -> int:
+    # >= (3, 11), not == (3, 12): Global Constraints say Python 3.11+, so
+    # exact equality would report a FAILURE on 3.11 or 3.13 while ZEUS runs
+    # perfectly well on both. A doctor that lies about health is worse than
+    # no doctor.
     checks = [
         ("python", f"{sys.version_info.major}.{sys.version_info.minor}",
-         sys.version_info[:2] == (3, 12)),
+         sys.version_info[:2] >= (3, 11)),
         ("say", "/usr/bin/say", _probe_say()),
         ("afplay", "/usr/bin/afplay", _probe_afplay()),
         ("ANTHROPIC_API_KEY", "environment", _probe_api_key()),
+        ("transcriber", "faster_whisper", _probe_transcriber()),
         ("zeus root", str(config.root), config.root.exists()),
         ("database", str(config.db_path), config.db_path.exists()),
         ("LaunchAgent", str(PLIST_PATH), PLIST_PATH.exists()),
@@ -5507,7 +5693,9 @@ def cmd_doctor(config: Config) -> int:
     for name, detail, ok in checks:
         print(f"  {'OK  ' if ok else 'FAIL'}  {name:<20} {detail}")
         # A missing database or LaunchAgent is expected before first run.
-        if not ok and name in {"python", "say", "afplay", "ANTHROPIC_API_KEY"}:
+        if not ok and name in {
+            "python", "say", "afplay", "ANTHROPIC_API_KEY", "transcriber",
+        }:
             healthy = False
     print()
     if not healthy:
@@ -5516,8 +5704,18 @@ def cmd_doctor(config: Config) -> int:
 
 
 def cmd_selftest(config: Config) -> int:
-    """Capture, transcribe, and speak. Requires real hardware — never in CI."""
-    from zeus.audio.mic import MicStream
+    """Capture, TRANSCRIBE, and speak. Requires real hardware — never in CI.
+
+    The transcription step is the point, not a bonus. audio_self_test only
+    proves frames are arriving with non-zero energy; it says nothing about
+    whether those frames become words. LocalWhisper.transcribe() swallows
+    every exception and returns "", so a missing model file, an
+    uninstalled faster_whisper, or a corrupt download all present as ZEUS
+    silently never understanding anything. Printing what came back is the
+    only way a user can tell "you said nothing" from "I am broken".
+    """
+    from zeus.audio.endpointer import Endpointer, capture_utterance
+    from zeus.audio.mic import FRAME_SAMPLES, MicStream
     from zeus.daemon import audio_self_test
     from zeus.stt import build_transcriber
     from zeus.tts import build_speaker
@@ -5535,8 +5733,29 @@ def cmd_selftest(config: Config) -> int:
             )
             return 1
         print("OK: microphone is producing audio.")
+
+        print("Now say a short sentence, then stop...")
+        frames_per_second = config.audio.sample_rate / FRAME_SAMPLES
+        audio = capture_utterance(
+            mic.frames(), Endpointer(config.audio), pre_roll=b"",
+            listen_timeout_frames=int(10 * frames_per_second),
+        )
     finally:
         mic.stop()
+
+    if not audio:
+        print("FAIL: captured no utterance — the endpointer heard only silence.")
+        return 1
+    transcriber = build_transcriber(config.stt, config.models_dir)
+    heard = transcriber.transcribe(audio, config.audio.sample_rate)
+    if not heard:
+        print(
+            "FAIL: audio was captured but transcription returned nothing.\n"
+            "  The model may be missing or corrupt. Check that faster_whisper\n"
+            f"  is installed and that {config.models_dir} holds the model."
+        )
+        return 1
+    print(f'OK: transcription works — I heard "{heard}"')
 
     speaker = build_speaker(config.tts)
     speaker.say("ZEUS self test complete. I can hear you and you can hear me.")
@@ -5548,11 +5767,21 @@ def cmd_install_agent(config: Config) -> int:
     python_path = Path(sys.executable).resolve()
     config.log_path.parent.mkdir(parents=True, exist_ok=True)
     PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
-    PLIST_PATH.write_text(launch_agent_plist(python_path, config.log_path))
+    PLIST_PATH.write_text(
+        launch_agent_plist(python_path, config.log_path, config.env_path)
+    )
     print(f"Wrote {PLIST_PATH}\n")
     print("Load it with:")
     print(f"  launchctl unload {PLIST_PATH} 2>/dev/null")
     print(f"  launchctl load {PLIST_PATH}\n")
+    if not config.env_path.exists():
+        print(
+            f"BEFORE loading it, put your API key in {config.env_path}:\n"
+            f"  printf 'ANTHROPIC_API_KEY=sk-ant-...\\n' > {config.env_path}\n"
+            f"  chmod 600 {config.env_path}\n"
+            "launchd inherits none of your shell environment, so without this\n"
+            "file the daemon starts fine and then fails on every request.\n"
+        )
     print(
         "IMPORTANT: run 'zeus selftest' from Terminal FIRST so macOS prompts\n"
         "for microphone access. A LaunchAgent that has never been granted\n"
@@ -5568,6 +5797,18 @@ def cmd_run(config: Config) -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # Under launchd the environment is empty but ZEUS_ENV_FILE points at the
+    # key file (see launch_agent_plist). Run from a shell and the file is
+    # usually absent while the variable is already exported — both paths end
+    # with ANTHROPIC_API_KEY in os.environ, which is the only place the
+    # Anthropic client reads it from.
+    env_file = Path(os.environ.get("ZEUS_ENV_FILE", config.env_path))
+    _load_env_file(env_file)
+    if not _probe_api_key():
+        log.error(
+            "ANTHROPIC_API_KEY is not set and %s did not supply it. "
+            "Every conversation will fail. Run 'zeus doctor'.", env_file,
+        )
     build_daemon(config).run_forever()
     return 0
 
@@ -5584,7 +5825,16 @@ def main(argv: list[str] | None = None) -> int:
     ]:
         sub.add_parser(name, help=help_text)
 
-    args = parser.parse_args(argv if argv is not None else sys.argv[1:])
+    # argparse RAISES SystemExit(2) on an unknown subcommand rather than
+    # returning — so without this, main() only sometimes returns an int and
+    # `main(["frobnicate"]) == 2` is unreachable. Catching it here keeps the
+    # declared `main(argv) -> int` contract true on every path, which is
+    # what makes main() callable as a library function and testable without
+    # pytest.raises.
+    try:
+        args = parser.parse_args(argv if argv is not None else sys.argv[1:])
+    except SystemExit as exit_request:
+        return int(exit_request.code or 0)
     if not args.command:
         parser.print_usage()
         return 2
@@ -5605,7 +5855,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run the test and verify it passes**
 
 Run: `.venv/bin/pytest tests/test_cli.py -v`
-Expected: PASS — 8 tests
+Expected: PASS — 15 tests
 
 - [ ] **Step 5: Commit**
 
