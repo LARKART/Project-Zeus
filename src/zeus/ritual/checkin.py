@@ -78,6 +78,13 @@ class VoiceIO:
                 unmute()
 
     def listen(self) -> str:
+        # Drain here rather than relying on WakeWordActivator.unmute() having
+        # done it: HotkeyActivator has no mute/unmute at all, so with that
+        # activator the queue would still hold ZEUS's own speech and the
+        # endpointer would read it as the start of the user's reply. Draining
+        # twice is harmless — drain() on an empty queue is a no-op.
+        if self._mic is not None:
+            self._mic.drain()
         frames_per_second = self._config.sample_rate / FRAME_SAMPLES
         timeout_frames = int(
             self._config.listen_timeout.total_seconds() * frames_per_second
@@ -125,13 +132,23 @@ class CheckIn:
         check-in left over from a previous day must not be reused, or today's
         first attempt would inherit yesterday's attempt count and could exhaust
         its retries before it has run once.
+
+        The local date is computed once, here, and passed to both
+        find_open_checkin (the lookup) and open_checkin (the write). An
+        earlier version let open_checkin derive it from scheduled_for.date(),
+        which is the UTC date, not the local one — the scheduler always
+        produces UTC-tagged datetimes (cron.next_occurrence ends in
+        .astimezone(timezone.utc)), so the write and the lookup silently
+        disagreed for every check-in at a negative UTC offset, and every
+        retry opened a fresh row instead of reusing the open one.
         """
-        existing = self._store.find_open_checkin(
-            self._kind, local_date(scheduled_for, self._tz)
-        )
+        date = local_date(scheduled_for, self._tz)
+        existing = self._store.find_open_checkin(self._kind, date)
         if existing is not None:
             return existing.id
-        return self._store.open_checkin(self._kind, scheduled_for)
+        # Same `date` for the write as for the lookup — that identity is the
+        # whole point; deriving it twice is how they drifted apart before.
+        return self._store.open_checkin(self._kind, scheduled_for, date)
 
     def run(self, scheduled_for: datetime) -> Outcome:
         date = local_date(scheduled_for, self._tz)

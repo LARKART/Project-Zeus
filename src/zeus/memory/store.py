@@ -122,13 +122,21 @@ class Store:
         )
 
     # ---- check-ins ---------------------------------------------------
-    def open_checkin(self, kind: str, scheduled_for: datetime) -> int:
-        # scheduled_for is aware and carries the *local* zone the scheduler built
-        # it in, so .date() is the local calendar day. Reading it before
-        # to_utc_iso() converts is what keeps Store timezone-free.
+    def open_checkin(self, kind: str, scheduled_for: datetime, local_date: str) -> int:
+        """Open a check-in row.
+
+        local_date is passed in rather than derived from scheduled_for. An
+        earlier version inferred it via scheduled_for.date(), relying on the
+        caller to hand over a local-zone-aware datetime -- but the scheduler
+        always produces UTC (cron.next_occurrence ends in .astimezone(utc)),
+        so the row was written with the UTC date while find_open_checkin
+        searched the local one. Every retry then opened a fresh row and
+        attempts never advanced past 1. Keeping the key explicit makes the
+        write and the lookup provably the same value.
+        """
         cur = self.connection.execute(
             "INSERT INTO checkins (kind, local_date, scheduled_for) VALUES (?, ?, ?)",
-            (kind, scheduled_for.date().isoformat(), to_utc_iso(scheduled_for)),
+            (kind, local_date, to_utc_iso(scheduled_for)),
         )
         return int(cur.lastrowid)
 

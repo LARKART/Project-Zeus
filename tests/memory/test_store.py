@@ -76,7 +76,7 @@ def test_update_goal_preserves_existing_notes(store):
 
 
 def test_checkin_lifecycle(store):
-    cid = store.open_checkin("morning", START)
+    cid = store.open_checkin("morning", START, "2026-08-05")
     assert store.get_checkin(cid).outcome == "deferred"
     store.update_checkin(cid, outcome="answered", attempts=1, fired_at=START)
     checkin = store.get_checkin(cid)
@@ -86,18 +86,18 @@ def test_checkin_lifecycle(store):
 
 
 def test_find_open_checkin_returns_unresolved(store):
-    cid = store.open_checkin("morning", START)
+    cid = store.open_checkin("morning", START, "2026-08-05")
     found = store.find_open_checkin("morning", "2026-08-05")
     assert found is not None
     assert found.id == cid
 
 
 def test_find_open_checkin_ignores_settled(store):
-    answered_id = store.open_checkin("morning", START)
+    answered_id = store.open_checkin("morning", START, "2026-08-05")
     store.update_checkin(answered_id, outcome="answered", attempts=1)
     assert store.find_open_checkin("morning", "2026-08-05") is None
 
-    no_answer_id = store.open_checkin("morning", START)
+    no_answer_id = store.open_checkin("morning", START, "2026-08-05")
     store.update_checkin(no_answer_id, outcome="no_answer", attempts=1)
     found = store.find_open_checkin("morning", "2026-08-05")
     assert found is not None
@@ -110,7 +110,7 @@ def test_find_open_checkin_uses_local_not_utc_date(store):
     # compared date(scheduled_for) against the local calendar date would
     # miss this check-in entirely -- it must be keyed on local_date instead.
     local_dt = datetime(2026, 8, 5, 21, 0, tzinfo=ZoneInfo("America/New_York"))
-    store.open_checkin("evening", local_dt)
+    store.open_checkin("evening", local_dt, "2026-08-05")
     assert store.find_open_checkin("evening", "2026-08-05") is not None
     assert store.find_open_checkin("evening", "2026-08-06") is None
 

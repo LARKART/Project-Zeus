@@ -1,10 +1,11 @@
+import threading
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pytest
 from zoneinfo import ZoneInfo
 
-from zeus.audio.mic import FRAME_SAMPLES
+from zeus.audio.mic import FRAME_SAMPLES, MicStream
 from zeus.brain.fake import FakeConversation
 from zeus.clock import FakeClock
 from zeus.config import Config, ScheduleConfig
@@ -13,10 +14,12 @@ from zeus.memory.journal import Journal
 from zeus.memory.store import Store
 from zeus.ritual.checkin import CheckIn, FakeNotifier, VoiceIO, local_date
 from zeus.ritual.retry import Outcome
+from zeus.schedule.cron import hhmm_to_cron, next_occurrence
 from zeus.stt.fake import FakeTranscriber
 from zeus.tts.fake import FakeSpeaker
 
 LAGOS = ZoneInfo("Africa/Lagos")
+LOS_ANGELES = ZoneInfo("America/Los_Angeles")
 NOW = datetime(2026, 8, 5, 10, 0, tzinfo=timezone.utc)  # 11:00 Lagos
 
 
@@ -165,6 +168,53 @@ def test_journal_records_a_missed_checkin(wiring):
     assert "no answer" in journal.read("2026-08-05").lower()
 
 
+def test_a_retry_finds_the_same_row_when_local_and_utc_dates_differ(wiring):
+    """Regression: open_checkin used to derive local_date from
+    scheduled_for.date() -- the UTC calendar date -- while find_open_checkin
+    searched on the local one. Africa/Lagos (UTC+1) can never expose this:
+    local and UTC dates only diverge at a negative UTC offset. Los Angeles
+    (UTC-7 in August) can, and scheduled_for below is built the way the real
+    scheduler builds it -- cron.next_occurrence always returns a UTC-tagged
+    datetime -- not hand-constructed to dodge the bug.
+    """
+    clock, store, journal = wiring
+    anchor = datetime(2026, 8, 5, 10, 0, tzinfo=timezone.utc)  # 03:00 PDT
+    scheduled_for = next_occurrence(hhmm_to_cron("21:00"), anchor, LOS_ANGELES)
+    date = local_date(scheduled_for, LOS_ANGELES)
+    # The whole point: the UTC calendar date and the local one disagree.
+    assert scheduled_for.date().isoformat() != date
+
+    checkin = CheckIn(
+        kind="evening", store=store, journal=journal,
+        presence=StubPresence(Verdict.DEFER), voice=StubVoice(),
+        notifier=FakeNotifier(),
+        conversation_factory=lambda conv_id, local: FakeConversation({}),
+        config=ScheduleConfig(), tz=LOS_ANGELES, clock=clock,
+    )
+
+    checkin.run(scheduled_for)
+    after_first = [
+        r["id"] for r in
+        store.connection.execute("SELECT id FROM checkins ORDER BY id").fetchall()
+    ]
+    assert len(after_first) == 1
+    first_id = after_first[0]
+
+    checkin.run(scheduled_for)
+    after_second = [
+        r["id"] for r in
+        store.connection.execute("SELECT id FROM checkins ORDER BY id").fetchall()
+    ]
+
+    # A retry must reuse the same row, not open a new one -- else attempts
+    # never advance, both retry budgets never exhaust, and the table
+    # accumulates a duplicate row per attempt.
+    assert after_second == [first_id], (
+        f"expected the retry to reuse row {first_id}, found rows {after_second}"
+    )
+    assert store.get_checkin(first_id).attempts == 2
+
+
 # ---- VoiceIO: the half-duplex seam --------------------------------------
 #
 # Everything above exercises CheckIn through StubVoice, which never touches
@@ -207,6 +257,9 @@ class BoomSpeaker:
 class _SilentMic:
     """Yields only silence frames, then ends."""
 
+    def drain(self):
+        pass  # listen() drains unconditionally now; nothing queued to discard
+
     def frames(self):
         for _ in range(50):
             yield SILENCE
@@ -220,6 +273,9 @@ class _LoudMic:
     the timeout ends the generator and fails the byte-count assertion below
     instead of hanging the suite.
     """
+
+    def drain(self):
+        pass  # listen() drains unconditionally now; nothing queued to discard
 
     def frames(self):
         for _ in range(2000):
@@ -283,3 +339,59 @@ def test_listen_stops_at_the_configured_timeout():
 
     assert result == "hello"
     assert transcriber.calls == [expected_frames * FRAME_SAMPLES * 2]
+
+
+def test_listen_discards_audio_buffered_before_it_was_called():
+    """listen() must own its drain rather than depend on
+    WakeWordActivator.unmute() having done it: HotkeyActivator has no
+    mute/unmute at all, so paired with that activator the queue would still
+    hold ZEUS's own speech, and the endpointer would read it as the start of
+    the user's reply.
+
+    Uses a real MicStream so the assertion is about the actual queue, not a
+    double's promise. mic.drain is wrapped rather than called ahead of time:
+    the frames that must survive have to be produced strictly *after*
+    listen() drains, and a single-threaded test can only guarantee that
+    ordering by hooking the call itself. Runs on a background thread with a
+    bounded wait rather than a bare call, because a regression here doesn't
+    raise -- it hangs (MicStream.frames() polls forever with nothing to stop
+    it), and a bare call would hang the suite instead of failing the test.
+    """
+    from zeus.config import AudioConfig
+
+    mic = MicStream(AudioConfig())
+
+    # Buffered before listen() is called -- e.g. the backlog of ZEUS's own
+    # voice sitting in the queue because the activator in play has no
+    # mute()/unmute() to drain it on unmute.
+    for _ in range(5):
+        mic._on_audio(SPEECH, FRAME_SAMPLES, None, None)
+
+    real_drain = mic.drain
+
+    def drain_then_produce_live_speech():
+        real_drain()
+        # Produced only after listen() started draining -- what the user
+        # actually says.
+        for _ in range(3):
+            mic._on_audio(SPEECH, FRAME_SAMPLES, None, None)
+        mic.stop()  # lets frames() end once this second batch is consumed
+
+    mic.drain = drain_then_produce_live_speech
+
+    transcriber = FakeTranscriber(["hello"])
+    voice = _voice(RecordingActivator(), FakeSpeaker(), transcriber, mic)
+
+    outcome = {}
+    finished = threading.Event()
+
+    def run():
+        outcome["text"] = voice.listen()
+        finished.set()
+
+    threading.Thread(target=run, daemon=True).start()
+    completed = finished.wait(2)
+
+    assert completed, "listen() did not return within 2s -- drain() was never called"
+    assert outcome["text"] == "hello"
+    assert transcriber.calls == [3 * FRAME_SAMPLES * 2]
