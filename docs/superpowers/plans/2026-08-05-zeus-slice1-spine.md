@@ -611,7 +611,7 @@ git commit -m "feat: clock abstraction and DST-aware timezone resolution"
 - Produces `Store(db_path: Path, clock: Clock)` with:
   - `set_goal(date: str, text: str) -> int`, `get_goal(date: str) -> Goal | None`
   - `update_goal(goal_id: int, status: str, notes: str | None = None) -> None`
-  - `open_checkin(kind: str, scheduled_for: datetime) -> int`
+  - `open_checkin(kind: str, scheduled_for: datetime, local_date: str) -> int` — `local_date` is explicit, never inferred from `scheduled_for`; see the docstring for why.
   - `get_checkin(checkin_id: int) -> CheckIn`, `find_open_checkin(kind, date) -> CheckIn | None`
   - `update_checkin(checkin_id: int, *, outcome: str, attempts: int, fired_at: datetime | None = None) -> None`
   - `log_action(tool, args, result, ok, duration_ms, error=None, conversation_id=None) -> int`
@@ -757,7 +757,7 @@ def test_invalid_goal_status_rejected(store):
 
 
 def test_checkin_lifecycle(store):
-    cid = store.open_checkin("morning", START)
+    cid = store.open_checkin("morning", START, "2026-08-05")
     assert store.get_checkin(cid).outcome == "deferred"
     store.update_checkin(cid, outcome="answered", attempts=1, fired_at=START)
     checkin = store.get_checkin(cid)
@@ -937,13 +937,25 @@ class Store:
         )
 
     # ---- check-ins ---------------------------------------------------
-    def open_checkin(self, kind: str, scheduled_for: datetime) -> int:
-        # scheduled_for is aware and carries the *local* zone the scheduler
-        # built it in, so .date() is the local calendar day. Reading it
-        # before to_utc_iso() converts is what keeps Store timezone-free.
+    def open_checkin(
+        self, kind: str, scheduled_for: datetime, local_date: str
+    ) -> int:
+        """Open a check-in row.
+
+        local_date is a PARAMETER, not derived from scheduled_for. An earlier
+        version inferred it via scheduled_for.date(), relying on the caller to
+        hand over a local-zone-aware datetime — but the scheduler always
+        produces UTC (cron.next_occurrence ends in .astimezone(utc)), so the
+        row was written with the UTC date while find_open_checkin searched the
+        local one. Every retry then opened a fresh row, attempts never advanced
+        past 1, both retry budgets never exhausted, and fold_forward/skipped
+        never fired. Africa/Lagos hid it — at UTC+1 the two dates coincide at
+        check-in times. Keeping the key explicit makes the write and the lookup
+        provably the same value, and keeps Store timezone-free.
+        """
         cur = self.connection.execute(
             "INSERT INTO checkins (kind, local_date, scheduled_for) VALUES (?, ?, ?)",
-            (kind, scheduled_for.date().isoformat(), to_utc_iso(scheduled_for)),
+            (kind, local_date, to_utc_iso(scheduled_for)),
         )
         return int(cur.lastrowid)
 
@@ -4515,6 +4527,14 @@ class VoiceIO:
                 unmute()
 
     def listen(self) -> str:
+        # Drain here rather than relying on WakeWordActivator.unmute() having
+        # done it. HotkeyActivator — a documented production fallback — has no
+        # mute/unmute at all, so with that activator the queue would still hold
+        # ZEUS's own speech and the endpointer would read it as the start of
+        # the user's reply. Draining twice is harmless; drain() on an empty
+        # queue is a no-op. VoiceIO should own what it depends on.
+        if self._mic is not None:
+            self._mic.drain()
         frames_per_second = self._config.sample_rate / FRAME_SAMPLES
         timeout_frames = int(
             self._config.listen_timeout.total_seconds() * frames_per_second
@@ -4563,12 +4583,13 @@ class CheckIn:
         first attempt would inherit yesterday's attempt count and could exhaust
         its retries before it has run once.
         """
-        existing = self._store.find_open_checkin(
-            self._kind, local_date(scheduled_for, self._tz)
-        )
+        date = local_date(scheduled_for, self._tz)
+        existing = self._store.find_open_checkin(self._kind, date)
         if existing is not None:
             return existing.id
-        return self._store.open_checkin(self._kind, scheduled_for)
+        # Same `date` for the write as for the lookup. That identity is the
+        # whole point — deriving it twice is exactly how they drifted apart.
+        return self._store.open_checkin(self._kind, scheduled_for, date)
 
     def run(self, scheduled_for: datetime) -> Outcome:
         date = local_date(scheduled_for, self._tz)
@@ -4621,12 +4642,15 @@ class CheckIn:
 - [ ] **Step 4: Run the test and verify it passes**
 
 Run: `.venv/bin/pytest tests/ritual/test_checkin.py -v`
-Expected: PASS — 14 tests (the Step 1 file collects 10; an earlier draft
-said 9, miscounting. Plus 4 added in review to cover `VoiceIO` directly,
+Expected: PASS — 16 tests (the Step 1 file collects 10; an earlier draft
+said 9, miscounting. Plus 6 added in review: 4 covering `VoiceIO` directly,
 which the Step 1 file never exercises — it drives `CheckIn` through a
-`StubVoice`. The important one asserts `speak()` unmutes in a `finally`:
-without it, a `say()` that raises leaves the wake detector muted forever
-and ZEUS never wakes again until the daemon restarts.)
+`StubVoice` — and 2 more from the review round. The three that matter:
+`speak()` must unmute in a `finally`, or a `say()` that raises leaves the
+wake detector muted forever and ZEUS never wakes again until the daemon
+restarts; a retry must find the SAME row when the local and UTC dates
+differ, which requires a non-Lagos zone to express at all; and `listen()`
+must discard audio buffered before it was called.)
 
 - [ ] **Step 5: Commit**
 
