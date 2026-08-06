@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 from zoneinfo import ZoneInfo
 
+from zeus.audio.activator import FakeActivator
 from zeus.audio.mic import FRAME_SAMPLES, MicStream
 from zeus.clock import FakeClock
 from zeus.config import AudioConfig, Config
@@ -25,6 +26,26 @@ def _mic(frames):
         mic._on_audio(frame, FRAME_SAMPLES, None, None)
     mic.stop()
     return mic
+
+
+class _RecordingMic:
+    """A mic double that only records start()/stop() calls.
+
+    Not a real MicStream: start() must never touch sounddevice, since
+    building one requires a real audio device. Used to assert Daemon.stop()
+    reaches the mic, without exercising MicStream.frames()'s own shutdown
+    plumbing (that's covered separately by tests/audio/test_mic.py).
+    """
+
+    def __init__(self) -> None:
+        self.started = False
+        self.stopped = False
+
+    def start(self) -> None:
+        self.started = True
+
+    def stop(self) -> None:
+        self.stopped = True
 
 
 def test_self_test_passes_on_real_audio():
@@ -112,3 +133,46 @@ def test_degraded_flag_defaults_to_false(daemon):
 def test_run_catch_up_is_empty_without_a_heartbeat(daemon):
     instance, _, _, _ = daemon
     assert instance.run_catch_up() == []
+
+
+def test_stop_stops_the_mic_not_just_the_activator(tmp_path):
+    """Finding #1: WakeWordActivator.events() only checks `self._running`
+    AFTER `mic.frames()` yields a frame:
+
+        for frame in self._mic.frames():
+            if not self._running:
+                return
+
+    With no incoming audio, `mic.frames()` never yields, so that check is
+    never reached — activator.stop() alone cannot unblock a thread parked
+    inside it. What actually unblocks it is MicStream.frames() observing
+    its own `_stopping` Event, which only `MicStream.stop()` sets. So
+    Daemon.stop() must call mic.stop() directly, not rely on the activator
+    to propagate the shutdown.
+
+    This is deliberately the narrower assertion, not an end-to-end proof
+    that a hung WakeWordActivator.events() call actually returns: wiring a
+    real WakeWordActivator needs a wake-word model that
+    openwakeword.utils.download_models() fetches over the network, which
+    tests must never require. Recording doubles for both activator and mic
+    keep this test to what Daemon.stop() itself is responsible for: calling
+    stop() on both, not just the activator. MicStream's own shutdown
+    behaviour (frames() ending once _stopping is set) is covered directly
+    by tests/audio/test_mic.py.
+    """
+    clock = FakeClock(NOW)
+    store = Store(tmp_path / "zeus.db", clock)
+    journal = Journal(tmp_path / "journal", clock, LAGOS)
+    scheduler = Scheduler(store, clock, LAGOS)
+    activator = FakeActivator(count=0)
+    mic = _RecordingMic()
+    instance = Daemon(
+        config=Config(root=tmp_path), store=store, journal=journal,
+        scheduler=scheduler, presence=None, voice=None, notifier=None,
+        checkins={}, clock=clock, activator=activator, mic=mic,
+    )
+
+    instance.stop()
+
+    assert mic.stopped is True
+    assert activator.stopped is True
