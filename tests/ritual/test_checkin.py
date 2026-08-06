@@ -1,4 +1,5 @@
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -257,9 +258,6 @@ class BoomSpeaker:
 class _SilentMic:
     """Yields only silence frames, then ends."""
 
-    def drain(self):
-        pass  # listen() drains unconditionally now; nothing queued to discard
-
     def frames(self):
         for _ in range(50):
             yield SILENCE
@@ -273,9 +271,6 @@ class _LoudMic:
     the timeout ends the generator and fails the byte-count assertion below
     instead of hanging the suite.
     """
-
-    def drain(self):
-        pass  # listen() drains unconditionally now; nothing queued to discard
 
     def frames(self):
         for _ in range(2000):
@@ -341,43 +336,39 @@ def test_listen_stops_at_the_configured_timeout():
     assert transcriber.calls == [expected_frames * FRAME_SAMPLES * 2]
 
 
-def test_listen_discards_audio_buffered_before_it_was_called():
-    """listen() must own its drain rather than depend on
-    WakeWordActivator.unmute() having done it: HotkeyActivator has no
-    mute/unmute at all, so paired with that activator the queue would still
-    hold ZEUS's own speech, and the endpointer would read it as the start of
-    the user's reply.
+def _await(predicate, message, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        assert time.monotonic() < deadline, message
+        time.sleep(0.005)
 
-    Uses a real MicStream so the assertion is about the actual queue, not a
-    double's promise. mic.drain is wrapped rather than called ahead of time:
-    the frames that must survive have to be produced strictly *after*
-    listen() drains, and a single-threaded test can only guarantee that
-    ordering by hooking the call itself. Runs on a background thread with a
-    bounded wait rather than a bare call, because a regression here doesn't
-    raise -- it hangs (MicStream.frames() polls forever with nothing to stop
-    it), and a bare call would hang the suite instead of failing the test.
+
+def test_listen_does_not_inherit_audio_buffered_before_it_was_called():
+    """listen() must not pick up ZEUS's own speech that was already in
+    flight when it started, or the endpointer reads it as the start of the
+    user's reply.
+
+    This used to depend on listen() calling mic.drain(). It is structural
+    now: mic.frames() opens a FRESH subscription whose queue starts empty,
+    so audio broadcast before listen() began went to queues listen() does
+    not own. That also covers HotkeyActivator, which has no mute/unmute at
+    all and so could never have drained anything -- the emptiness no longer
+    depends on any activator remembering to act.
+
+    Uses a real MicStream so the assertion is about the actual queues, not
+    a double's promise. Runs on a background thread with a bounded wait
+    rather than a bare call, because a regression here doesn't raise -- it
+    hangs (Subscription.frames() polls forever with nothing to stop it).
     """
     from zeus.config import AudioConfig
 
     mic = MicStream(AudioConfig())
+    mic.subscribe()  # a long-lived consumer, as the wake detector is
 
-    # Buffered before listen() is called -- e.g. the backlog of ZEUS's own
-    # voice sitting in the queue because the activator in play has no
-    # mute()/unmute() to drain it on unmute.
+    # Buffered before listen() is called -- the backlog of ZEUS's own voice.
+    # It reaches the subscriptions that exist NOW, never listen()'s.
     for _ in range(5):
         mic._on_audio(SPEECH, FRAME_SAMPLES, None, None)
-
-    real_drain = mic.drain
-
-    def drain_then_produce_live_speech():
-        real_drain()
-        # Produced only after listen() started draining -- what the user
-        # actually says.
-        for _ in range(3):
-            mic._on_audio(SPEECH, FRAME_SAMPLES, None, None)
-        mic.stop()  # lets frames() end once this second batch is consumed
-
-    mic.drain = drain_then_produce_live_speech
 
     transcriber = FakeTranscriber(["hello"])
     voice = _voice(RecordingActivator(), FakeSpeaker(), transcriber, mic)
@@ -390,8 +381,100 @@ def test_listen_discards_audio_buffered_before_it_was_called():
         finished.set()
 
     threading.Thread(target=run, daemon=True).start()
-    completed = finished.wait(2)
+    _await(lambda: len(mic._subscribers) == 2, "listen() never subscribed")
 
-    assert completed, "listen() did not return within 2s -- drain() was never called"
+    # Produced only after listen() subscribed -- what the user actually says.
+    for _ in range(3):
+        mic._on_audio(SPEECH, FRAME_SAMPLES, None, None)
+    mic.stop()  # lets frames() end once this second batch is consumed
+
+    assert finished.wait(5), "listen() did not return within 5s"
     assert outcome["text"] == "hello"
     assert transcriber.calls == [3 * FRAME_SAMPLES * 2]
+
+
+def test_listen_holds_the_detector_muted_for_the_whole_window():
+    """The other half of the fan-out ruling. Once every consumer gets its
+    own copy of every frame the detector no longer STEALS the user's
+    answer -- but it now hears all of it, and a "hey zeus" spoken
+    mid-answer would launch an ad-hoc conversation on top of the running
+    check-in. speak() mutes for its own duration; listen() must cover the
+    rest of the turn.
+    """
+    activator = RecordingActivator()
+    voice = _voice(activator, FakeSpeaker(), FakeTranscriber([]), _silent_mic())
+
+    assert voice.listen() == ""
+    assert activator.events == ["mute", "unmute"]
+
+
+def test_listen_unmutes_even_when_capture_raises():
+    """Without the finally, a mid-capture failure leaves the detector muted
+    forever and ZEUS never wakes again -- the same trap speak() already has
+    a regression test for."""
+
+    class BoomMic:
+        def frames(self):
+            raise RuntimeError("audio device vanished mid-capture")
+
+    activator = RecordingActivator()
+    voice = _voice(activator, FakeSpeaker(), FakeTranscriber([]), BoomMic())
+
+    with pytest.raises(RuntimeError):
+        voice.listen()
+    assert activator.events == ["mute", "unmute"]
+
+
+def test_a_live_wake_detector_does_not_eat_the_users_answer(monkeypatch):
+    """C2 (round 4), across the real wiring build_daemon() builds.
+
+    ONE MicStream is shared by the wake detector (its own thread, running
+    forever) and VoiceIO.listen() (the main thread, during a check-in).
+    With a single shared queue, queue.get() removed the frame, so the
+    detector took roughly half the user's answer and Whisper received
+    non-contiguous 80 ms chunks -- recorded as NO_ANSWER or garbage.
+    Every frame produced during the listen window must reach the
+    transcriber whole.
+    """
+    from zeus.audio.wakeword import WakeWordActivator
+    from zeus.config import AudioConfig, WakeConfig
+
+    class _NeverFires:
+        def predict(self, samples):
+            return {"hey_jarvis": 0.0}
+
+    mic = MicStream(AudioConfig())
+    activator = WakeWordActivator(mic, WakeConfig(), threshold=0.5)
+    monkeypatch.setattr(activator, "_load_model", lambda: _NeverFires())
+    activator.start()
+    threading.Thread(
+        target=lambda: list(activator.events()), daemon=True
+    ).start()
+    _await(
+        lambda: activator._subscription is not None,
+        "the wake detector never subscribed",
+    )
+
+    transcriber = FakeTranscriber(["the whole answer"])
+    voice = _voice(activator, FakeSpeaker(), transcriber, mic)
+
+    outcome = {}
+    finished = threading.Event()
+
+    def run():
+        outcome["text"] = voice.listen()
+        finished.set()
+
+    threading.Thread(target=run, daemon=True).start()
+    _await(lambda: len(mic._subscribers) == 2, "listen() never subscribed")
+
+    spoken_frames = 10
+    for _ in range(spoken_frames):
+        mic._on_audio(SPEECH, FRAME_SAMPLES, None, None)
+    mic.stop()
+
+    assert finished.wait(5), "listen() did not return within 5s"
+    assert outcome["text"] == "the whole answer"
+    assert transcriber.calls == [spoken_frames * FRAME_SAMPLES * 2], (
+        "the wake detector consumed part of the user's answer"
+    )

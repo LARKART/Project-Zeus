@@ -25,6 +25,8 @@ class WakeWordActivator:
         self._model = None
         self._muted = False
         self._running = False
+        # Set while events() is iterating; unmute() drains through it.
+        self._subscription = None
 
     def _load_model(self):
         import openwakeword
@@ -55,14 +57,31 @@ class WakeWordActivator:
         detector scores all of it on resume and re-triggers itself — the
         exact feedback loop muting exists to prevent. Measured: 51 queued
         frames of self-audio, all 51 scored after unmute.
+
+        Drains THIS detector's own subscription, never the whole stream: a
+        scheduled check-in capturing an answer on the main thread holds its
+        own subscription, and a stream-wide drain would delete the user's
+        in-flight reply.
         """
         self._muted = False
-        self._mic.drain()
+        if self._subscription is not None:
+            self._subscription.drain()
 
     def events(self) -> Iterator[ActivationEvent]:
         if self._model is None:
             self._model = self._load_model()
-        for frame in self._mic.frames():
+        # subscribe() rather than mic.frames(): the detector is a long-lived
+        # consumer that needs a stable handle for unmute() to drain. Closing
+        # it on exit stops _on_audio filling a queue nobody reads.
+        with self._mic.subscribe() as subscription:
+            self._subscription = subscription
+            try:
+                yield from self._detect(subscription)
+            finally:
+                self._subscription = None
+
+    def _detect(self, subscription) -> Iterator[ActivationEvent]:
+        for frame in subscription.frames():
             if not self._running:
                 return
             if self._muted:

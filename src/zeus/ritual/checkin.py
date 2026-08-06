@@ -78,21 +78,38 @@ class VoiceIO:
                 unmute()
 
     def listen(self) -> str:
-        # Drain here rather than relying on WakeWordActivator.unmute() having
-        # done it: HotkeyActivator has no mute/unmute at all, so with that
-        # activator the queue would still hold ZEUS's own speech and the
-        # endpointer would read it as the start of the user's reply. Draining
-        # twice is harmless — drain() on an empty queue is a no-op.
-        if self._mic is not None:
-            self._mic.drain()
-        frames_per_second = self._config.sample_rate / FRAME_SAMPLES
-        timeout_frames = int(
-            self._config.listen_timeout.total_seconds() * frames_per_second
-        )
-        audio = capture_utterance(
-            self._mic.frames(), self._endpointer,
-            pre_roll=b"", listen_timeout_frames=timeout_frames,
-        )
+        """Capture one utterance with the wake detector held muted.
+
+        No drain() is needed any more: mic.frames() opens a FRESH
+        subscription whose queue starts empty, so it cannot inherit the
+        audio of ZEUS's own speech the way the old single shared queue
+        could. That also fixes it for HotkeyActivator, which has no
+        mute/unmute at all — the emptiness is structural now, not something
+        an activator has to remember to do.
+
+        The mute is the other half of the fan-out fix. Once every consumer
+        gets its own copy of every frame, the detector no longer steals the
+        user's answer — but it now HEARS all of it, and a "hey zeus" spoken
+        mid-answer would launch an ad-hoc conversation on top of the running
+        check-in. Muting for the whole listen window closes that. speak()
+        mutes for its own duration; this covers the rest of the turn.
+        """
+        mute = getattr(self._activator, "mute", None)
+        unmute = getattr(self._activator, "unmute", None)
+        if mute:
+            mute()
+        try:
+            frames_per_second = self._config.sample_rate / FRAME_SAMPLES
+            timeout_frames = int(
+                self._config.listen_timeout.total_seconds() * frames_per_second
+            )
+            audio = capture_utterance(
+                self._mic.frames(), self._endpointer,
+                pre_roll=b"", listen_timeout_frames=timeout_frames,
+            )
+        finally:
+            if unmute:
+                unmute()
         if not audio:
             return ""
         return self._transcriber.transcribe(audio, self._config.sample_rate)
