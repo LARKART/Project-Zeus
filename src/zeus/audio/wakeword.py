@@ -64,7 +64,7 @@ class WakeWordActivator:
         """
         with self._mute_lock:
             self._mute_depth += 1
-        self._muted = True
+            self._muted = True
 
     def unmute(self) -> None:
         """Re-enable detection after ZEUS has finished speaking.
@@ -82,9 +82,17 @@ class WakeWordActivator:
         in-flight reply.
 
         Only the OUTERMOST unmute actually unmutes — see mute() for why.
-        Clamped at zero so an unmute() without a matching mute() stays safe,
-        which VoiceIO relies on: it calls unmute() in a `finally` whether or
-        not the paired mute() ran.
+
+        Clamped at zero as DEFENCE IN DEPTH, not because anything emits a
+        stray unmute today: both call sites (VoiceIO.speak and
+        VoiceIO.listen) run mute() immediately before a try/finally that
+        unmutes, and no activator defines unmute without mute, so the
+        `if unmute:` guard never fires unpaired. An earlier version of this
+        docstring claimed VoiceIO "calls unmute() in a finally whether or
+        not the paired mute() ran" — that is false, and worth correcting
+        rather than deleting: without the clamp, ONE stray unmute would
+        leave the depth at -1 and the next nested window would unwind a
+        level early, unmuting while an outer window is still open.
         """
         with self._mute_lock:
             self._mute_depth = max(0, self._mute_depth - 1)

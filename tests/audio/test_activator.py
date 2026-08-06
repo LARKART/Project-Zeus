@@ -215,9 +215,10 @@ def test_matched_unmutes_restore_detection(monkeypatch):
 def test_a_stray_unmute_cannot_undermine_a_later_mute_window(monkeypatch):
     """Why the counter is clamped at zero.
 
-    VoiceIO calls unmute() in a `finally` whether or not the paired mute()
-    ran -- HotkeyActivator has no mute at all, and speak() unmutes even when
-    say() raises before anything was muted. Unclamped, one stray unmute
+    No caller emits a stray unmute today -- both VoiceIO call sites pair
+    mute() with a finally-unmute, and HotkeyActivator defines NEITHER method
+    so the `if unmute:` guard never fires on it. This pins the clamp as
+    defence in depth. Unclamped, one stray unmute
     leaves the depth at -1, and the NEXT nested window then unwinds one
     level early: the inner unmute drops the depth to 0 and unmutes while the
     outer window is still open. Clamping keeps a stray unmute a no-op.
