@@ -5591,6 +5591,7 @@ import argparse
 import importlib.util
 import logging
 import os
+import plistlib
 import sys
 from pathlib import Path
 
