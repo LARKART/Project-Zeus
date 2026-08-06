@@ -3513,10 +3513,21 @@ class WakeWordActivator:
         detector scored 5 of 5 frames of the user's in-flight answer. With
         a counter, the inner unmute decrements to 1 and the detector stays
         muted until the outer window closes.
+
+        BOTH WRITES GO INSIDE THE LOCK. An earlier version of this snippet
+        incremented the depth under the lock and then set _muted outside
+        it, which loses a race: thread A increments 0->1 and releases the
+        lock; before A sets _muted, thread B's unmute() takes the lock,
+        decrements 1->0, sees no window open, sets _muted = False and
+        returns; A then sets _muted = True. The result is depth 0 with
+        _muted True — nobody holds a mute, but events() reads _muted, so
+        the wake word is DEAF until some later matched mute/unmute pair
+        happens to clear it. Reproduced deterministically by pausing A
+        between the lock release and the write.
         """
         with self._mute_lock:
             self._mute_depth += 1
-        self._muted = True
+            self._muted = True
 
     def unmute(self) -> None:
         """Re-enable detection after ZEUS has finished speaking.
