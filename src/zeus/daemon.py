@@ -106,6 +106,25 @@ class DegradedPresence:
         return Verdict.NOTIFY if verdict is Verdict.SPEAK else verdict
 
 
+class SwitchablePresence:
+    """One level of indirection so the daemon can downgrade after startup.
+
+    The self-test runs after the CheckIns are built, and CheckIn stores its
+    presence at construction. Handing every CheckIn this wrapper means a
+    single degrade() call reaches all of them — no rebuilding them, and no
+    reaching into their private attributes from outside.
+    """
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+
+    def verdict(self) -> Verdict:
+        return self._inner.verdict()
+
+    def degrade(self) -> None:
+        self._inner = DegradedPresence(self._inner)
+
+
 class Daemon:
     def __init__(
         self, config: Config, store, journal, scheduler: Scheduler,
@@ -199,37 +218,18 @@ class Daemon:
         finally:
             self._store.end_conversation(conversation_id)
 
-    def _degrade_presence(self) -> None:
-        """Wrap presence so SPEAK becomes NOTIFY once the mic has failed
-        its self-test.
-
-        self._checkins already holds fully-built CheckIn instances by the
-        time start() runs -- build_daemon() constructs them before the
-        daemon exists at all, and Daemon.__init__'s `checkins` parameter
-        must stay dict[str, CheckIn] since Tasks 17/18 are written against
-        that signature. Restructuring so the self-test result were known
-        before CheckIn construction would mean either running mic.start()
-        and audio_self_test() inside build_daemon() (a build-time function
-        starting the microphone as a side effect) or turning `checkins`
-        into a factory instead of a dict (a signature change). Swapping
-        each already-built CheckIn's presence reference in place, here, is
-        the smaller change: every CheckIn was built from -- and points at
-        -- the SAME presence object build_daemon() also handed to this
-        Daemon, so wrapping self._presence once and repointing each
-        CheckIn at that one wrapped instance keeps them all consistent.
-        """
-        self._presence = DegradedPresence(self._presence)
-        for checkin in self._checkins.values():
-            if hasattr(checkin, "_presence"):
-                checkin._presence = self._presence
-
     def start(self) -> None:
         self._running = True
         if self._mic is not None:
             self._mic.start()
             if not audio_self_test(self._mic):
                 self.degraded = True
-                self._degrade_presence()
+                # self._presence is a SwitchablePresence built once, up
+                # front, and handed to both this Daemon and every CheckIn
+                # (see build_daemon). degrade() flips it in place, so every
+                # holder of that one shared object sees the change -- no
+                # rebuilding CheckIns, no reaching into their attributes.
+                self._presence.degrade()
                 log.error(
                     "ZEUS is running in DEGRADED mode: no working microphone. "
                     "Check-ins will notify instead of speaking. "
@@ -314,7 +314,11 @@ def build_daemon(config: Config | None = None) -> Daemon:
 
     from zeus.context.presence import Presence
 
-    presence = Presence(config.context)
+    # Wrapped so a failed self-test can downgrade every CheckIn at once. The
+    # CheckIns below are built before start() runs the self-test, and each
+    # stores its presence at construction — this indirection is what lets
+    # start() reach them afterwards.
+    presence = SwitchablePresence(Presence(config.context))
     scheduler = Scheduler(store, clock, tz)
 
     checkins: dict[str, Any] = {"_adhoc_factory": adhoc_factory}

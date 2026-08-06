@@ -11,7 +11,13 @@ from zeus.brain.fake import FakeConversation
 from zeus.clock import FakeClock
 from zeus.config import AudioConfig, Config, ScheduleConfig
 from zeus.context.presence import Verdict
-from zeus.daemon import Daemon, DegradedPresence, audio_self_test, catch_up_actions
+from zeus.daemon import (
+    Daemon,
+    DegradedPresence,
+    SwitchablePresence,
+    audio_self_test,
+    catch_up_actions,
+)
 from zeus.memory.journal import Journal
 from zeus.memory.store import Store
 from zeus.ritual.checkin import CheckIn, FakeNotifier
@@ -408,25 +414,59 @@ def test_degraded_presence_passes_defer_through():
     assert DegradedPresence(_StubPresence(Verdict.DEFER)).verdict() is Verdict.DEFER
 
 
+def test_degrading_reaches_check_ins_built_before_the_self_test(tmp_path):
+    """The property the old _degrade_presence() attribute-reach-in was
+    standing in for, pinned directly rather than inferred from
+    Daemon.start() + shared-object wiring (that end-to-end proof is still
+    covered separately below).
+
+    A CheckIn is built with a SwitchablePresence BEFORE any self-test has
+    run -- exactly the order build_daemon() uses, since CheckIns are built
+    well before Daemon.start() ever calls audio_self_test(). degrade() is
+    then called on that same object, playing the role of "the daemon's
+    copy" -- it IS the daemon's copy, since build_daemon() hands the one
+    SwitchablePresence instance to both the Daemon and every CheckIn. The
+    CheckIn's own verdict must flip from SPEAK to NOTIFY as a result, with
+    no rebuilding and no reaching into CheckIn's attributes from outside.
+    """
+    clock = FakeClock(NOW)
+    store = Store(tmp_path / "zeus.db", clock)
+    journal = Journal(tmp_path / "journal", clock, LAGOS)
+    presence = SwitchablePresence(_StubPresence(Verdict.SPEAK))
+    checkin = CheckIn(
+        kind="morning", store=store, journal=journal,
+        presence=presence, voice=_StubVoice(), notifier=FakeNotifier(),
+        conversation_factory=lambda conv_id, local: FakeConversation({}),
+        config=ScheduleConfig(), tz=LAGOS, clock=clock,
+    )
+    assert checkin._presence.verdict() is Verdict.SPEAK
+
+    presence.degrade()
+
+    assert checkin._presence.verdict() is Verdict.NOTIFY
+
+
 def test_a_failed_self_test_makes_check_ins_notify_instead_of_speak(tmp_path):
     """Behavioural, not just the flag: test_degraded_flag_defaults_to_false
     already covers `degraded` itself and proves nothing about whether
     CheckIn actually respects it.
 
-    Wires a REAL CheckIn (not a stub) sharing the SAME presence object with
-    the Daemon, exactly as build_daemon() does -- both are handed the one
-    `presence` built from config.context -- so this proves the wiring
-    reaches the CheckIn, not merely that DegradedPresence's own logic is
-    correct in isolation (that's pinned separately above). presence
-    returns SPEAK; the mic double fails audio_self_test immediately (no
-    frames, ever). After start(), the check-in must notify rather than
-    speak.
+    Wires a REAL CheckIn (not a stub) sharing the SAME SwitchablePresence
+    object with the Daemon, exactly as build_daemon() does -- both are
+    handed the one `presence` built from config.context -- so this proves
+    the wiring reaches the CheckIn end-to-end through Daemon.start(), not
+    merely that DegradedPresence's own logic is correct in isolation
+    (pinned separately above) or that a bare degrade() call propagates
+    (pinned directly in test_degrading_reaches_check_ins_built_before_the_
+    self_test above). presence returns SPEAK; the mic double fails
+    audio_self_test immediately (no frames, ever). After start(), the
+    check-in must notify rather than speak.
     """
     clock = FakeClock(NOW)
     store = Store(tmp_path / "zeus.db", clock)
     journal = Journal(tmp_path / "journal", clock, LAGOS)
     scheduler = Scheduler(store, clock, LAGOS)
-    presence = _StubPresence(Verdict.SPEAK)
+    presence = SwitchablePresence(_StubPresence(Verdict.SPEAK))
     voice = _StubVoice()
     notifier = FakeNotifier()
     conversation = FakeConversation({})
