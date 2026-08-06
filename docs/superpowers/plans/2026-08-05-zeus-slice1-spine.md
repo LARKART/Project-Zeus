@@ -4828,6 +4828,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from datetime import datetime
 from typing import Any
 
@@ -4835,6 +4836,7 @@ from zeus.audio.endpointer import Endpointer, rms
 from zeus.audio.mic import FRAME_SAMPLES, MicStream
 from zeus.clock import Clock, SystemClock, resolve_timezone
 from zeus.config import Config, load_config
+from zeus.context.presence import Verdict
 from zeus.schedule.cron import hhmm_to_cron
 from zeus.schedule.scheduler import MissedRun, Scheduler
 
@@ -4844,6 +4846,51 @@ log = logging.getLogger(__name__)
 # day. A goal question at 15:00 is useful; the same question at 09:00 the
 # next morning is noise. See spec §9.2.
 CATCH_UP_ELIGIBLE = {"checkin_morning"}
+
+
+class DegradedPresence:
+    """Presence adapter used when the microphone self-test failed.
+
+    Speaking is pointless when the mic is dead: ZEUS would talk into a void,
+    call listen() on it, hear nothing, and record NO_ANSWER — precisely the
+    outcome audio_self_test exists to prevent (risk R1). So SPEAK becomes
+    NOTIFY.
+
+    DEFER passes through untouched. Being locked or idle still means defer,
+    regardless of microphone health — a dead mic must not turn "the user is
+    away" into "post a notification anyway".
+
+    An earlier draft set Daemon.degraded and logged "check-ins will notify
+    instead of speaking", but nothing read the flag on the check-in path:
+    CheckIn chooses SPEAK from presence.verdict() alone, which knows nothing
+    about microphone health. The mitigation was wired to nothing.
+    """
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+
+    def verdict(self) -> Verdict:
+        verdict = self._inner.verdict()
+        return Verdict.NOTIFY if verdict is Verdict.SPEAK else verdict
+
+
+class SwitchablePresence:
+    """One level of indirection so the daemon can downgrade after startup.
+
+    The self-test runs after the CheckIns are built, and CheckIn stores its
+    presence at construction. Handing every CheckIn this wrapper means a
+    single degrade() call reaches all of them — no rebuilding them, and no
+    reaching into their private attributes from the daemon.
+    """
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+
+    def verdict(self) -> Verdict:
+        return self._inner.verdict()
+
+    def degrade(self) -> None:
+        self._inner = DegradedPresence(self._inner)
 
 
 def audio_self_test(mic: MicStream, seconds: float = 1.0) -> bool:
@@ -4856,11 +4903,27 @@ def audio_self_test(mic: MicStream, seconds: float = 1.0) -> bool:
     wanted = max(1, int(seconds * 16000 / FRAME_SAMPLES))
     energy = 0.0
     seen = 0
+    # A wall-clock deadline as well as a frame count. `wanted` alone bounds
+    # how many frames we want, not how long we will wait for them:
+    # mic.frames() blocks on queue.get(timeout=0.1) and only returns once
+    # _stopping is set, which nothing does during the self-test. A mic that
+    # goes silent PARTWAY through — a dead-hardware variant of R1, distinct
+    # from the "opens fine, silent forever" TCC case — would otherwise hang
+    # here forever, so Daemon.start() never returns and the tick loop never
+    # begins. monotonic(), not datetime.now(): this must not move if the
+    # wall clock is adjusted.
+    deadline = time.monotonic() + max(seconds * 5.0, 5.0)
     for frame in mic.frames():
         energy = max(energy, rms(frame))
         seen += 1
         if seen >= wanted:
             break
+        if time.monotonic() >= deadline:
+            log.error(
+                "audio self-test: only %d of %d frames arrived before the "
+                "deadline — the microphone stopped delivering audio", seen, wanted,
+            )
+            return False
     if seen == 0:
         log.error("audio self-test: no frames received from the microphone")
         return False
@@ -4908,9 +4971,29 @@ class Daemon:
         for run, (job, action) in zip(missed, actions):
             if action == "fire" and job in self._checkins:
                 log.info("catch-up: firing %s missed at %s", job, run.scheduled_for)
-                self._checkins[job].run(run.scheduled_for)
+                try:
+                    self._checkins[job].run(run.scheduled_for)
+                except Exception:
+                    # Mirrors Scheduler.run_pending's per-handler isolation.
+                    # Unguarded, one failing catch-up conversation kills the
+                    # daemon before it ever reaches its tick loop.
+                    log.exception("catch-up run for %r failed", job)
             else:
                 log.info("catch-up: skipping %s missed at %s", job, run.scheduled_for)
+            # Consume the occurrence either way — FIRED OR SKIPPED.
+            # catch_up() reads the heartbeat while run_pending() reads
+            # last_run_at; they are separate state. Without this the very
+            # next tick() recomputes from a stale last_run_at and OVERRIDES
+            # the decision just made: a "skip" gets fired anyway (spec §9.2
+            # forbids asking about yesterday today), and a "fire" runs a
+            # second time, either re-running _converse on the open row or
+            # opening a second row and asking again.
+            #
+            # Only reproducible after a RESTART, when last_run_at already
+            # exists — with a fresh store run_pending merely seeds the
+            # baseline and fires nothing. That is why fixture fakes which
+            # never populate last_run_at cannot catch this.
+            self._store.set_job_run(job, run.scheduled_for)
         return actions
 
     def tick(self) -> None:
@@ -4950,6 +5033,14 @@ class Daemon:
             self._mic.start()
             if not audio_self_test(self._mic):
                 self.degraded = True
+                # Wire the flag to the behaviour it claims. Without this the
+                # log line below is a lie: CheckIn picks SPEAK from
+                # presence.verdict() alone and would still speak into a dead
+                # microphone and record NO_ANSWER. Every CheckIn was handed
+                # this same SwitchablePresence at construction, so one call
+                # reaches all of them — no rebuild, no reaching into their
+                # internals.
+                self._presence.degrade()
                 log.error(
                     "ZEUS is running in DEGRADED mode: no working microphone. "
                     "Check-ins will notify instead of speaking. "
@@ -5034,7 +5125,11 @@ def build_daemon(config: Config | None = None) -> Daemon:
 
     from zeus.context.presence import Presence
 
-    presence = Presence(config.context)
+    # Wrapped so a failed self-test can downgrade every CheckIn at once.
+    # The CheckIns below are built before start() runs the self-test, and
+    # each stores its presence at construction — this indirection is what
+    # lets Daemon.start() reach them afterwards.
+    presence = SwitchablePresence(Presence(config.context))
     scheduler = Scheduler(store, clock, tz)
 
     checkins: dict[str, Any] = {"_adhoc_factory": adhoc_factory}
@@ -5064,10 +5159,19 @@ def build_daemon(config: Config | None = None) -> Daemon:
 - [ ] **Step 4: Run the test and verify it passes**
 
 Run: `.venv/bin/pytest tests/test_daemon.py -v`
-Expected: PASS — 14 tests (13 above, plus a shutdown test added in review:
-WakeWordActivator.events() only checks _running AFTER mic.frames() yields,
-so stopping the activator alone never terminates it — the daemon must stop
-the MIC too.)
+Expected: PASS — 19 tests (13 above, plus 6 added in review):
+- shutdown must stop the MIC, not just the activator —
+  `WakeWordActivator.events()` checks `_running` only AFTER `mic.frames()`
+  yields, so stopping the activator alone never terminates it;
+- a **skipped** catch-up must not be re-fired by the next `tick()`, and a
+  **fired** one must not run twice. Both need a RESTART setup —
+  `store.set_job_run(...)` before the run — or they pass vacuously, since a
+  fresh store makes `run_pending` merely seed the baseline;
+- a failed self-test must make check-ins NOTIFY instead of speak (assert
+  the notifier fired and the speaker said nothing — asserting the flag
+  proves nothing), and `DegradedPresence` must pass DEFER through unchanged;
+- `audio_self_test` must return `False` within a bounded wait when the mic
+  goes silent mid-capture, rather than hanging `Daemon.start()` forever.
 
 - [ ] **Step 5: Commit**
 
