@@ -1,3 +1,4 @@
+import threading
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -149,3 +150,91 @@ def test_jobs_and_heartbeat(store):
     assert store.heartbeat() is None
     store.set_heartbeat()
     assert store.heartbeat() == START
+
+
+# ---- thread safety: round 4, C1 ----------------------------------------
+#
+# The daemon hands ONE Store to two threads: the main thread (the tick loop
+# and every scheduled check-in) and the wake-word activation thread
+# (Daemon._handle_activation -> start_conversation). sqlite3's default
+# check_same_thread=True binds the connection to whichever thread created
+# it, and Daemon._activation_loop wraps _handle_activation in a broad
+# `except Exception`, so the resulting ProgrammingError was swallowed and
+# logged as "ad-hoc conversation failed" -- the user spoke, ZEUS
+# transcribed, and nothing was ever recorded.
+
+
+def test_a_second_thread_can_write_to_the_store(tmp_path):
+    """C1: reproduced -- the wake-word thread's write raised
+    ProgrammingError("SQLite objects created in a thread can only be used in
+    that same thread") and `conversations` stayed empty."""
+    store = Store(tmp_path / "zeus.db", FakeClock(START))
+    # The main thread writes first, exactly as the tick loop does, so the
+    # connection is unambiguously bound to this thread before the wake
+    # thread touches it.
+    store.set_heartbeat()
+
+    failure: list[BaseException] = []
+
+    def wake_thread() -> None:
+        try:
+            store.start_conversation("wake")
+        except BaseException as exc:      # noqa: BLE001 - recorded, not swallowed
+            failure.append(exc)
+
+    thread = threading.Thread(target=wake_thread, daemon=True)
+    thread.start()
+    thread.join(timeout=5)
+    assert not thread.is_alive(), "the wake-word thread never finished"
+
+    assert failure == [], (
+        "a wake-word-thread write to the shared Store raised "
+        f"{failure[0]!r} -- every ad-hoc conversation dies silently"
+    )
+    count = store.connection.execute(
+        "SELECT count(*) AS n FROM conversations"
+    ).fetchone()["n"]
+    assert count == 1
+
+
+def test_concurrent_writers_do_not_lose_rows(tmp_path):
+    """The other half of the ruling: check_same_thread=False alone makes the
+    connection *usable* across threads, not *safe*. Every method that
+    touches the connection takes a lock so two threads cannot interleave.
+
+    Probabilistic, so it runs several rounds with a fresh database each
+    time -- one green round proves nothing about a race.
+    """
+    for round_number in range(5):
+        store = Store(tmp_path / f"round{round_number}.db", FakeClock(START))
+        writers = 8
+        per_writer = 10
+        barrier = threading.Barrier(writers, timeout=5)
+        failures: list[BaseException] = []
+
+        def write(worker: int) -> None:
+            try:
+                barrier.wait()
+                for i in range(per_writer):
+                    store.log_action(f"tool{worker}", {"i": i}, None, True, 1)
+            except BaseException as exc:  # noqa: BLE001
+                failures.append(exc)
+
+        threads = [
+            threading.Thread(target=write, args=(w,), daemon=True)
+            for w in range(writers)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+            assert not thread.is_alive()
+
+        assert failures == [], f"round {round_number}: {failures[0]!r}"
+        count = store.connection.execute(
+            "SELECT count(*) AS n FROM actions"
+        ).fetchone()["n"]
+        assert count == writers * per_writer, (
+            f"round {round_number}: {writers * per_writer - count} rows lost"
+        )
+        store.close()
