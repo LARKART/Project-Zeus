@@ -2556,6 +2556,7 @@ never leaves the device.
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -2574,6 +2575,7 @@ class LocalWhisper:
         self._compute = compute
         self._models_dir = models_dir
         self._model = None
+        self._load_lock = threading.Lock()
 
     def _load(self):
         from faster_whisper import WhisperModel
@@ -2592,7 +2594,16 @@ class LocalWhisper:
             return ""
         try:
             if self._model is None:
-                self._model = self._load()
+                # Under a lock: the daemon shares ONE transcriber between the
+                # main thread and the wake thread, and this check-then-act
+                # let both load a model at once. Measured: 4 concurrent
+                # first-calls produced 4 WhisperModel loads, each writing the
+                # same files into models_dir concurrently. Double-checked
+                # inside the lock so the common case stays lock-free after
+                # the first load.
+                with self._load_lock:
+                    if self._model is None:
+                        self._model = self._load()
             segments, _ = self._model.transcribe(
                 pcm_to_float32(pcm), language="en", beam_size=1
             )
@@ -2774,7 +2785,11 @@ log = logging.getLogger(__name__)
 FRAME_SAMPLES = 1280        # 80 ms at 16 kHz — openWakeWord's expected chunk
 BYTES_PER_SAMPLE = 2        # int16
 _QUEUE_MAX = 256            # 20.5 s of audio
-_POLL_SECONDS = 0.1         # how promptly frames() notices stop()
+_POLL_SECONDS = 0.1
+# How long a subscription waits on a silent device before giving up. Every
+# other capture bound in this codebase counts FRAMES, which cannot advance
+# when the callback has stopped — this is the only wall-clock backstop.
+_IDLE_TIMEOUT_SECONDS = 5.0         # how promptly frames() notices stop()
 
 # NOTE: an earlier draft signalled shutdown by pushing a module-level
 # _SENTINEL onto _queue. That deadlocked: _queue is bounded, so a blocking
@@ -2978,11 +2993,42 @@ class Subscription:
         guaranteed by _on_audio refusing to push once _stopping is set —
         the two halves only work together.
         """
+        idle = 0.0
         while True:
             try:
                 yield self._queue.get(timeout=_POLL_SECONDS)
+                idle = 0.0
             except queue.Empty:
                 if self._mic._stopping.is_set():
+                    return
+                # WALL-CLOCK IDLE BOUND. Without this the iterator waits
+                # forever for a device that has stopped delivering, and every
+                # bound above it is a FRAME COUNT that only advances when a
+                # frame actually arrives — so listen()'s 30s timeout can
+                # never fire. Measured: 10 frames delivered, callback then
+                # silenced, and listen() was still parked indefinitely; the
+                # daemon's tick loop runs on that thread, so the heartbeat
+                # stopped, no further check-in fired, and the wake word
+                # stayed muted at depth 1. The process stays alive, so
+                # launchd's KeepAlive never notices.
+                #
+                # CoreAudio stops calling back without closing the stream on
+                # ordinary events: sleep/wake, a default-input change when
+                # AirPods connect, a USB mic unplug, a coreaudiod restart.
+                #
+                # 5s is ~62 missed 80ms frames — far beyond any normal gap,
+                # since frames arrive during silence too (the endpointer
+                # needs them to detect the end of an utterance). Ending the
+                # iterator makes capture_utterance return what it has; the
+                # check-in records NO_ANSWER and retries, which is the
+                # already-designed path for "heard nothing".
+                idle += _POLL_SECONDS
+                if idle >= _IDLE_TIMEOUT_SECONDS:
+                    log.error(
+                        "no audio for %.0fs — the input device stopped "
+                        "delivering. Ending capture so the daemon keeps "
+                        "running; run 'zeus doctor'.", _IDLE_TIMEOUT_SECONDS,
+                    )
                     return
 
     def drain(self) -> None:
@@ -4759,7 +4805,19 @@ class VoiceIO:
                 self._config.listen_timeout.total_seconds() * frames_per_second
             )
             audio = capture_utterance(
-                self._mic.frames(), self._endpointer,
+                # A FRESH Endpointer PER CAPTURE. One shared instance was
+                # mutable state across two threads: the daemon builds one
+                # VoiceIO and hands it to both the wake thread
+                # (_handle_activation) and every CheckIn on the main thread,
+                # and capture_utterance calls reset()/feed() on it and reads
+                # saw_speech after the loop. Two overlapping captures
+                # double-counted the same silence — an utterance ended after
+                # 10 frames instead of 19, cutting the user off mid-sentence
+                # — and a reset() landing between the other capture's loop
+                # exit and its saw_speech check made a complete answer come
+                # back empty, recorded as NO_ANSWER. Endpointer is cheap and
+                # stateless at construction; sharing it bought nothing.
+                self._mic.frames(), Endpointer(self._config),
                 pre_roll=b"", listen_timeout_frames=timeout_frames,
             )
         finally:
