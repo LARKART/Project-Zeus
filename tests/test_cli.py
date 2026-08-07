@@ -187,6 +187,24 @@ def test_env_file_loader_handles_non_utf8_content_without_raising(tmp_path):
     assert _load_env_file(env) == 0
 
 
+def test_env_file_loader_handles_a_utf16_file_without_raising(tmp_path):
+    """Round3 finding: the third hole in this same guard, and the one
+    everyone kept walking past by looking at the PATH instead of the
+    CONTENT. NUL is valid UTF-8, so a file saved as UTF-16LE -- `iconv -t
+    UTF-16LE`, an editor's "Unicode" save option, a truncated or sparse
+    write -- decodes CLEANLY under read_text(encoding="utf-8"): every other
+    byte is a NUL. os.environ[key] = value then raises
+    ValueError("embedded null byte"), which is not an OSError and so is
+    not caught by the guard around read_text() -- and the assignment sits
+    outside that try in any case. Verified against the venv's 3.12.13
+    before this test existed."""
+    from zeus.cli import _load_env_file
+
+    env = tmp_path / "env"
+    env.write_bytes("ANTHROPIC_API_KEY=sk-ant-test\n".encode("utf-16-le"))
+    assert isinstance(_load_env_file(env), int)
+
+
 def test_env_file_loader_skips_keys_containing_whitespace(monkeypatch, tmp_path):
     """Round1 finding M1: `export ANTHROPIC_API_KEY=sk-...` used to set a
     variable literally named "export ANTHROPIC_API_KEY" and report
