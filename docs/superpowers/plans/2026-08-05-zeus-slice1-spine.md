@@ -4492,7 +4492,7 @@ from zeus.config import Config, ScheduleConfig
 from zeus.context.presence import Signals, Verdict
 from zeus.memory.journal import Journal
 from zeus.memory.store import Store
-from zeus.ritual.checkin import CheckIn, FakeNotifier, local_date, local_date
+from zeus.ritual.checkin import CheckIn, FakeNotifier, local_date
 from zeus.ritual.retry import Outcome
 from zeus.tts.fake import FakeSpeaker
 
@@ -5698,10 +5698,27 @@ def _load_env_file(path: Path) -> int:
         # report success while the real key stays unset — the worst shape,
         # since it looks like it worked. The docstring says `export` is
         # unsupported; this makes the code agree.
-        if not key or " " in key or "\t" in key:
+        value = value.strip().strip("'\"")
+        # A NUL anywhere is fatal to os.environ: CPython rejects it with
+        # ValueError, which is NOT an OSError and so slips past the guard
+        # above — and this assignment sits outside that try in any case.
+        #
+        # It is reachable, because NUL is valid UTF-8 and read_text() passes
+        # it straight through. A file saved as UTF-16LE — by `iconv -t
+        # UTF-16LE`, an editor's "Unicode" option, or a truncated write —
+        # decodes cleanly and then EVERY assignment raises, uncaught, out of
+        # cmd_run and cmd_doctor. That is I2's failure mode again: a respawn
+        # loop under KeepAlive:true, and a health oracle that dies on the
+        # condition it exists to diagnose.
+        #
+        # Skip the bad line and keep the good ones, exactly as the
+        # whitespace-key skip does — one corrupt line must not cost you a
+        # valid ANTHROPIC_API_KEY on the next.
+        if (not key or " " in key or "\t" in key
+                or "\x00" in key or "\x00" in value):
             continue
         if key not in os.environ:
-            os.environ[key] = value.strip().strip("'\"")
+            os.environ[key] = value
             loaded += 1
     return loaded
 
