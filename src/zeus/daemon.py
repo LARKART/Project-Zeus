@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from zeus.audio.endpointer import rms
@@ -27,6 +27,21 @@ log = logging.getLogger(__name__)
 # day. A goal question at 15:00 is useful; the same question at 09:00 the
 # next morning is noise. See spec §9.2.
 CATCH_UP_ELIGIBLE = {"checkin_morning"}
+
+# HOW LATE A §9.3 RETRY MAY STILL FIRE. The ladder's own span is the
+# yardstick -- §9.3 tops out at max_defer_retries x defer_retry_after (60
+# minutes with the shipped defaults) -- plus slack, because each rung is
+# scheduled from `now` rather than from the occurrence, so tick granularity
+# and a restart both push the last rung a little further out. Beyond that
+# the occurrence's moment has genuinely passed (§9.2) and replaying it is
+# not a late check-in, it is next-day data loss.
+_RETRY_SLACK = timedelta(minutes=30)
+# A hard ceiling regardless of configuration. max_defer_retries is a config
+# value, so a large one would otherwise licence a ladder that spans into the
+# next local day -- and a morning retry that crosses midnight re-runs with
+# yesterday's scheduled_for, which is precisely the write that destroys a
+# completed goal row. §9.2 outranks a long ladder.
+_RETRY_MAX_AGE = timedelta(hours=6)
 
 
 def audio_self_test(mic: MicStream, seconds: float = 1.0) -> bool:
@@ -292,8 +307,30 @@ class Daemon:
         The retry lives in the database rather than an in-process timer, so a
         daemon restarted between 11:00 and 11:20 still honours it — and with
         KeepAlive, restarts are routine.
+
+        THAT DURABILITY IS ALSO WHY STALENESS HAS TO BE CHECKED HERE.
+        due_retries() filters only on `retry_at <= now`, and a Mac that
+        sleeps with the lid closed keeps both the row and the process. So a
+        morning check-in that deferred at 11:00 fired its 11:20 rung at 09:00
+        the next day, re-running with the ORIGINAL scheduled_for — right for
+        a twenty-minute retry, catastrophic for a twenty-two-hour one, since
+        `date` is then yesterday and save_goal's upsert rewrites yesterday's
+        goal row (status and notes reset) while today records nothing.
+        Reproduced in test_daemon.py.
+
+        The bound is on the retry's AGE, not on its local calendar date. The
+        catch-up path's same_local_day rule cannot be reused verbatim here:
+        an evening check-in at 23:50 defers to 00:10, which is a live rung
+        twenty minutes old that merely happens to fall on the next date, and
+        the day rule would settle it as skipped and never review the day.
+        Age also keeps the decision out of the UTC/local seam entirely,
+        which is where six defects in this codebase have come from.
         """
+        deadline = self._retry_deadline()
         for due in self._store.due_retries(now):
+            if now - due.scheduled_for > deadline:
+                self._settle_stale_retry(due, now)
+                continue
             checkin = self._checkins.get(f"checkin_{due.kind}")
             if checkin is None:
                 continue
@@ -304,6 +341,55 @@ class Daemon:
             except Exception:
                 # One failing retry must not stop the others or the tick.
                 log.error("retry for %s failed", due.kind, exc_info=True)
+
+    def _retry_deadline(self) -> timedelta:
+        """How long after its occurrence a retry may still fire (§9.2, §9.3).
+
+        Derived from the configured ladder rather than hardcoded, so a user
+        who lengthens defer_retry_after does not silently lose their last
+        rungs — and capped, so one who lengthens it absurdly cannot licence a
+        replay on the following day.
+        """
+        schedule = self._config.schedule
+        ladder = max(
+            schedule.defer_retry_after * schedule.max_defer_retries,
+            schedule.no_answer_retry_after * schedule.max_no_answer_retries,
+        )
+        return min(ladder + _RETRY_SLACK, _RETRY_MAX_AGE)
+
+    def _settle_stale_retry(self, due, now: datetime) -> None:
+        """Record a retry that outlived its ladder as skipped, and clear it.
+
+        Settling is not optional housekeeping: retry_at is what due_retries()
+        selects on, so a stale row that is merely skipped over comes back on
+        the very next tick — once a minute, forever. update_checkin targets
+        DueRetry.id, so it lands on exactly the row that was due rather than
+        on whatever find_open_checkin would resolve for that (kind, date).
+
+        attempts is carried across unchanged, for the reason _record_skipped
+        gives: a retry that never fired is not an attempt, and attempts is
+        the one column the §9.3 ladder reads.
+        """
+        log.warning(
+            "retry: dropping the %s retry for the occurrence at %s — it came "
+            "due %s after that occurrence, so its moment has passed (spec "
+            "§9.2). Recording it as skipped.",
+            due.kind, due.scheduled_for, now - due.scheduled_for,
+        )
+        try:
+            attempts = self._store.get_checkin(due.id).attempts
+            self._store.update_checkin(
+                due.id, outcome="skipped", attempts=attempts, retry_at=None
+            )
+            self._journal.append(
+                f"{due.kind.title()} check-in: skipped (its retry came due "
+                f"long after the check-in's moment had passed)"
+            )
+        except Exception:
+            # Same isolation as every other per-item failure on this path.
+            # Loud, and the row keeps its retry_at, so the next tick tries
+            # to settle it again rather than pretending it is gone.
+            log.exception("could not settle the stale %s retry", due.kind)
 
     def tick(self) -> None:
         now = self._clock.now_utc()

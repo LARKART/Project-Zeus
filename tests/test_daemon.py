@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 from zeus.audio.activator import FakeActivator
 from zeus.audio.mic import FRAME_SAMPLES, MicStream
 from zeus.brain.fake import FakeConversation
+from zeus.brain.tools import build_tool_callables
 from zeus.clock import FakeClock, from_utc_iso
 from zeus.config import AudioConfig, Config, ScheduleConfig
 from zeus.context.presence import Verdict
@@ -935,6 +936,13 @@ def _away(tmp_path, tz, kind, cron, start):
     situation §9.3's ladder was designed for. `start` is an hour before the
     scheduled occurrence, so the scheduler's first run_pending() seeds its
     baseline without firing -- as it does on a real fresh start.
+
+    tz REACHES THE Daemon, not just the Store/Journal/Scheduler/CheckIn.
+    Omitted, Daemon.__init__ falls back to resolve_timezone("system"), which
+    follows /etc/localtime -- so the rig claimed to be running in Los
+    Angeles while the daemon inside it ran in whatever zone the developer's
+    Mac is set to, and any daemon-level rule that reads self._tz was being
+    exercised against the wrong zone (and differently on every machine).
     """
     clock = FakeClock(start)
     store = Store(tmp_path / "zeus.db", clock)
@@ -959,7 +967,7 @@ def _away(tmp_path, tz, kind, cron, start):
     instance = Daemon(
         config=Config(root=tmp_path), store=store, journal=journal,
         scheduler=scheduler, presence=None, voice=None, notifier=None,
-        checkins={name: checkin}, clock=clock,
+        checkins={name: checkin}, clock=clock, tz=tz,
     )
     return SimpleNamespace(
         daemon=instance, store=store, clock=clock, fired=fired,
@@ -1208,3 +1216,186 @@ def test_build_daemon_wraps_presence_so_a_failed_self_test_can_degrade_it(
     assert instance._voice._mic is instance._mic
     assert instance._activator._mic is instance._mic
     instance._store.close()
+
+
+# ---- X1: a stale retry must never replay a check-in whose moment has passed
+#
+# THE REGRESSION TESTS FOR THE SECOND-ORDER DEFECT TASK 19 INTRODUCED.
+#
+# due_retries() filters only on `retry_at IS NOT NULL AND retry_at <= now`.
+# Nothing bounded how LATE a retry could be, so a Mac that slept through the
+# 11:20 rung fired it the next morning -- re-running with the ORIGINAL
+# scheduled_for, which is correct for a 20-minute retry and catastrophic for
+# a 22-hour one: `date` is yesterday, so today's answer is written onto
+# yesterday's goal row, destroying a completed review, and today records
+# nothing. Spec §9.2: "never replay a check-in whose moment has genuinely
+# passed"; §9.3's ladder tops out 60 minutes after the occurrence.
+#
+# The bound is on the retry's AGE, not on its local calendar date. A local-day
+# rule would drop the perfectly legitimate rungs of a late-evening ladder --
+# a 23:50 check-in deferring to 00:10 is twenty minutes late, not a day --
+# which test_a_retry_across_midnight_still_belongs_to_the_original_day pins,
+# and it would make the decision depend on the daemon's timezone, the seam
+# that has produced six defects in this codebase already.
+
+
+def _goal_saving_checkin(store, journal, clock, tz, voice, kind="morning"):
+    """A REAL CheckIn whose fake brain drives the REAL save_goal tool.
+
+    The point of the test below is data loss, so the write has to be the
+    production one: build_tool_callables closes over the local date the
+    CheckIn was constructed with, which is exactly what a stale retry gets
+    wrong.
+    """
+
+    def factory(conversation_id, date):
+        return FakeConversation(
+            tools=build_tool_callables(store, journal, conversation_id, date),
+            tool_calls=[[("save_goal", {"text": "call the dentist"})]],
+        )
+
+    return CheckIn(
+        kind=kind, store=store, journal=journal,
+        presence=_StubPresence(Verdict.SPEAK), voice=voice,
+        notifier=FakeNotifier(), conversation_factory=factory,
+        config=ScheduleConfig(), tz=tz, clock=clock,
+    )
+
+
+def test_a_stale_retry_never_writes_todays_answer_onto_yesterdays_row(tmp_path):
+    """The data-loss trigger, reproduced end to end.
+
+    Morning check-in DEFERs at 11:00 on 2026-08-05 and schedules its 11:20
+    rung. The lid closes; the machine is asleep until 09:00 the next day.
+    Before the fix, that retry fired with scheduled_for=2026-08-05 11:00, so
+    save_goal's upsert rewrote the 2026-08-05 goal row -- resetting the
+    status and NULLing the notes of a review that had already been completed
+    -- while 2026-08-06 recorded nothing at all.
+    """
+    tz = LOS_ANGELES
+    clock = FakeClock(datetime(2026, 8, 5, 11, 0, tzinfo=tz))
+    store = Store(tmp_path / "zeus.db", clock)
+    journal = Journal(tmp_path / "journal", clock, tz)
+    scheduler = Scheduler(store, clock, tz)
+    voice = _StubVoice()
+
+    goal_id = store.set_goal("2026-08-05", "water the plants")
+    store.update_goal(goal_id, "done", "watered them before lunch")
+    checkin_id = store.open_checkin("morning", clock.now_utc(), "2026-08-05")
+    store.update_checkin(
+        checkin_id, outcome="deferred", attempts=1,
+        retry_at=clock.now_utc() + timedelta(minutes=20),
+    )
+
+    clock.advance(timedelta(hours=22))           # 09:00 the NEXT local day
+    instance = Daemon(
+        config=Config(root=tmp_path), store=store, journal=journal,
+        scheduler=scheduler, presence=None, voice=None, notifier=None,
+        checkins={
+            "checkin_morning": _goal_saving_checkin(
+                store, journal, clock, tz, voice
+            )
+        },
+        clock=clock, tz=tz,
+    )
+
+    instance.tick()
+
+    survivor = store.get_goal("2026-08-05")
+    assert survivor.text == "water the plants", (
+        "a stale retry overwrote yesterday's goal with today's answer"
+    )
+    assert survivor.status == "done", "the completed review was reset to pending"
+    assert survivor.notes == "watered them before lunch", "the notes were erased"
+    assert store.get_goal("2026-08-06") is None, (
+        "today's answer was filed under yesterday's date, so today has no goal"
+    )
+    assert voice.spoken == [], "the stale check-in was replayed out loud"
+
+
+def test_a_stale_retry_is_settled_so_it_cannot_come_back(tmp_path):
+    """§9.2's "record outcome=skipped", applied to the retry path.
+
+    Dropping the retry is only half of it: leaving retry_at set would make
+    the same stale row come due again on the very next tick, once a minute,
+    for the rest of the process's life.
+    """
+    tz = LOS_ANGELES
+    clock = FakeClock(datetime(2026, 8, 5, 21, 0, tzinfo=tz))
+    store = Store(tmp_path / "zeus.db", clock)
+    journal = Journal(tmp_path / "journal", clock, tz)
+    scheduler = Scheduler(store, clock, tz)
+
+    checkin_id = store.open_checkin("evening", clock.now_utc(), "2026-08-05")
+    store.update_checkin(
+        checkin_id, outcome="deferred", attempts=2,
+        retry_at=clock.now_utc() + timedelta(minutes=20),
+    )
+
+    ran: list[datetime] = []
+
+    class _RecordingCheckIn:
+        def run(self, scheduled_for):
+            ran.append(scheduled_for)
+
+    clock.advance(timedelta(hours=11, minutes=5))   # 08:05 the next morning
+    instance = Daemon(
+        config=Config(root=tmp_path), store=store, journal=journal,
+        scheduler=scheduler, presence=None, voice=None, notifier=None,
+        checkins={"checkin_evening": _RecordingCheckIn()}, clock=clock, tz=tz,
+    )
+
+    instance.tick()
+
+    assert ran == [], (
+        "the evening check-in was replayed the next morning — spec §9.2: "
+        "'do not ask about yesterday today'"
+    )
+    row = store.get_checkin(checkin_id)
+    assert row.outcome == "skipped"
+    assert row.retry_at is None
+    assert store.due_retries(clock.now_utc()) == [], (
+        "the stale retry is still due and will fire again on the next tick"
+    )
+    # attempts is untouched: a retry that never fired is not an attempt.
+    assert row.attempts == 2
+    instance.tick()                                  # and stays settled
+    assert ran == []
+
+
+def test_a_retry_that_is_merely_late_still_fires(tmp_path):
+    """Guards the guard: the staleness bound must not eat live rungs.
+
+    A daemon restarted twenty-five minutes after the occurrence must still
+    honour the 11:20 rung (test_a_retry_survives_a_daemon_restart pins that
+    end to end); this pins the bound itself, at the granularity a mutation
+    to the constant would show up in.
+    """
+    tz = LOS_ANGELES
+    clock = FakeClock(datetime(2026, 8, 5, 11, 0, tzinfo=tz))
+    store = Store(tmp_path / "zeus.db", clock)
+    journal = Journal(tmp_path / "journal", clock, tz)
+    scheduler = Scheduler(store, clock, tz)
+
+    checkin_id = store.open_checkin("morning", clock.now_utc(), "2026-08-05")
+    store.update_checkin(
+        checkin_id, outcome="deferred", attempts=1,
+        retry_at=clock.now_utc() + timedelta(minutes=20),
+    )
+
+    ran: list[datetime] = []
+
+    class _RecordingCheckIn:
+        def run(self, scheduled_for):
+            ran.append(scheduled_for)
+
+    clock.advance(timedelta(minutes=25))
+    instance = Daemon(
+        config=Config(root=tmp_path), store=store, journal=journal,
+        scheduler=scheduler, presence=None, voice=None, notifier=None,
+        checkins={"checkin_morning": _RecordingCheckIn()}, clock=clock, tz=tz,
+    )
+
+    instance.tick()
+
+    assert ran == [datetime(2026, 8, 5, 11, 0, tzinfo=tz)]
