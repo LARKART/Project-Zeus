@@ -2068,8 +2068,24 @@ def test_no_answer_exhaustion_skips_an_evening_checkin():
 
 
 def test_notify_is_treated_as_deferred_until_acknowledged():
+    # DEFERRED but NOT retried. This originally expected a 20-minute retry,
+    # which was harmless only while Task 19 was still discarding
+    # Decision.retry_after -- see next_step() below.
     result = next_step("morning", Verdict.NOTIFY, answered=None, attempts=0, config=CONFIG)
-    assert result == Decision(Outcome.DEFERRED, timedelta(minutes=20), False)
+    assert result == Decision(Outcome.DEFERRED, None, False)
+
+
+def test_notify_does_not_schedule_a_retry():
+    result = next_step("morning", Verdict.NOTIFY, answered=None, attempts=0, config=CONFIG)
+    assert result.retry_after is None
+
+
+@pytest.mark.parametrize("attempts", [0, 1, 2, 3, 9])
+def test_notify_never_schedules_a_retry_at_any_attempt_count(attempts):
+    result = next_step(
+        "evening", Verdict.NOTIFY, answered=None, attempts=attempts, config=CONFIG
+    )
+    assert result.retry_after is None
 
 
 def test_notify_that_gets_answered_ends_the_sequence():
@@ -2107,6 +2123,9 @@ Two distinct retry paths with different causes, cadences, and limits:
 
   DEFER      user is away or the screen is locked   20 min × 3
   NO_ANSWER  ZEUS spoke into silence                30 min × 1
+
+TWO, not three. NOTIFY is deliberately absent from that list, and from
+§9.3's table — see next_step().
 
 On exhaustion a morning check-in folds forward into the evening one; an
 evening check-in is recorded as skipped, because there is nothing to fold
@@ -2161,7 +2180,30 @@ def next_step(
     if answered:
         return Decision(Outcome.ANSWERED, None, False)
 
-    if verdict in (Verdict.DEFER, Verdict.NOTIFY) and answered is None:
+    # NOTIFY IS NOT A RETRY PATH. §9.3's table names exactly two causes,
+    # DEFER and NO_ANSWER, and NOTIFY is not among them. NOTIFY used to
+    # fall through to the DEFER branch below, which was invisible while
+    # run() was still discarding Decision.retry_after — one notification
+    # per check-in. Once Task 19 wired the ladder the same fall-through
+    # became FOUR notifications twenty minutes apart, and nothing anywhere
+    # can mark a macOS notification "answered", so it always ran to
+    # exhaustion. In degraded mode DegradedPresence turns every SPEAK into
+    # NOTIFY, so that is not an edge case there but the guaranteed path:
+    # eight notifications a day until the microphone is fixed.
+    #
+    # Retrying would also be redundant rather than merely noisy: §8 says
+    # the notification "speaks on click or wake word", so the user already
+    # holds the way back in.
+    #
+    # `deferred`, not `skipped`: unanswered, not abandoned. Keeping the row
+    # non-terminal is what lets an unanswered morning fold into the evening
+    # opener — the same place an exhausted DEFER ladder ends up. Checked
+    # before the DEFER branch and without consulting `answered`, because
+    # ZEUS never spoke, so "spoke and heard nothing" cannot apply either.
+    if verdict is Verdict.NOTIFY:
+        return Decision(Outcome.DEFERRED, None, False)
+
+    if verdict is Verdict.DEFER and answered is None:
         if attempts + 1 > config.max_defer_retries:
             return _exhausted(kind, Outcome.DEFERRED)
         return Decision(Outcome.DEFERRED, config.defer_retry_after, False)
@@ -2175,11 +2217,12 @@ def next_step(
 - [ ] **Step 4: Run the test and verify it passes**
 
 Run: `.venv/bin/pytest tests/ritual/test_retry.py -v`
-Expected: PASS — 14 tests (11 plain tests + `test_defer_retries_up_to_three_times`
-parametrized over 3 attempt counts. An earlier draft said 15; that was a
-miscount of the parametrize expansion, not a dropped case — the file covers
-both retry paths, both exhaustion branches for morning and evening, both
-NOTIFY branches, the DB-constraint match, and a custom-config case.)
+Expected: PASS — `test_defer_retries_up_to_three_times` is parametrized over
+3 attempt counts and `test_notify_never_schedules_a_retry_at_any_attempt_count`
+over 5, so the count is larger than the number of `def`s; count the expansion,
+not the functions. The file covers both retry paths, both exhaustion branches
+for morning and evening, every NOTIFY branch, the DB-constraint match, and a
+custom-config case.
 
 - [ ] **Step 5: Commit**
 
@@ -5093,11 +5136,12 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from zeus.audio.endpointer import Endpointer, rms
 from zeus.audio.mic import FRAME_SAMPLES, MicStream
+from zeus.brain.prompts import NOT_CAUGHT_LINE
 from zeus.clock import Clock, SystemClock, resolve_timezone
 from zeus.config import Config, load_config
 from zeus.context.presence import Verdict
@@ -5110,6 +5154,26 @@ log = logging.getLogger(__name__)
 # day. A goal question at 15:00 is useful; the same question at 09:00 the
 # next morning is noise. See spec §9.2.
 CATCH_UP_ELIGIBLE = {"checkin_morning"}
+
+# HOW LATE A §9.3 RETRY MAY STILL FIRE (see _run_due_retries in Task 19).
+# The ladder's own span is the yardstick, plus slack, because each rung is
+# scheduled from `now` rather than from the occurrence.
+_RETRY_SLACK = timedelta(minutes=30)
+# A hard ceiling regardless of configuration: max_defer_retries is a config
+# value, and a large one would otherwise licence a ladder spanning into the
+# next local day. §9.2 outranks a long ladder.
+_RETRY_MAX_AGE = timedelta(hours=6)
+
+# How long the activation loop waits before re-entering events() after the
+# microphone stopped delivering. Subscription.frames()' idle bound already
+# rate-limits each cycle; this only stops a source that fails INSTANTLY
+# from spinning.
+_ACTIVATION_RESTART_SECONDS = 5.0
+
+# The longest the run loop may go without noticing request_stop(). launchd's
+# default grace period between SIGTERM and SIGKILL is 20 seconds, and the
+# tick loop can otherwise be a full minute from its next wake.
+_SHUTDOWN_POLL_SECONDS = 1.0
 
 
 class DegradedPresence:
@@ -5241,6 +5305,12 @@ class Daemon:
         self._activator = activator
         self._mic = mic
         self._running = False
+        # Set when shutdown is requested. An Event, not just the _running
+        # bool, because the activation thread has to WAIT on it: a plain
+        # flag would have to be polled, and the restart backoff would then
+        # be waited out in full before a stop() was noticed.
+        self._shutdown = threading.Event()
+        self._activation_thread: threading.Thread | None = None
         self.degraded = False
 
     def run_catch_up(self) -> list[tuple[str, str]]:
@@ -5280,16 +5350,58 @@ class Daemon:
         self._store.set_heartbeat()
 
     def _activation_loop(self) -> None:
+        """Consume activation events, RE-ENTERING events() if it ever ends.
+
+        THE OUTER `while` IS LOAD-BEARING, and it was added late. This
+        method was written when Subscription.frames() returned only on
+        stop(), so `for event in self._activator.events():` really was an
+        endless source. The A1 idle bound changed what "frames() returned"
+        means, and the chain from it is unconditional: frames() returns ->
+        _detect returns -> events() closes its subscription and ends -> a
+        single `for` falls out -> this thread returns. Nothing restarted
+        it; start() launches it exactly once. So sleep/wake, AirPods
+        taking over the default input, a USB mic unplugged or a coreaudiod
+        restart -- any of them over five seconds -- permanently ended "hey
+        jarvis" for the life of the process, with _running still True,
+        nothing logged, and `doctor` unable to see it. Spec §10 inverted.
+
+        WARNING, not INFO: a microphone that stopped delivering is a real
+        fault even though ZEUS recovers, and this is the only evidence of
+        it that ever reaches zeusd.log.
+
+        The backoff is a floor on the cycle time, not the main rate limit
+        -- the idle bound already caps each cycle. It waits on _shutdown
+        rather than sleeping so stop() cuts it short instead of being made
+        to sit through it; launchd escalates SIGTERM to SIGKILL.
+        """
         if self._activator is None:
             return
-        for event in self._activator.events():
-            if not self._running:
-                return
-            log.info("activated via %s", event.source)
+        restarts = 0
+        while self._running and not self._shutdown.is_set():
             try:
-                self._handle_activation()
+                for event in self._activator.events():
+                    if not self._running:
+                        return
+                    log.info("activated via %s", event.source)
+                    try:
+                        self._handle_activation()
+                    except Exception:
+                        log.error("ad-hoc conversation failed", exc_info=True)
             except Exception:
-                log.error("ad-hoc conversation failed", exc_info=True)
+                # A raising activator must not end activation either — that
+                # is the same silent death by a different door.
+                log.error("the activation source failed", exc_info=True)
+            if not self._running or self._shutdown.is_set():
+                return
+            restarts += 1
+            log.warning(
+                "the microphone stopped delivering audio, so wake-word "
+                "activation ended; restarting it in %.0fs (restart #%d). "
+                "If this repeats, the input device is failing — run "
+                "'zeus doctor'.", _ACTIVATION_RESTART_SECONDS, restarts,
+            )
+            if self._shutdown.wait(_ACTIVATION_RESTART_SECONDS):
+                return
 
     def _handle_activation(self) -> None:
         """Ad-hoc conversation triggered by the wake word."""
@@ -5297,6 +5409,12 @@ class Daemon:
             return
         heard = self._voice.listen()
         if not heard:
+            # The wake word fired, so the user IS talking to ZEUS — going
+            # silent here is the worst possible answer. Spec §10: say it
+            # once, then end the turn cleanly. No conversation is started,
+            # so this costs no API call and works even when the brain is
+            # the thing that is down. (A bare `return` here was C-I4.)
+            self._voice.speak([NOT_CAUGHT_LINE])
             return
         conversation_id = self._store.start_conversation("wake")
         try:
@@ -5306,6 +5424,11 @@ class Daemon:
             self._store.end_conversation(conversation_id)
 
     def start(self) -> None:
+        # Cleared FIRST, before _running is raised, so a restarted daemon
+        # does not inherit the previous run's shutdown signal — and so a
+        # request_stop() arriving during the slow part of start() below
+        # cannot be erased by a later clear.
+        self._shutdown.clear()
         self._running = True
         if self._mic is not None:
             self._mic.start()
@@ -5331,11 +5454,36 @@ class Daemon:
                     )
         if self._activator is not None and not self.degraded:
             self._activator.start()
-            threading.Thread(target=self._activation_loop, daemon=True).start()
+            # Kept as an attribute so shutdown is OBSERVABLE: without a
+            # handle, "the activation thread ended" can only be inferred
+            # from threading.active_count(), which counts every other
+            # thread in the process too — an oracle weak enough that an
+            # uninterruptible backoff survived a mutation run against it.
+            self._activation_thread = threading.Thread(
+                target=self._activation_loop, daemon=True
+            )
+            self._activation_thread.start()
         self.run_catch_up()
 
-    def stop(self) -> None:
+    def request_stop(self) -> None:
+        """Ask the daemon to shut down. SAFE TO CALL FROM A SIGNAL HANDLER.
+
+        It flips a bool and sets an Event, and the restraint is the point:
+        stop() is NOT safe from a handler. stop() -> MicStream.stop() takes
+        _lifecycle_lock, a plain non-reentrant Lock that MicStream.start()
+        holds across the sounddevice import and the PortAudio open —
+        seconds, on a Bluetooth input. Signal handlers run on the main
+        thread, which is the thread inside start(), so a SIGTERM in that
+        window self-deadlocked until launchd escalated to SIGKILL.
+
+        run_forever's loop observes this within _SHUTDOWN_POLL_SECONDS and
+        its `finally` does the real teardown, on a thread holding no lock.
+        """
         self._running = False
+        self._shutdown.set()
+
+    def stop(self) -> None:
+        self.request_stop()
         if self._activator is not None:
             self._activator.stop()
         if self._mic is not None:
@@ -5346,11 +5494,30 @@ class Daemon:
         try:
             while self._running:
                 self.tick()
-                self._clock.sleep(
-                    self._scheduler.seconds_until_next(self._clock.now_utc())
-                )
+                self._sleep_until_next()
         finally:
             self.stop()
+
+    def _sleep_until_next(self) -> None:
+        """Sleep to the next occurrence, in slices, so a stop is noticed.
+
+        SLICED, not one long sleep. seconds_until_next() returns up to
+        _MAX_SLEEP (60s), and PEP 475 makes an interrupted time.sleep()
+        resume for its full remaining time — so a SIGTERM arriving just
+        after a tick would go unacted-on for another minute, and launchd
+        sends SIGKILL after twenty seconds. Slicing costs one wakeup a
+        second on a process already running wake-word inference twelve
+        times a second.
+
+        Still self._clock.sleep, not _shutdown.wait: the Clock is the seam
+        the whole scheduler is tested through, and a FakeClock advances
+        virtual time here exactly as a SystemClock burns real time.
+        """
+        remaining = self._scheduler.seconds_until_next(self._clock.now_utc())
+        while remaining > 0 and not self._shutdown.is_set():
+            interval = min(remaining, _SHUTDOWN_POLL_SECONDS)
+            self._clock.sleep(interval)
+            remaining -= interval
 
 
 def build_daemon(config: Config | None = None) -> Daemon:
@@ -6021,8 +6188,68 @@ def cmd_run(config: Config) -> int:
             "ANTHROPIC_API_KEY is not set and %s did not supply it. "
             "Every conversation will fail. Run 'zeus doctor'.", env_file,
         )
-    build_daemon(config).run_forever()
+    daemon = build_daemon(config)
+    _install_sigterm_handler(daemon)
+    daemon.run_forever()
     return 0
+
+
+def _install_sigterm_handler(daemon) -> None:
+    """Make Daemon shutdown reachable under launchd.
+
+    Without this the whole shutdown path is dead code as deployed: nothing
+    installed a handler, so SIGTERM took its default disposition and the
+    process died on the spot. Daemon.stop(), MicStream.stop() and the
+    PortAudio close never ran — and SIGTERM is how launchd stops a
+    LaunchAgent (`launchctl unload`, logout, shutdown), so that was every
+    ordinary stop. KeyboardInterrupt was the only path that reached the
+    carefully ordered shutdown, i.e. only when run in a terminal by hand.
+
+    THE HANDLER ASKS; IT DOES NOT DO. An earlier version called
+    daemon.stop() here, under a comment claiming stop() "takes no lock the
+    main thread could already be holding". That was false, and provably so:
+    Daemon.stop() -> MicStream.stop() takes _lifecycle_lock, a plain
+    non-reentrant Lock that MicStream.start() holds across the sounddevice
+    import and the PortAudio open — which this very file notes can take
+    seconds on Bluetooth. Signal handlers run on the main thread, and the
+    main thread is the one inside start(), so a SIGTERM in that window
+    self-deadlocked. Demonstrated in a subprocess: SIGTERM 0.3s into a 2.0s
+    hold hung until the process was killed.
+
+    daemon.request_stop() flips a bool and sets an Event, and takes no lock
+    at all. run_forever's loop sleeps in _SHUTDOWN_POLL_SECONDS slices
+    precisely so this is observed promptly — PEP 475 resumes an interrupted
+    sleep for its full remaining time, so without slicing the loop could be
+    a minute from noticing and launchd sends SIGKILL after twenty seconds.
+    The real teardown then happens in run_forever's `finally`, on a thread
+    that holds no lock.
+
+    What that costs: if the main thread is mid-check-in when SIGTERM
+    arrives, shutdown waits for that conversation rather than yanking the
+    device out from under it. That is a bound on real work in flight, not a
+    deadlock, and it is the direction to err in.
+
+    Failures are swallowed: raising from a signal handler would propagate
+    into whatever the main thread happened to be doing, which is a worse
+    exit than an untidy one.
+    """
+    import signal
+
+    def handle(signum, frame):
+        log.info("SIGTERM received; shutting down")
+        try:
+            daemon.request_stop()
+        except Exception:
+            log.error("error during shutdown", exc_info=True)
+
+    try:
+        signal.signal(signal.SIGTERM, handle)
+    except ValueError:
+        # signal.signal() only works on the main thread. cmd_run always is
+        # one, but a caller embedding it need not be, and refusing to run
+        # the daemon over a missing shutdown nicety would be the wrong
+        # trade.
+        log.warning("could not install a SIGTERM handler off the main thread")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -6687,8 +6914,29 @@ cron job's work:
         Re-runs with the ORIGINAL scheduled_for, so local_date and the
         check-in row stay the ones the ritual started with — a retry at 11:20
         belongs to the 11:00 occurrence, not to a new one.
+
+        THAT DURABILITY IS ALSO WHY STALENESS HAS TO BE CHECKED HERE.
+        due_retries() filters only on `retry_at <= now`, and a Mac that
+        sleeps with the lid closed keeps both the row and the process. So a
+        morning check-in that deferred at 11:00 fired its 11:20 rung at
+        09:00 the next day, re-running with the ORIGINAL scheduled_for —
+        right for a twenty-minute retry, catastrophic for a twenty-two-hour
+        one, since `date` is then yesterday and save_goal's upsert rewrites
+        yesterday's goal row (status and notes reset) while today records
+        nothing.
+
+        The bound is on the retry's AGE, not on its local calendar date.
+        The catch-up path's same_local_day rule cannot be reused verbatim:
+        an evening check-in at 23:50 defers to 00:10, a live rung twenty
+        minutes old that merely falls on the next date, and the day rule
+        would settle it as skipped and never review the day. Age also keeps
+        the decision out of the UTC/local seam entirely.
         """
+        deadline = self._retry_deadline()
         for due in self._store.due_retries(now):
+            if now - due.scheduled_for > deadline:
+                self._settle_stale_retry(due, now)
+                continue
             checkin = self._checkins.get(f"checkin_{due.kind}")
             if checkin is None:
                 continue
@@ -6697,7 +6945,73 @@ cron job's work:
             except Exception:
                 # One failing retry must not stop the others or the tick.
                 log.error("retry for %s failed", due.kind, exc_info=True)
+
+    def _retry_deadline(self) -> timedelta:
+        """How long after its occurrence a retry may still fire (§9.2, §9.3).
+
+        Derived from the configured ladder rather than hardcoded, so a user
+        who lengthens defer_retry_after does not silently lose their last
+        rungs — and capped, so one who lengthens it absurdly cannot licence
+        a replay on the following day.
+        """
+        schedule = self._config.schedule
+        ladder = max(
+            schedule.defer_retry_after * schedule.max_defer_retries,
+            schedule.no_answer_retry_after * schedule.max_no_answer_retries,
+        )
+        return min(ladder + _RETRY_SLACK, _RETRY_MAX_AGE)
+
+    def _settle_stale_retry(self, due, now: datetime) -> None:
+        """Record a retry that outlived its ladder as skipped, and clear it.
+
+        Settling is not optional housekeeping: retry_at is what
+        due_retries() selects on, so a stale row that is merely skipped over
+        comes back on the very next tick — once a minute, forever.
+        update_checkin targets DueRetry.id, so it lands on exactly the row
+        that was due rather than on whatever find_open_checkin would resolve
+        for that (kind, date).
+
+        attempts is carried across unchanged, for the reason
+        _record_skipped gives: a retry that never fired is not an attempt,
+        and attempts is the one column the §9.3 ladder reads.
+        """
+        log.warning(
+            "retry: dropping the %s retry for the occurrence at %s — it came "
+            "due %s after that occurrence, so its moment has passed (spec "
+            "§9.2). Recording it as skipped.",
+            due.kind, due.scheduled_for, now - due.scheduled_for,
+        )
+        try:
+            attempts = self._store.get_checkin(due.id).attempts
+            self._store.update_checkin(
+                due.id, outcome="skipped", attempts=attempts, retry_at=None
+            )
+            self._journal.append(
+                f"{due.kind.title()} check-in: skipped (its retry came due "
+                f"long after the check-in's moment had passed)"
+            )
+        except Exception:
+            # Same isolation as every other per-item failure on this path.
+            # Loud, and the row keeps its retry_at, so the next tick tries
+            # to settle it again rather than pretending it is gone.
+            log.exception("could not settle the stale %s retry", due.kind)
 ```
+
+**Staleness is part of this task, not an afterthought.** The first version of
+`_run_due_retries` had no bound at all, and that is a data-loss defect, not a
+tidiness one: `due_retries()` selects on `retry_at <= now` and nothing else,
+so an overnight sleep turns a live rung into a next-day replay that writes
+today's answer onto yesterday's row. Both triggers are covered in
+`tests/test_daemon.py`:
+
+- an evening check-in deferring at 21:00 and firing at 08:05 the next
+  morning — §9.2's "do not ask about yesterday today";
+- a morning check-in deferring at 11:00 and firing at 09:00 the next day,
+  destroying a completed goal review. That test asserts yesterday's goal
+  still reads `status='done'` with its notes intact.
+
+`DueRetry.id` exists for this: it is what makes the settle target the exact
+row that was due.
 
 The daemon already wakes at least once a minute (`seconds_until_next` caps at
 `_MAX_SLEEP`), so no new sleep machinery is needed — a 20-minute retry is
