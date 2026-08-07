@@ -5378,6 +5378,11 @@ class Daemon:
             return
         restarts = 0
         while self._running and not self._shutdown.is_set():
+            # Named rather than assumed: events() can also end by RAISING —
+            # openWakeWord failing to load its model, say — and a log line
+            # that blamed the microphone for that would be one more false
+            # statement in a codebase already bitten by five.
+            reason = "the microphone stopped delivering audio"
             try:
                 for event in self._activator.events():
                     if not self._running:
@@ -5390,15 +5395,16 @@ class Daemon:
             except Exception:
                 # A raising activator must not end activation either — that
                 # is the same silent death by a different door.
+                reason = "the activation source raised"
                 log.error("the activation source failed", exc_info=True)
             if not self._running or self._shutdown.is_set():
                 return
             restarts += 1
             log.warning(
-                "the microphone stopped delivering audio, so wake-word "
-                "activation ended; restarting it in %.0fs (restart #%d). "
-                "If this repeats, the input device is failing — run "
-                "'zeus doctor'.", _ACTIVATION_RESTART_SECONDS, restarts,
+                "%s, so wake-word activation ended; restarting it in %.0fs "
+                "(restart #%d). If this keeps repeating, run 'zeus doctor' — "
+                "the input device or the wake-word model is failing.",
+                reason, _ACTIVATION_RESTART_SECONDS, restarts,
             )
             if self._shutdown.wait(_ACTIVATION_RESTART_SECONDS):
                 return

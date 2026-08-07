@@ -1620,3 +1620,56 @@ def test_a_notified_checkin_is_not_notified_again_every_twenty_minutes(tmp_path)
     row = store.get_checkin(1)
     assert row.retry_at is None
     assert row.outcome == "deferred"             # unanswered, not abandoned
+
+
+def test_a_raising_activation_source_is_restarted_too(tmp_path, monkeypatch, caplog):
+    """The other way events() can end: by raising.
+
+    openWakeWord failing to load its model raises straight out of events(),
+    which killed the thread just as silently as the idle bound did. It must
+    restart on the same loop — and say what actually happened, not blame the
+    microphone.
+    """
+    import logging
+
+    monkeypatch.setattr("zeus.daemon._ACTIVATION_RESTART_SECONDS", 0.01)
+
+    class _BrokenActivator:
+        def __init__(self):
+            self.attempts = 0
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def events(self):
+            self.attempts += 1
+            raise RuntimeError("openwakeword could not load its model")
+
+    clock = FakeClock(NOW)
+    store = Store(tmp_path / "zeus.db", clock)
+    journal = Journal(tmp_path / "journal", clock, LAGOS)
+    scheduler = Scheduler(store, clock, LAGOS)
+    activator = _BrokenActivator()
+    instance = Daemon(
+        config=Config(root=tmp_path), store=store, journal=journal,
+        scheduler=scheduler, presence=None, voice=None, notifier=None,
+        checkins={}, clock=clock, activator=activator, mic=None, tz=LAGOS,
+    )
+
+    try:
+        with caplog.at_level(logging.WARNING, logger="zeus.daemon"):
+            instance.start()
+            _await(lambda: activator.attempts >= 3,
+                   "a raising activation source was not restarted")
+    finally:
+        instance.stop()
+
+    instance._activation_thread.join(timeout=5.0)
+    assert not instance._activation_thread.is_alive()
+    assert any(
+        "the activation source raised" in record.getMessage()
+        for record in caplog.records
+    ), "the restart log blamed the microphone for a model-load failure"
