@@ -8,6 +8,12 @@ what your one goal is each morning and whether it happened each evening.
 macOS 12+ on Intel or Apple Silicon, and [uv](https://docs.astral.sh/uv/).
 No Homebrew required.
 
+**Install Python 3.12**, exactly as below. The source itself needs only 3.11
+(`requires-python = ">=3.11"`, and the suite passes on a real 3.11), but the
+pinned dependency set does not resolve there — `numpy==2.5.1` requires 3.12 —
+and the audio wheels stop at 3.12 at the other end. `uv pip install` names the
+offending pin if you try anything else.
+
 ## Install
 
 ```bash
