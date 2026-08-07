@@ -454,15 +454,29 @@ def _install_sigterm_handler(daemon) -> None:
     ordinary stop. KeyboardInterrupt was the only path that reached the
     carefully ordered shutdown, i.e. only when run in a terminal by hand.
 
-    stop() runs INSIDE the handler rather than setting a flag for the loop
-    to notice, because PEP 475 makes time.sleep() resume after a handler
-    returns: the tick loop can be up to a minute from its next wake, and
-    launchd sends SIGKILL long before that. Doing the work here means the
-    device is released and the activator stopped even if the process is
-    killed a moment later. stop() itself is signal-safe enough for this —
-    it sets an Event, flips two flags, and closes the stream; it takes no
-    lock the main thread could already be holding, and sqlite needs
-    nothing, being isolation_level=None with every statement autocommitted.
+    THE HANDLER ASKS; IT DOES NOT DO. An earlier version called
+    daemon.stop() here, under a comment claiming stop() "takes no lock the
+    main thread could already be holding". That was false, and provably so:
+    Daemon.stop() -> MicStream.stop() takes _lifecycle_lock, a plain
+    non-reentrant Lock that MicStream.start() holds across the sounddevice
+    import and the PortAudio open — which this very file notes can take
+    seconds on Bluetooth. Signal handlers run on the main thread, and the
+    main thread is the one inside start(), so a SIGTERM in that window
+    self-deadlocked. Demonstrated in a subprocess: SIGTERM 0.3s into a 2.0s
+    hold hung until the process was killed.
+
+    daemon.request_stop() flips a bool and sets an Event, and takes no lock
+    at all. run_forever's loop sleeps in _SHUTDOWN_POLL_SECONDS slices
+    precisely so this is observed promptly — PEP 475 resumes an interrupted
+    sleep for its full remaining time, so without slicing the loop could be
+    a minute from noticing and launchd sends SIGKILL after twenty seconds.
+    The real teardown then happens in run_forever's `finally`, on a thread
+    that holds no lock.
+
+    What that costs: if the main thread is mid-check-in when SIGTERM
+    arrives, shutdown waits for that conversation rather than yanking the
+    device out from under it. That is a bound on real work in flight, not a
+    deadlock, and it is the direction to err in.
 
     Failures are swallowed: raising from a signal handler would propagate
     into whatever the main thread happened to be doing, which is a worse
@@ -473,7 +487,7 @@ def _install_sigterm_handler(daemon) -> None:
     def handle(signum, frame):
         log.info("SIGTERM received; shutting down")
         try:
-            daemon.stop()
+            daemon.request_stop()
         except Exception:
             log.error("error during shutdown", exc_info=True)
 

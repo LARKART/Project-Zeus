@@ -49,6 +49,11 @@ _RETRY_MAX_AGE = timedelta(hours=6)
 # source that fails INSTANTLY (a raising activator, say) from spinning.
 _ACTIVATION_RESTART_SECONDS = 5.0
 
+# The longest the run loop may go without noticing request_stop(). launchd's
+# default grace period between SIGTERM and SIGKILL is 20 seconds, and the
+# tick loop can otherwise be a full minute from its next wake.
+_SHUTDOWN_POLL_SECONDS = 1.0
+
 
 def audio_self_test(mic: MicStream, seconds: float = 1.0) -> bool:
     """Capture briefly and assert the microphone is actually producing audio.
@@ -528,9 +533,30 @@ class Daemon:
             self._activation_thread.start()
         self.run_catch_up()
 
-    def stop(self) -> None:
+    def request_stop(self) -> None:
+        """Ask the daemon to shut down. SAFE TO CALL FROM A SIGNAL HANDLER.
+
+        It flips a bool and sets an Event. That is all, and the restraint is
+        the point: stop() itself is NOT safe from a handler. stop() ->
+        MicStream.stop() takes _lifecycle_lock, a plain non-reentrant Lock
+        that MicStream.start() holds across the sounddevice import and the
+        PortAudio open — seconds, on a Bluetooth input. A signal handler
+        runs on the main thread, which is the thread inside start(), so a
+        SIGTERM in that window self-deadlocked the process until launchd
+        escalated to SIGKILL. The comment in cli.py asserting the opposite
+        was the fifth false comment in this codebase.
+
+        run_forever's loop observes this within _SHUTDOWN_POLL_SECONDS and
+        its `finally` does the real teardown, on a thread that holds no
+        lock. The bound on shutdown is therefore whatever work is genuinely
+        in flight — a check-in conversation waiting on the Anthropic API,
+        say — rather than a deadlock that can never clear.
+        """
         self._running = False
         self._shutdown.set()
+
+    def stop(self) -> None:
+        self.request_stop()
         if self._activator is not None:
             self._activator.stop()
         if self._mic is not None:
@@ -541,11 +567,30 @@ class Daemon:
         try:
             while self._running:
                 self.tick()
-                self._clock.sleep(
-                    self._scheduler.seconds_until_next(self._clock.now_utc())
-                )
+                self._sleep_until_next()
         finally:
             self.stop()
+
+    def _sleep_until_next(self) -> None:
+        """Sleep to the next occurrence, in slices, so a stop is noticed.
+
+        SLICED, not one long sleep. seconds_until_next() returns up to
+        _MAX_SLEEP (60s), and PEP 475 makes an interrupted time.sleep()
+        resume for its full remaining time — so a SIGTERM arriving just
+        after a tick would not be acted on for another minute, and launchd
+        sends SIGKILL long before that. Slicing costs a wakeup a second on
+        a process that is already running wake-word inference twelve times
+        a second.
+
+        Still self._clock.sleep, not _shutdown.wait: the Clock is the one
+        seam the whole scheduler is tested through, and a FakeClock advances
+        virtual time here exactly as a SystemClock burns real time.
+        """
+        remaining = self._scheduler.seconds_until_next(self._clock.now_utc())
+        while remaining > 0 and not self._shutdown.is_set():
+            interval = min(remaining, _SHUTDOWN_POLL_SECONDS)
+            self._clock.sleep(interval)
+            remaining -= interval
 
 
 def build_daemon(config: Config | None = None) -> Daemon:

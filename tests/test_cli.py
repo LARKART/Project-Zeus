@@ -514,19 +514,32 @@ def test_run_stops_the_daemon_on_sigterm(monkeypatch, tmp_path):
     absorbs the signal, this test fails alone). The previous disposition is
     restored afterwards: signal handlers are process-global and monkeypatch
     does not track them.
+
+    The handler now calls request_stop(), not stop() — see X4: stop() takes
+    MicStream._lifecycle_lock, which start() can be holding on this very
+    thread. The fake mirrors the real run_forever's shape, signal then
+    `finally: stop()`, so this still pins the whole path from the delivered
+    signal to the device being released, not merely that a flag was set.
     """
     import os
     import signal
 
     stopped = []
+    requested = []
     caught_by_the_net = []
 
     class _FakeDaemon:
         def run_forever(self):
-            os.kill(os.getpid(), signal.SIGTERM)
-            # PEP 475 resumes an interrupted syscall after the handler
-            # returns, so a real run_forever would carry on to its next
-            # tick and exit there. What matters is that stop() ran.
+            try:
+                os.kill(os.getpid(), signal.SIGTERM)
+                # PEP 475 resumes an interrupted syscall after the handler
+                # returns, so a real run_forever carries on to its next
+                # loop check and leaves there.
+            finally:
+                self.stop()
+
+        def request_stop(self):
+            requested.append(True)
 
         def stop(self):
             stopped.append(True)
@@ -544,6 +557,7 @@ def test_run_stops_the_daemon_on_sigterm(monkeypatch, tmp_path):
         "net absorbed the signal. Deployed, that signal is fatal and "
         "Daemon.stop() never runs"
     )
+    assert requested == [True], "SIGTERM did not reach Daemon.request_stop()"
     assert stopped == [True], "SIGTERM did not reach Daemon.stop()"
 
 
@@ -632,3 +646,135 @@ def test_doctor_survives_an_env_file_behind_an_untraversable_directory(
         vault.chmod(0o700)  # so tmp_path teardown can remove it
 
     assert isinstance(code, int)
+
+
+def test_the_sigterm_handler_cannot_deadlock_on_a_slow_mic_start(tmp_path):
+    """X4: the handler used to call Daemon.stop() directly, under a comment
+    claiming it "takes no lock the main thread could already be holding".
+
+    That was false. Daemon.stop() -> MicStream.stop() takes _lifecycle_lock,
+    a plain non-reentrant Lock that MicStream.start() holds across the
+    sounddevice import and the PortAudio open -- which cli.py itself notes
+    can take seconds on Bluetooth. Signal handlers run on the MAIN thread,
+    which is the thread inside start(), so a SIGTERM in that window
+    self-deadlocked: the process hung until launchd escalated to SIGKILL,
+    i.e. the pre-fix outcome, with the tidy shutdown lost anyway.
+
+    The lock is held here by the TEST thread and the handler is invoked on
+    another, rather than reproducing the same-thread deadlock literally: a
+    genuine self-deadlock would hang the suite instead of reporting one red
+    test, and a non-reentrant Lock blocks a second thread exactly as it
+    blocks a re-entering one. What is asserted is what matters -- the
+    handler returns while the lock is held.
+    """
+    import signal
+    import threading
+
+    from zeus.audio.mic import MicStream
+    from zeus.cli import _install_sigterm_handler
+    from zeus.config import AudioConfig
+    from zeus.daemon import Daemon
+
+    mic = MicStream(AudioConfig())
+    daemon = Daemon(
+        config=Config(root=tmp_path), store=None, journal=None,
+        scheduler=None, presence=None, voice=None, notifier=None,
+        checkins={}, clock=None, activator=None, mic=mic,
+    )
+    previous = signal.getsignal(signal.SIGTERM)
+    try:
+        _install_sigterm_handler(daemon)
+        handler = signal.getsignal(signal.SIGTERM)
+        assert callable(handler), "no SIGTERM handler was installed"
+
+        returned = threading.Event()
+
+        def call_handler():
+            handler(signal.SIGTERM, None)
+            returned.set()
+
+        # The lock is held, exactly as it is across MicStream.start()'s
+        # sounddevice import and PortAudio open.
+        with mic._lifecycle_lock:
+            threading.Thread(target=call_handler, daemon=True).start()
+            assert returned.wait(2.0), (
+                "the SIGTERM handler blocked on MicStream._lifecycle_lock — "
+                "deployed, that is a self-deadlock on the main thread and "
+                "launchd has to SIGKILL the process"
+            )
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+    # And it still asked for shutdown: the run loop's finally does the real
+    # teardown, so the flag is the whole contract here.
+    assert daemon._shutdown.is_set()
+    assert daemon._running is False
+
+
+def test_run_forever_shuts_down_when_stop_is_requested(tmp_path, monkeypatch):
+    """The other half of X4: a flag nothing observes is not a shutdown.
+
+    request_stop() only asks. What must follow is the loop noticing and its
+    finally releasing the microphone -- and noticing PROMPTLY, because
+    seconds_until_next() returns up to 60 seconds and PEP 475 resumes an
+    interrupted sleep for its full remaining time.
+    """
+    import threading
+    import time
+
+    from zeus.clock import SystemClock
+    from zeus.daemon import Daemon
+
+    class _NoJobs:
+        def catch_up(self):
+            return []
+
+        def run_pending(self, now):
+            pass
+
+        def seconds_until_next(self, now):
+            return 60.0
+
+    class _Store:
+        def set_heartbeat(self):
+            pass
+
+        def due_retries(self, now):
+            return []
+
+    class _RecordingMic:
+        def __init__(self):
+            self.stopped = False
+
+        def start(self):
+            pass
+
+        def stop(self):
+            self.stopped = True
+
+    # The self-test needs real frames from a real device; what is under test
+    # is the shutdown path, so it is stubbed healthy rather than fed audio.
+    monkeypatch.setattr("zeus.daemon.audio_self_test", lambda mic, **kw: True)
+
+    mic = _RecordingMic()
+    daemon = Daemon(
+        config=Config(root=tmp_path), store=_Store(), journal=None,
+        scheduler=_NoJobs(), presence=None, voice=None, notifier=None,
+        checkins={}, clock=SystemClock(), activator=None, mic=mic,
+    )
+
+    finished = threading.Event()
+    threading.Thread(
+        target=lambda: (daemon.run_forever(), finished.set()), daemon=True
+    ).start()
+    time.sleep(0.2)            # into the 60-second sleep
+
+    started = time.monotonic()
+    daemon.request_stop()
+
+    assert finished.wait(5.0), (
+        "run_forever ignored request_stop() and sat out its 60-second sleep; "
+        "launchd would SIGKILL long before it noticed"
+    )
+    assert time.monotonic() - started < 5.0
+    assert mic.stopped is True, "the run loop's finally never released the mic"
