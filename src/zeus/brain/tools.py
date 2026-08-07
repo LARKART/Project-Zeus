@@ -18,15 +18,36 @@ log = logging.getLogger(__name__)
 
 VALID_STATUSES = {"done", "partial", "missed", "carried"}
 
+# A goal is one spoken sentence. The cap exists because nothing else bounds
+# what lands here: `text` comes straight from a Whisper transcript of a 30s
+# listen window, and whatever is stored replays into every later prompt AND
+# into the journal, for good. Truncating rather than rejecting keeps a
+# long-winded but genuine answer usable.
+MAX_GOAL_CHARS = 500
+
 
 def logged_tool(
     store: Store, conversation_id: int, name: str, fn: Callable
 ) -> Callable:
     """Wrap a tool so every call is timed and recorded.
 
-    A raising tool returns an error *string* rather than propagating, so the
-    model can adapt (spec §10) instead of the turn collapsing.
+    A raising tool is reported to the model as an ERROR, not as a successful
+    result (spec §10: "Return is_error: true so the model can adapt; log to
+    actions with ok=0"). It used to RETURN the error as a string, which the
+    Tool Runner cannot distinguish from a normal result — so it emitted a
+    plain tool_result with no `is_error`, and the model was told the call
+    had worked. The action log was right the whole time (ok=False, error
+    set); only the model was misinformed, and a model that thinks a failing
+    call succeeded has no reason to stop retrying it.
+
+    anthropic.lib.tools.ToolError rather than letting the original
+    exception escape: the runner catches BOTH and sets is_error either way,
+    but ToolError's content is used verbatim, so the model reads "The
+    save_goal tool failed: disk full" instead of repr(RuntimeError(...)).
+    The turn still does not collapse — the runner turns this into a
+    tool_result and hands it back to the model.
     """
+    from anthropic.lib.tools import ToolError
 
     @functools.wraps(fn)
     def wrapper(**kwargs):
@@ -42,7 +63,7 @@ def logged_tool(
             log.error("tool %s failed", name, exc_info=True)
             store.log_action(name, kwargs, None, False, elapsed,
                              error=str(exc), conversation_id=conversation_id)
-            return f"The {name} tool failed: {exc}"
+            raise ToolError(f"The {name} tool failed: {exc}") from exc
 
     return wrapper
 
@@ -59,6 +80,28 @@ def build_tool_callables(
     """
 
     def _save_goal(text: str) -> str:
+        # VALIDATED, because nothing upstream does it. text="" was stored
+        # and journalled as "Goal set: " — a goal row that reads as an
+        # answered morning check-in while carrying nothing, which the
+        # evening check-in then recalls back to the user as an empty
+        # sentence. And text="x" * 100000 was stored whole, replaying into
+        # every later prompt and into the journal permanently.
+        #
+        # Empty is REJECTED (the model can ask again); too long is
+        # TRUNCATED (the answer is real, just long-winded — losing it
+        # entirely would be worse than losing its tail).
+        text = (text or "").strip()
+        if not text:
+            return (
+                "No goal text was given, so nothing was saved. Ask the user "
+                "what the one thing is and save what they actually say."
+            )
+        if len(text) > MAX_GOAL_CHARS:
+            log.warning(
+                "goal text was %d characters; truncated to %d",
+                len(text), MAX_GOAL_CHARS,
+            )
+            text = text[:MAX_GOAL_CHARS].rstrip()
         store.set_goal(local_date, text)
         journal.append(f"Goal set: {text}")
         return f"Saved today's goal: {text}"

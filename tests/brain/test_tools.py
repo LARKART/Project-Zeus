@@ -32,19 +32,40 @@ def test_logged_tool_records_a_successful_action(wiring):
     assert action.error is None
 
 
-def test_logged_tool_captures_failures_without_raising(wiring):
+def test_logged_tool_reports_failures_to_the_model_as_errors(wiring):
+    """B7: a failing tool used to RETURN its error as a string, which the
+    Tool Runner cannot tell apart from a successful result -- so it emitted
+    a tool_result with no `is_error` and the model was told the call had
+    worked. The runner sets is_error for a raised ToolError and uses its
+    content verbatim, so the model still reads the friendly message.
+
+    The action log was always correct; this test pins BOTH halves so the
+    fix cannot regress into "loud to the model, silent in the log"."""
+    from anthropic.lib.tools import ToolError
+
     store, _, conv = wiring
 
     def explode():
         raise RuntimeError("nope")
 
     wrapped = logged_tool(store, conv, "boom", explode)
-    result = wrapped()
-    assert "nope" in result
+    with pytest.raises(ToolError, match="nope") as raised:
+        wrapped()
+    assert "The boom tool failed" in str(raised.value)
 
     action = store.recent_actions()[0]
     assert action.ok is False
     assert "nope" in action.error
+
+
+def test_a_raised_tool_error_is_what_the_runner_marks_as_an_error(wiring):
+    """The SDK contract this depends on, pinned against the installed SDK:
+    the runner catches ToolError specially and uses its `content` rather
+    than repr(exc). A stub asserting our own call would prove nothing."""
+    from anthropic.lib.tools import ToolError
+
+    error = ToolError("The save_goal tool failed: disk full")
+    assert error.content == "The save_goal tool failed: disk full"
 
 
 def test_save_goal_writes_goal_and_journal(wiring):
@@ -83,6 +104,44 @@ def test_record_outcome_rejects_an_invalid_status(wiring):
     result = tools["record_outcome"](status="banana")
     assert "banana" in result
     assert store.get_goal("2026-08-05").status == "pending"
+
+
+def test_save_goal_refuses_an_empty_goal(wiring):
+    """B8: text="" was stored and journalled as "Goal set: " -- a goal row
+    that reads as an answered morning check-in while carrying nothing, and
+    that the evening check-in then recalls back as an empty sentence."""
+    store, journal, conv = wiring
+    tools = build_tool_callables(store, journal, conv, "2026-08-05")
+
+    result = tools["save_goal"](text="   ")
+
+    assert store.get_goal("2026-08-05") is None
+    assert "Goal set:" not in journal.read("2026-08-05")
+    assert "no goal text" in result.lower()
+
+
+def test_save_goal_truncates_an_enormous_goal(wiring):
+    """B8: 100,000 characters were stored whole, and whatever is stored
+    replays into every later prompt and into the journal, permanently."""
+    from zeus.brain.tools import MAX_GOAL_CHARS
+
+    store, journal, conv = wiring
+    tools = build_tool_callables(store, journal, conv, "2026-08-05")
+
+    tools["save_goal"](text="x" * 100_000)
+
+    assert len(store.get_goal("2026-08-05").text) == MAX_GOAL_CHARS
+
+
+def test_save_goal_leaves_an_ordinary_goal_untouched(wiring):
+    """The guard must not mangle the normal case: no truncation, and the
+    surrounding whitespace a transcript often carries is stripped."""
+    store, journal, conv = wiring
+    tools = build_tool_callables(store, journal, conv, "2026-08-05")
+
+    tools["save_goal"](text="  Finish the auth flow  ")
+
+    assert store.get_goal("2026-08-05").text == "Finish the auth flow"
 
 
 def test_callables_and_decorated_tools_cover_the_same_surface(wiring):

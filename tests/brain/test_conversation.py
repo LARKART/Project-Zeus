@@ -271,6 +271,172 @@ def test_an_exception_after_a_tool_round_drops_the_dangling_tool_use(wiring):
     _assert_history_is_well_formed(client.calls[1]["messages"])
 
 
+# ---- B2: the tool loop is bounded ---------------------------------------
+
+
+def _tool_round(tool_id):
+    """A round that asks for a tool and never produces text."""
+    return StubStream(
+        [], stop_reason="tool_use",
+        content=[{
+            "type": "tool_use", "id": tool_id,
+            "name": "record_outcome", "input": {"status": "done"},
+        }],
+    )
+
+
+def test_the_tool_runner_is_given_an_iteration_bound(wiring):
+    """Without max_iterations the SDK's _should_stop() short-circuits on
+    `self._max_iterations is not None`, so request -> tool -> request is
+    bounded only by the model deciding to stop. record_outcome returning
+    "There is no goal recorded for today" is a SUCCESSFUL result the model
+    may simply retry: the check-in never returns, speak() never finishes,
+    the scheduler thread blocks, and the API bill runs on unattended."""
+    from zeus.brain.conversation import MAX_TOOL_ROUNDS
+
+    client = StubClient([StubStream(["ok."])])
+    list(_conversation(client, wiring).send("hi"))
+
+    assert client.calls[0]["max_iterations"] == MAX_TOOL_ROUNDS
+    assert MAX_TOOL_ROUNDS > 2, (
+        "a normal tool-using turn is two rounds (tool_use, then text); a "
+        "bound at or below that would truncate healthy conversations"
+    )
+
+
+def test_the_installed_sdk_accepts_max_iterations():
+    """The kwarg is only useful if the real client takes it -- a stub that
+    records whatever it is handed cannot tell a correct parameter name from
+    a typo. Reads the signature; no network, no key in use."""
+    import inspect
+
+    import anthropic
+
+    client = anthropic.Anthropic(api_key="test-key-never-sent")
+    parameters = inspect.signature(client.beta.messages.tool_runner).parameters
+    assert "max_iterations" in parameters
+
+
+def test_running_out_of_tool_rounds_is_spoken_and_logged(wiring, caplog):
+    """The runner stops SILENTLY when it hits max_iterations -- StopIteration,
+    no exception, no warning. Left alone that is a check-in that just goes
+    quiet, which §10 rules is worse than one that says it is broken."""
+    import logging
+
+    from zeus.brain.conversation import STUCK_LINE
+
+    client = StubClient([[_tool_round(f"toolu_{i}") for i in range(6)]])
+    with caplog.at_level(logging.ERROR, logger="zeus.brain.conversation"):
+        spoken = list(_conversation(client, wiring).send("hi"))
+
+    assert spoken == [STUCK_LINE]
+    assert any("tool rounds" in r.message for r in caplog.records)
+
+
+def test_running_out_of_tool_rounds_leaves_history_valid(wiring):
+    """The trap the bound introduces if it is added carelessly: the last
+    round the runner produced holds a tool_use whose tool_result will never
+    be generated, and replaying it on the next send() is a 400."""
+    client = StubClient([
+        [_tool_round(f"toolu_{i}") for i in range(6)],
+        StubStream(["Sure."]),
+    ])
+    conversation = _conversation(client, wiring)
+    list(conversation.send("first"))
+    list(conversation.send("second"))
+
+    _assert_history_is_well_formed(client.calls[1]["messages"])
+
+
+# ---- B1: a truncated reply must not sound complete ----------------------
+
+
+def test_a_truncated_reply_says_so_instead_of_sounding_finished(wiring, caplog):
+    """MAX_TOKENS is the ceiling for adaptive thinking PLUS text on Opus 5,
+    so a long turn can exhaust it. Only `refusal` was branched on, so every
+    other stop reason fell through and the buffered fragment was spoken as
+    a finished sentence with nothing logged at WARNING or above."""
+    import logging
+
+    from zeus.brain.conversation import TRUNCATED_LINE
+
+    client = StubClient([
+        StubStream(["You said you'd finish the auth flow, and you got about "
+                    "three quarters of the way thro"], stop_reason="max_tokens")
+    ])
+    with caplog.at_level(logging.WARNING, logger="zeus.brain.conversation"):
+        spoken = list(_conversation(client, wiring).send("hi"))
+
+    assert spoken[-1] == TRUNCATED_LINE, (
+        "the truncated fragment was spoken as if the answer were complete"
+    )
+    assert "three quarters of the way thro" in spoken[0], (
+        "what the model DID say should still be heard"
+    )
+    assert any(record.levelno >= logging.WARNING for record in caplog.records)
+
+
+def test_a_truncated_tool_call_is_neither_run_nor_replayed(wiring):
+    """The quieter half. The SDK accumulates tool input with
+    partial_mode=True, so a cut-off {"status":"done","notes":"took about
+    three ho would call record_outcome(status="done") with notes silently
+    dropped and ok=True in the action log. The runner only executes those
+    tools when the iterator is advanced again -- so the fix is to stop
+    advancing it, which also keeps the dangling tool_use out of history."""
+    truncated_tool_round = StubStream(
+        [], stop_reason="max_tokens",
+        content=[{
+            "type": "tool_use", "id": "toolu_cut",
+            "name": "record_outcome", "input": {"status": "done"},
+        }],
+    )
+    client = StubClient([
+        [truncated_tool_round, StubStream(["never reached."])],
+        StubStream(["Sure."]),
+    ])
+    conversation = _conversation(client, wiring)
+    spoken = list(conversation.send("first"))
+    list(conversation.send("second"))
+
+    assert "never reached." not in spoken, (
+        "the runner was advanced past the truncated tool call"
+    )
+    _assert_history_is_well_formed(client.calls[1]["messages"])
+
+
+# ---- B5, B6: round bookkeeping ------------------------------------------
+
+
+def test_sentences_are_not_welded_across_rounds(wiring):
+    """B5: the buffer was never reset between rounds, so a round ending
+    without punctuation and the next round's opening text were emitted as
+    one sentence -- two separate model messages welded into one line of
+    speech."""
+    client = StubClient([[StubStream(["Let me save that"]),
+                          StubStream(["Done."])]])
+    assert list(_conversation(client, wiring).send("[morning]")) == [
+        "Let me save that", "Done.",
+    ]
+
+
+def test_an_empty_content_list_is_not_appended_to_history(wiring):
+    """B6: the guard was `final_content is not None`, so an empty list
+    passed it and appended {"role": "assistant", "content": []}, which the
+    API rejects. Empty means the model contributed nothing, which is
+    exactly when the spoken fallback should take over."""
+    client = StubClient([
+        StubStream(["Morning."], content=[]),
+        StubStream(["Next."]),
+    ])
+    conversation = _conversation(client, wiring)
+    list(conversation.send("first"))
+    list(conversation.send("second"))
+
+    history = client.calls[1]["messages"]
+    assert all(message["content"] for message in history), history
+    assert history[1] == {"role": "assistant", "content": "Morning."}
+
+
 def test_fake_conversation_replays_a_script():
     fake = FakeConversation({"[morning]": ["Morning.", "What's the goal?"]})
     assert list(fake.send("[morning]")) == ["Morning.", "What's the goal?"]

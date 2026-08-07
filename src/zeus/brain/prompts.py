@@ -63,9 +63,18 @@ def EVENING_OPENER(goal_text: str) -> str:
     )
 
 
-# A sentence ends at . ? or ! that is followed by whitespace or end-of-string,
-# and is not part of a decimal number.
-_SENTENCE_END = re.compile(r"(?<!\d)([.!?])(?=\s|$)")
+# A sentence ends at . ? or ! that is followed by whitespace or end-of-string.
+#
+# NO (?<!\d) DECIMAL GUARD. It was there to stop "1.5" splitting, but the
+# lookahead already does that: in "1.5" the dot is followed by "5", not
+# whitespace, so it never matches. What the guard actually did was suppress
+# the break after any sentence ENDING in a digit — "The meeting is at 3.
+# Then we go." came out as one blob, withheld from text-to-speech until some
+# later non-digit sentence arrived. Spec §7.1 makes that latency the whole
+# point of streaming sentence by sentence. Verified: deleting the guard left
+# every prompt test green, and the decimal test passed identically with and
+# without it.
+_SENTENCE_END = re.compile(r"([.!?])(?=\s|$)")
 
 
 def split_sentences(buffer: str) -> tuple[list[str], str]:
