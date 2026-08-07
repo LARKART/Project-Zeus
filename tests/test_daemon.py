@@ -1573,6 +1573,160 @@ def test_the_activation_loop_ends_when_the_daemon_stops(tmp_path, monkeypatch):
     )
 
 
+class _AlwaysRaisingActivator:
+    """An activation source that fails INSTANTLY, every time.
+
+    A dead USB microphone left plugged in is the realistic version: the
+    restart loop's own idle bound never gets a chance to rate-limit it,
+    because events() does not survive long enough to idle.
+    """
+
+    def __init__(self) -> None:
+        self.entries = 0
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def events(self):
+        self.entries += 1
+        raise OSError("input device is gone")
+        yield  # pragma: no cover -- makes this a generator function
+
+
+def test_the_restart_backoff_grows_and_caps_instead_of_logging_forever(
+    tmp_path, monkeypatch
+):
+    """A fault that never clears must not write 0.79 GB a year.
+
+    X2's restart loop is right to be loud, but a permanently dead microphone
+    restarts every _IDLE_TIMEOUT_SECONDS + _ACTIVATION_RESTART_SECONDS = 10s
+    and writes a WARNING each time: 8,640 lines a day into a zeusd.log that
+    nothing rotates. The wait doubles to a ceiling, so the first failures stay
+    exactly as prompt and as loud while a permanent one settles to one line
+    every five minutes.
+    """
+    monkeypatch.setattr("zeus.daemon._ACTIVATION_RESTART_SECONDS", 1.0)
+    monkeypatch.setattr("zeus.daemon._ACTIVATION_RESTART_MAX_SECONDS", 8.0)
+
+    clock = FakeClock(NOW)
+    store = Store(tmp_path / "zeus.db", clock)
+    activator = _AlwaysRaisingActivator()
+    instance = Daemon(
+        config=Config(root=tmp_path), store=store,
+        journal=Journal(tmp_path / "journal", clock, LAGOS),
+        scheduler=None, presence=None, voice=None, notifier=None,
+        checkins={}, clock=clock, activator=activator, mic=None, tz=LAGOS,
+    )
+
+    # Record what it WOULD wait, and never actually wait: the schedule is the
+    # thing under test, not the wall clock.
+    waits: list[float] = []
+
+    def fake_wait(timeout=None):
+        waits.append(timeout)
+        return len(waits) >= 6      # the 6th "wait" is a stop()
+
+    instance._running = True
+    monkeypatch.setattr(instance._shutdown, "wait", fake_wait)
+    instance._activation_loop()
+
+    assert waits == [1.0, 2.0, 4.0, 8.0, 8.0, 8.0], (
+        f"the restart backoff did not double to its ceiling: {waits}"
+    )
+
+
+def test_a_delivered_event_resets_the_restart_backoff(tmp_path, monkeypatch):
+    """Recovery must not leave the ratchet wound up.
+
+    Without this, a Mac that sleeps once a day climbs to the five-minute
+    ceiling over a week — and then takes five minutes to bring "hey jarvis"
+    back after an ordinary lid-open, which is far worse than the log volume
+    the ceiling exists to fix.
+    """
+    monkeypatch.setattr("zeus.daemon._ACTIVATION_RESTART_SECONDS", 1.0)
+    monkeypatch.setattr("zeus.daemon._ACTIVATION_RESTART_MAX_SECONDS", 64.0)
+
+    clock = FakeClock(NOW)
+    store = Store(tmp_path / "zeus.db", clock)
+
+    class _RecoveringActivator(_AlwaysRaisingActivator):
+        """Fails twice, then delivers one event, then fails again."""
+
+        def events(self):
+            self.entries += 1
+            if self.entries == 3:
+                yield SimpleNamespace(source="wake")
+                return
+            raise OSError("input device is gone")
+
+    activator = _RecoveringActivator()
+    instance = Daemon(
+        config=Config(root=tmp_path), store=store,
+        journal=Journal(tmp_path / "journal", clock, LAGOS),
+        scheduler=None, presence=None, voice=_StubVoice(), notifier=None,
+        checkins={}, clock=clock, activator=activator, mic=None, tz=LAGOS,
+    )
+
+    waits: list[float] = []
+
+    def fake_wait(timeout=None):
+        waits.append(timeout)
+        return len(waits) >= 4
+
+    instance._running = True
+    monkeypatch.setattr(instance._shutdown, "wait", fake_wait)
+    instance._activation_loop()
+
+    assert waits == [1.0, 2.0, 1.0, 2.0], (
+        f"a delivered event did not reset the backoff: {waits}"
+    )
+
+
+def test_a_ladder_longer_than_the_cap_says_so_instead_of_blaming_the_clock(
+    tmp_path, caplog
+):
+    """The dropped-retry WARNING must name the real reason.
+
+    A user whose config.toml asks for a ladder longer than _RETRY_MAX_AGE has
+    their last rungs dropped by ZEUS's ceiling, not by the retry being late.
+    A message reading "its moment has passed" tells them their settings were
+    honoured when they were overridden.
+    """
+    import logging
+
+    tz = LOS_ANGELES
+    occurrence = datetime(2026, 8, 5, 11, 0, tzinfo=tz)
+    clock = FakeClock(datetime(2026, 8, 5, 21, 0, tzinfo=tz))
+    store = Store(tmp_path / "zeus.db", clock)
+
+    config = Config(root=tmp_path)
+    config.schedule.defer_retry_after = timedelta(hours=3)
+    config.schedule.max_defer_retries = 3
+
+    checkin_id = store.open_checkin("morning", occurrence, "2026-08-05")
+    store.update_checkin(
+        checkin_id, outcome="deferred", attempts=1, fired_at=occurrence,
+        retry_at=occurrence + timedelta(hours=3),
+    )
+
+    instance = Daemon(
+        config=config, store=store,
+        journal=Journal(tmp_path / "journal", clock, tz),
+        scheduler=None, presence=None, voice=None, notifier=None,
+        checkins={}, clock=clock, tz=tz,
+    )
+    with caplog.at_level(logging.WARNING, logger="zeus.daemon"):
+        instance._run_due_retries(clock.now_utc())
+
+    message = "\n".join(r.getMessage() for r in caplog.records)
+    assert "config.toml" in message and "ceiling" in message, (
+        f"the cap bit but the log blamed the clock instead: {message}"
+    )
+
+
 # ---- X3: degraded mode must notify once a check-in, not four times -------
 
 

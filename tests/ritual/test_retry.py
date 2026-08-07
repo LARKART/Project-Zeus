@@ -124,6 +124,13 @@ def test_notify_never_schedules_a_retry_at_any_attempt_count(attempts):
     A NOTIFY landing partway through a DEFER ladder (the screen unlocks into
     a Focus session) must end the retries rather than continue them: the
     cause of THIS attempt is NOTIFY, and §9.3 gives NOTIFY no retry.
+
+    Honest about which params carry the fix: only [0]-[2] do. At attempts=3
+    and 9 the ladder is already exhausted, so the PRE-FIX code returned None
+    here too and those two params would pass against the bug. They are kept
+    because "at any attempt count" is the claim being made, and a reader
+    checking the boundary should see it covered — but the guard against the
+    NOTIFY defect itself lives entirely in [0]-[2].
     """
     result = next_step(
         "evening", Verdict.NOTIFY, answered=None, attempts=attempts, config=CONFIG

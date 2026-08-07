@@ -473,10 +473,23 @@ def _install_sigterm_handler(daemon) -> None:
     The real teardown then happens in run_forever's `finally`, on a thread
     that holds no lock.
 
-    What that costs: if the main thread is mid-check-in when SIGTERM
-    arrives, shutdown waits for that conversation rather than yanking the
-    device out from under it. That is a bound on real work in flight, not a
-    deadlock, and it is the direction to err in.
+    What that costs, stated honestly rather than reassuringly: if the main
+    thread is mid-check-in when SIGTERM arrives, shutdown waits for that
+    conversation. The bound is MAX_EXCHANGES (3) x AudioConfig.listen_timeout
+    (30s) plus API latency — up to ~90 seconds, against the 20-second grace
+    period named above. So a SIGTERM mid-check-in does NOT get a tidy
+    shutdown; it reaches SIGKILL, exactly as the deadlock did. The trade is
+    still right — an UNBOUNDED deadlock in the start() window became a
+    bounded wait, and every SIGTERM outside a live check-in (nearly all of
+    them: two check-ins a day, seconds each) now shuts down cleanly where
+    none did before. But do not read this as "shutdown is now prompt in all
+    cases". Making it prompt in this case means observing _shutdown between
+    exchanges inside CheckIn._converse, which is Slice 2 work.
+
+    The consequence of that SIGKILL is small and known: PortAudio is
+    reclaimed by the OS, sqlite is isolation_level=None so every statement
+    has already committed, and at worst one `conversations` row is left
+    without its end timestamp.
 
     Failures are swallowed: raising from a signal handler would propagate
     into whatever the main thread happened to be doing, which is a worse

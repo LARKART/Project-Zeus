@@ -49,6 +49,18 @@ _RETRY_MAX_AGE = timedelta(hours=6)
 # source that fails INSTANTLY (a raising activator, say) from spinning.
 _ACTIVATION_RESTART_SECONDS = 5.0
 
+# ...and how far that wait is allowed to grow. The wait DOUBLES per restart up
+# to this ceiling, because a fault that does not clear is the common case, not
+# the rare one: a USB microphone unplugged and left out restarts every
+# _IDLE_TIMEOUT_SECONDS + _ACTIVATION_RESTART_SECONDS = 10s forever, and each
+# restart writes a WARNING. That is 8,640 lines a day, ~0.79 GB a year, into a
+# zeusd.log that nothing rotates. Backing off to five minutes cuts it ~30x
+# while leaving the FIRST failures exactly as loud and as prompt as before —
+# which is the half that matters, since a transient gap (sleep/wake, AirPods
+# taking the input) recovers on the first or second try and never reaches the
+# ceiling at all.
+_ACTIVATION_RESTART_MAX_SECONDS = 300.0
+
 # The longest the run loop may go without noticing request_stop(). launchd's
 # default grace period between SIGTERM and SIGKILL is 20 seconds, and the
 # tick loop can otherwise be a full minute from its next wake.
@@ -367,12 +379,15 @@ class Daemon:
         rungs — and capped, so one who lengthens it absurdly cannot licence a
         replay on the following day.
         """
+        return min(self._configured_ladder() + _RETRY_SLACK, _RETRY_MAX_AGE)
+
+    def _configured_ladder(self) -> timedelta:
+        """The span the configured §9.3 ladder asks for, before the cap."""
         schedule = self._config.schedule
-        ladder = max(
+        return max(
             schedule.defer_retry_after * schedule.max_defer_retries,
             schedule.no_answer_retry_after * schedule.max_no_answer_retries,
         )
-        return min(ladder + _RETRY_SLACK, _RETRY_MAX_AGE)
 
     def _settle_stale_retry(self, due, now: datetime) -> None:
         """Record a retry that outlived its ladder as skipped, and clear it.
@@ -387,11 +402,24 @@ class Daemon:
         gives: a retry that never fired is not an attempt, and attempts is
         the one column the §9.3 ladder reads.
         """
+        # Name the CAP when the cap is what bit, not §9.2 generally. A user
+        # who configured a ladder longer than _RETRY_MAX_AGE has their last
+        # rungs dropped by ZEUS's policy, not by their own configuration, and
+        # a message blaming "its moment has passed" reads as if their settings
+        # were honoured. It is the difference between a log they can act on
+        # and one that quietly contradicts their config.toml.
+        capped = self._configured_ladder() + _RETRY_SLACK > _RETRY_MAX_AGE
+        because = (
+            f"that is past the {_RETRY_MAX_AGE} ceiling ZEUS puts on a retry, "
+            f"which is shorter than your configured ladder — see "
+            f"defer_retry_after/max_defer_retries in config.toml"
+            if capped else
+            "so its moment has passed (spec §9.2)"
+        )
         log.warning(
             "retry: dropping the %s retry for the occurrence at %s — it came "
-            "due %s after that occurrence, so its moment has passed (spec "
-            "§9.2). Recording it as skipped.",
-            due.kind, due.scheduled_for, now - due.scheduled_for,
+            "due %s after that occurrence, %s. Recording it as skipped.",
+            due.kind, due.scheduled_for, now - due.scheduled_for, because,
         )
         try:
             attempts = self._store.get_checkin(due.id).attempts
@@ -457,6 +485,12 @@ class Daemon:
                 for event in self._activator.events():
                     if not self._running:
                         return
+                    # A delivered event proves the source recovered, so the
+                    # backoff starts over. Without this, a Mac that sleeps
+                    # once a day would ratchet its way to the five-minute
+                    # ceiling over a week and then take five minutes to
+                    # bring "hey jarvis" back after an ordinary lid-open.
+                    restarts = 0
                     log.info("activated via %s", event.source)
                     try:
                         self._handle_activation()
@@ -470,13 +504,17 @@ class Daemon:
             if not self._running or self._shutdown.is_set():
                 return
             restarts += 1
+            wait = min(
+                _ACTIVATION_RESTART_SECONDS * 2 ** (restarts - 1),
+                _ACTIVATION_RESTART_MAX_SECONDS,
+            )
             log.warning(
                 "%s, so wake-word activation ended; restarting it in %.0fs "
                 "(restart #%d). If this keeps repeating, run 'zeus doctor' — "
                 "the input device or the wake-word model is failing.",
-                reason, _ACTIVATION_RESTART_SECONDS, restarts,
+                reason, wait, restarts,
             )
-            if self._shutdown.wait(_ACTIVATION_RESTART_SECONDS):
+            if self._shutdown.wait(wait):
                 return
 
     def _handle_activation(self) -> None:
