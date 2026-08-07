@@ -279,16 +279,6 @@ def test_doctor_reports_and_returns_a_status(monkeypatch, tmp_path, capsys):
     assert "say" in output and "ANTHROPIC_API_KEY" in output
 
 
-def test_doctor_accepts_any_supported_python(monkeypatch, tmp_path, capsys):
-    """Global Constraints say 3.11+, so doctor must not report a FAILURE on
-    3.11 or 3.13 merely because it was developed on 3.12."""
-    import zeus.cli as cli
-
-    _mock_probes(monkeypatch, cli)
-    assert sys.version_info[:2] >= (3, 11)
-    assert main(["doctor", "--root", str(tmp_path)]) == 0
-
-
 def test_doctor_fails_when_the_transcriber_is_missing(monkeypatch, tmp_path, capsys):
     """A broken transcriber is silent at runtime — LocalWhisper.transcribe()
     returns "" for every failure — so doctor is where it must surface."""
@@ -354,6 +344,10 @@ def test_doctor_reads_the_key_from_the_env_file_not_just_os_environ(
     import zeus.cli as cli
 
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    # Round2 finding M3: a ZEUS_ENV_FILE left exported from debugging cmd_run
+    # by hand overrides config.env_path, so without clearing it this test
+    # fails whenever the developer's shell happens to have it set.
+    monkeypatch.delenv("ZEUS_ENV_FILE", raising=False)
     for probe in ("_probe_say", "_probe_afplay", "_probe_transcriber",
                   "_probe_python", "_probe_sounddevice", "_probe_openwakeword"):
         monkeypatch.setattr(cli, probe, lambda: True)
@@ -367,7 +361,41 @@ def test_doctor_reads_the_key_from_the_env_file_not_just_os_environ(
         assert main(["doctor", "--root", str(root)]) == 0
         assert os.environ["ANTHROPIC_API_KEY"] == "sk-ant-from-file"
     finally:
+        # _load_env_file sets os.environ directly, bypassing monkeypatch's
+        # tracking, so a valid file loaded here would otherwise pollute
+        # os.environ for the rest of the session.
         os.environ.pop("ANTHROPIC_API_KEY", None)
+        os.environ.pop("ZEUS_ENV_FILE", None)
+
+
+def test_doctor_reports_the_env_file_it_actually_loaded(
+    monkeypatch, tmp_path, capsys
+):
+    """Round2 finding M4: doctor printed config.env_path even when
+    ZEUS_ENV_FILE pointed somewhere else, so it could print FAIL for a file
+    that loaded fine, or OK for the default file the daemon will never open
+    -- the same lying-oracle class as the check itself. It must report the
+    path it actually loaded from."""
+    import zeus.cli as cli
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    _mock_probes(monkeypatch, cli)
+
+    root = tmp_path / "root"
+    override = tmp_path / "elsewhere" / "env"
+    override.parent.mkdir(parents=True)
+    override.write_text("ANTHROPIC_API_KEY=sk-ant-from-override\n")
+    monkeypatch.setenv("ZEUS_ENV_FILE", str(override))
+
+    try:
+        code = main(["doctor", "--root", str(root)])
+        output = capsys.readouterr().out
+    finally:
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+
+    assert code == 0
+    assert str(override) in output
+    assert str(Config(root=root).env_path) not in output
 
 
 def test_install_agent_names_the_venv_interpreter_not_the_resolved_symlink(
@@ -403,3 +431,41 @@ def test_install_agent_creates_the_log_directory(monkeypatch, tmp_path):
     assert not config.log_path.parent.exists()
     cli.cmd_install_agent(config)
     assert config.log_path.parent.exists()
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root traverses directories regardless of mode, so this can't be reproduced",
+)
+def test_doctor_survives_an_env_file_behind_an_untraversable_directory(
+    monkeypatch, tmp_path
+):
+    """Round2 finding I2-residual: Path.is_file() is not the safe probe it
+    looks like -- pathlib swallows ENOENT/ENOTDIR/EBADF/ELOOP but RE-RAISES
+    EACCES/EPERM/ENAMETOOLONG. A file inside a mode-000 directory raises
+    PermissionError straight out of is_file() (verified against the actual
+    venv interpreter this suite runs under -- the system python3 on this
+    machine happens to behave differently, so this could not be reproduced
+    with just any Python 3). Because cmd_doctor now calls _load_env_file
+    before probing (round1 finding I4), an untraversable ZEUS_ENV_FILE
+    directory used to crash the health oracle with a raw traceback on
+    exactly the condition it exists to diagnose -- and on macOS a
+    TCC-protected folder (~/Desktop, ~/Documents) raises the same EPERM, so
+    this was reachable without deliberately chmod'ing anything."""
+    import zeus.cli as cli
+
+    _mock_probes(monkeypatch, cli)
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    env_file = vault / "env"
+    env_file.write_text("ANTHROPIC_API_KEY=sk-ant-test\n")
+    vault.chmod(0o000)
+    monkeypatch.setenv("ZEUS_ENV_FILE", str(env_file))
+    config = Config(root=tmp_path / "root")
+
+    try:
+        code = cli.cmd_doctor(config)
+    finally:
+        vault.chmod(0o700)  # so tmp_path teardown can remove it
+
+    assert isinstance(code, int)

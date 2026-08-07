@@ -73,12 +73,25 @@ def _load_env_file(path: Path) -> int:
     that already exported ANTHROPIC_API_KEY behaves the same as launchd
     loading it from the file.
     """
-    # is_file(), not exists(): a directory passes exists() and then
-    # read_text() raises IsADirectoryError. ZEUS_ENV_FILE="" resolves to
-    # Path(".") and hits exactly that.
-    if not path.is_file():
-        return 0
+    # THE GUARD GOES INSIDE THE TRY. is_file() is not the safe probe it looks
+    # like: pathlib swallows only ENOENT/ENOTDIR/EBADF/ELOOP and RE-RAISES
+    # EACCES, EPERM and ENAMETOOLONG. Verified — a file inside a mode-000
+    # directory raises PermissionError straight out of is_file(). So an
+    # untraversable parent, a TCC-protected folder (a LaunchAgent statting
+    # ~/Documents gets EPERM), or a >1024-char path all escaped this function
+    # from the very line written to make it safe.
+    #
+    # Worse now that cmd_doctor calls this too: the health oracle would crash
+    # on exactly the condition it exists to diagnose, and cmd_run would
+    # crash-loop under KeepAlive:true.
+    #
+    # is_file() over exists() is still right — a directory passes exists() and
+    # then read_text() raises IsADirectoryError, and ZEUS_ENV_FILE="" resolves
+    # to Path(".") and hits that. It just has to be guarded like everything
+    # else.
     try:
+        if not path.is_file():
+            return 0
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         # A mode-000 file, a non-UTF-8 file, a dangling symlink. Degrade the
@@ -89,8 +102,10 @@ def _load_env_file(path: Path) -> int:
         return 0
     loaded = 0
     for line in text.splitlines():
-        line = line.strip().lstrip("\ufeff")     # a UTF-8 BOM would become
-        if not line or line.startswith("#") or "=" not in line:  # part of key 1
+        # A UTF-8 BOM at the top of the file would otherwise become part of
+        # the first key's name if not stripped here.
+        line = line.strip().lstrip("\ufeff")
+        if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, value = line.partition("=")
         key = key.strip()
@@ -142,6 +157,14 @@ def _probe_transcriber() -> bool:
     return importlib.util.find_spec("faster_whisper") is not None
 
 
+def _probe_env_file(path: Path) -> bool:
+    """is_file() re-raises EACCES/EPERM/ENAMETOOLONG — see _load_env_file."""
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
 def _probe_sounddevice() -> bool:
     """Hard import inside MicStream.start(); without it ZEUS cannot hear."""
     return importlib.util.find_spec("sounddevice") is not None
@@ -153,17 +176,14 @@ def _probe_openwakeword() -> bool:
 
 
 def cmd_doctor(config: Config) -> int:
-    # >= (3, 11), not == (3, 12): Global Constraints say Python 3.11+, so
-    # exact equality would report a FAILURE on 3.11 or 3.13 while ZEUS runs
-    # perfectly well on both. A doctor that lies about health is worse than
-    # no doctor.
     # Load the env file FIRST, exactly as cmd_run does. Without this, doctor
     # reads only os.environ: a key exported in ~/.zshrc makes doctor report
     # all-OK, and then the LaunchAgent — which inherits no shell environment —
     # starts with no key and fails every brain call, with one line in
     # zeusd.log as the only signal. Being blind to that is being blind to the
     # exact failure ZEUS_ENV_FILE exists to prevent.
-    _load_env_file(Path(os.environ.get("ZEUS_ENV_FILE", config.env_path)))
+    env_file = Path(os.environ.get("ZEUS_ENV_FILE", config.env_path))
+    _load_env_file(env_file)
     checks = [
         ("python", f"{sys.version_info.major}.{sys.version_info.minor}",
          _probe_python()),
@@ -174,7 +194,10 @@ def cmd_doctor(config: Config) -> int:
         ("wake word", "openwakeword", _probe_openwakeword()),
         ("zeus root", str(config.root), config.root.exists()),
         ("database", str(config.db_path), config.db_path.exists()),
-        ("env file", str(config.env_path), config.env_path.is_file()),
+        # env_file, NOT config.env_path: ZEUS_ENV_FILE overrides it, so
+        # reporting the default while having loaded the override is the same
+        # lying-oracle bug this check was added to fix.
+        ("env file", str(env_file), _probe_env_file(env_file)),
         ("afplay", "/usr/bin/afplay", _probe_afplay()),
         ("LaunchAgent", str(PLIST_PATH), PLIST_PATH.exists()),
     ]
@@ -253,18 +276,22 @@ def cmd_selftest(config: Config) -> int:
         return 1
     print(f'OK: transcription works — I heard "{heard}"')
 
-    # I3: MacSay.say() deliberately swallows every exception and never
-    # surfaces Popen.returncode (spec: a failed sentence must not abort a
-    # ritual check-in), so "OK: speech synthesis worked." used to print
-    # unconditionally -- a misspelled or uninstalled `say` voice exits 1
-    # without making a sound, and selftest reported success anyway. This is
-    # the one function no automated test can cover and detecting broken
-    # hardware is its whole purpose, so it asks instead of assuming.
     speaker = build_speaker(config.tts)
     speaker.say("ZEUS self test complete. I can hear you and you can hear me.")
+    # ASK. MacSay.say() swallows every exception and ignores the return code —
+    # deliberately, so one failed sentence cannot abort a check-in — which
+    # means nothing downstream can tell whether a sound was actually produced.
+    # A misspelled or uninstalled voice exits 1 silently, and this function's
+    # entire purpose is detecting exactly that. selftest is interactive by
+    # design, so asking is the honest oracle.
+    #
+    # RuntimeError as well as EOFError: input() raises EOFError at end of
+    # input, but RuntimeError("lost sys.stdin") when fd 0 is closed outright,
+    # as in `zeus selftest 0<&-`. Either way, treat it as "not heard" — a
+    # self-test that cannot confirm must not claim success.
     try:
         heard_it = input("Did you hear that? [y/N] ").strip().lower()
-    except EOFError:
+    except (EOFError, RuntimeError):
         heard_it = ""
     if heard_it not in ("y", "yes"):
         print(
