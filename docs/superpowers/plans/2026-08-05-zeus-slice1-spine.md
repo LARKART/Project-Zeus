@@ -28,6 +28,7 @@ Every task's requirements implicitly include this section.
 - **No automated test may require a microphone, speakers, or a network call.** Hardware checks live only in the manual `zeus selftest` command.
 - **Audio format throughout: 16 kHz, mono, `int16`.** openWakeWord consumes 1280-sample (80 ms) chunks.
 - **Every commit runs `pytest` green before being made.**
+- **Test directories carry no `__init__.py`, and `pyproject.toml` sets `addopts = ["--import-mode=importlib"]`.** These two go together and both are required. This plan gives several tasks a test file named `test_fake.py` in its own subdirectory (`tests/tts/`, `tests/stt/`, …). Under pytest's legacy `prepend` import mode, same-basename test modules in `__init__.py`-less directories collide and the suite fails to *collect at all* — `import file mismatch: imported module 'test_fake' has this __file__ attribute …`. Discovered in T10, when `tests/stt/test_fake.py` met T9's `tests/tts/test_fake.py`. `importlib` mode resolves it without `__init__.py` files and without renaming any file the plan declares.
 
 ---
 
@@ -122,7 +123,11 @@ T1 config ──┬── T2 clock ──┬── T3 store ── T4 journal
 3.12
 ```
 
-`.gitignore`:
+`.gitignore` — **already exists; verify, do not overwrite.** It was written
+before plan execution and additionally ignores `.worktrees/` and
+`.superpowers/`, which must survive. Confirm it contains every entry below
+and add any that are missing:
+
 ```
 .venv/
 __pycache__/
@@ -350,6 +355,18 @@ class Config:
     def log_path(self) -> Path:
         return self.root / "logs" / "zeusd.log"
 
+    @property
+    def env_path(self) -> Path:
+        """Where the API key lives for launchd's benefit.
+
+        NOT config.toml, and never written by ZEUS — it holds a secret, and
+        the spec says the key is environment-only. cmd_run loads this file
+        into os.environ at startup because launchd inherits no shell
+        environment; the LaunchAgent plist carries only this PATH, never the
+        key itself.
+        """
+        return self.root / "env"
+
 
 def _apply(section: Any, values: dict[str, Any]) -> None:
     """Overlay TOML values onto a dataclass, converting duration strings."""
@@ -509,7 +526,12 @@ def resolve_timezone(name: str) -> ZoneInfo:
         parts = _LOCALTIME.resolve().parts
         index = len(parts) - 1 - parts[::-1].index("zoneinfo")
         return ZoneInfo("/".join(parts[index + 1 :]))
-    except (OSError, ValueError):
+    except (OSError, ValueError, KeyError):
+        # KeyError is required, not defensive padding: ZoneInfoNotFoundError
+        # subclasses KeyError, and it is exactly what ZoneInfo() raises when
+        # the symlink resolves through a `zoneinfo` directory but the trailing
+        # segment is not a valid IANA key. Without it a malformed system
+        # timezone raises straight past the TZ and UTC fallbacks below.
         pass
     env = os.environ.get("TZ")
     if env:
@@ -528,8 +550,17 @@ def to_utc_iso(dt: datetime) -> str:
 
 
 def from_utc_iso(text: str) -> datetime:
-    """Parse an ISO-8601 string back into an aware UTC datetime."""
-    return datetime.fromisoformat(text).astimezone(timezone.utc)
+    """Parse an ISO-8601 string back into an aware UTC datetime.
+
+    Rejects naive strings rather than converting them. `.astimezone()` on a
+    naive datetime silently interprets it in the *system local* zone, which
+    would quietly mis-time any row that ever lost its offset. The write side
+    already refuses naive input; the read side must match.
+    """
+    parsed = datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        raise ValueError(f"naive timestamp rejected: {text!r}")
+    return parsed.astimezone(timezone.utc)
 
 
 class Clock(Protocol):
@@ -568,7 +599,9 @@ class FakeClock:
 - [ ] **Step 4: Run the test and verify it passes**
 
 Run: `.venv/bin/pytest tests/test_clock.py -v`
-Expected: PASS — 8 tests
+Expected: PASS — 11 tests (8 above, plus 3 covering the two fallback/rejection
+paths added in review: a malformed `/etc/localtime` degrading to UTC rather
+than raising, and `from_utc_iso` rejecting a naive string.)
 
 - [ ] **Step 5: Commit**
 
@@ -590,7 +623,7 @@ git commit -m "feat: clock abstraction and DST-aware timezone resolution"
 - Produces `Store(db_path: Path, clock: Clock)` with:
   - `set_goal(date: str, text: str) -> int`, `get_goal(date: str) -> Goal | None`
   - `update_goal(goal_id: int, status: str, notes: str | None = None) -> None`
-  - `open_checkin(kind: str, scheduled_for: datetime) -> int`
+  - `open_checkin(kind: str, scheduled_for: datetime, local_date: str) -> int` — `local_date` is explicit, never inferred from `scheduled_for`; see the docstring for why.
   - `get_checkin(checkin_id: int) -> CheckIn`, `find_open_checkin(kind, date) -> CheckIn | None`
   - `update_checkin(checkin_id: int, *, outcome: str, attempts: int, fired_at: datetime | None = None) -> None`
   - `log_action(tool, args, result, ok, duration_ms, error=None, conversation_id=None) -> int`
@@ -621,6 +654,7 @@ CREATE TABLE IF NOT EXISTS goals (
 CREATE TABLE IF NOT EXISTS checkins (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     kind          TEXT NOT NULL CHECK (kind IN ('morning','evening')),
+    local_date    TEXT NOT NULL,                 -- local YYYY-MM-DD, same convention as goals.date
     scheduled_for TEXT NOT NULL,
     fired_at      TEXT,
     outcome       TEXT NOT NULL DEFAULT 'deferred'
@@ -628,6 +662,7 @@ CREATE TABLE IF NOT EXISTS checkins (
     attempts      INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_checkins_sched ON checkins (scheduled_for);
+CREATE INDEX IF NOT EXISTS idx_checkins_local_date ON checkins (local_date, kind);
 
 CREATE TABLE IF NOT EXISTS conversations (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -734,7 +769,7 @@ def test_invalid_goal_status_rejected(store):
 
 
 def test_checkin_lifecycle(store):
-    cid = store.open_checkin("morning", START)
+    cid = store.open_checkin("morning", START, "2026-08-05")
     assert store.get_checkin(cid).outcome == "deferred"
     store.update_checkin(cid, outcome="answered", attempts=1, fired_at=START)
     checkin = store.get_checkin(cid)
@@ -821,6 +856,7 @@ class Goal:
 class CheckIn:
     id: int
     kind: str
+    local_date: str
     scheduled_for: datetime
     fired_at: datetime | None
     outcome: str
@@ -861,29 +897,54 @@ class Store:
     def __init__(self, db_path: Path, clock: Clock) -> None:
         self._clock = clock
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.connection = sqlite3.connect(db_path, isolation_level=None)
+        # check_same_thread=False because the daemon writes to this Store
+        # from TWO threads: the main thread (scheduled check-ins) and the
+        # wake-word activation thread (_handle_activation ->
+        # start_conversation). sqlite3's default binds the connection to its
+        # creating thread and raises ProgrammingError anywhere else -- and
+        # the daemon's activation loop catches Exception broadly, so the
+        # error is swallowed and EVERY wake-word conversation dies leaving
+        # nothing in the database. Verified: the wake-thread write raised
+        # "SQLite objects created in a thread can only be used in that same
+        # thread" and `select count(*) from conversations` stayed at 0.
+        #
+        # Turning the check off makes the connection usable across threads
+        # but NOT safe on its own, hence _lock below: every method that
+        # touches the connection takes it, so two threads cannot interleave.
+        # This mirrors the lock Journal.append() already carries for the
+        # exact same wiring -- the daemon hands one Journal AND one Store to
+        # both threads.
+        self.connection = sqlite3.connect(
+            db_path, isolation_level=None, check_same_thread=False
+        )
+        self._lock = threading.Lock()
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA busy_timeout = 5000")
         self.connection.executescript(_SCHEMA.read_text())
 
     def close(self) -> None:
-        self.connection.close()
+        with self._lock:
+            self.connection.close()
 
     def _now(self) -> str:
         return to_utc_iso(self._clock.now_utc())
 
     # ---- goals -------------------------------------------------------
     def set_goal(self, date: str, text: str) -> int:
-        cur = self.connection.execute(
+        # RETURNING, not cur.lastrowid: last_insert_rowid() is only updated by
+        # a real insert, so on the ON CONFLICT DO UPDATE branch lastrowid
+        # silently returns the id of whatever row was last inserted on this
+        # connection — a caller that then calls update_goal(that_id, ...)
+        # mutates an unrelated day's goal.
+        row = self.connection.execute(
             "INSERT INTO goals (date, text, set_at) VALUES (?, ?, ?) "
             "ON CONFLICT(date) DO UPDATE SET text = excluded.text, "
             "set_at = excluded.set_at, status = 'pending', "
-            "reviewed_at = NULL, notes = NULL",
+            "reviewed_at = NULL, notes = NULL "
+            "RETURNING id",
             (date, text, self._now()),
-        )
-        if cur.lastrowid:
-            return cur.lastrowid
-        return self.get_goal(date).id  # type: ignore[union-attr]
+        ).fetchone()
+        return int(row["id"])
 
     def get_goal(self, date: str) -> Goal | None:
         row = self.connection.execute(
@@ -898,16 +959,36 @@ class Store:
         )
 
     def update_goal(self, goal_id: int, status: str, notes: str | None = None) -> None:
+        # COALESCE, matching update_checkin's fired_at below: omitting the
+        # optional notes arg must not erase notes written by an earlier
+        # review. Clearing notes is still reachable — set_goal's upsert
+        # resets them to NULL.
         self.connection.execute(
-            "UPDATE goals SET status = ?, notes = ?, reviewed_at = ? WHERE id = ?",
+            "UPDATE goals SET status = ?, notes = COALESCE(?, notes), "
+            "reviewed_at = ? WHERE id = ?",
             (status, notes, self._now(), goal_id),
         )
 
     # ---- check-ins ---------------------------------------------------
-    def open_checkin(self, kind: str, scheduled_for: datetime) -> int:
+    def open_checkin(
+        self, kind: str, scheduled_for: datetime, local_date: str
+    ) -> int:
+        """Open a check-in row.
+
+        local_date is a PARAMETER, not derived from scheduled_for. An earlier
+        version inferred it via scheduled_for.date(), relying on the caller to
+        hand over a local-zone-aware datetime — but the scheduler always
+        produces UTC (cron.next_occurrence ends in .astimezone(utc)), so the
+        row was written with the UTC date while find_open_checkin searched the
+        local one. Every retry then opened a fresh row, attempts never advanced
+        past 1, both retry budgets never exhausted, and fold_forward/skipped
+        never fired. Africa/Lagos hid it — at UTC+1 the two dates coincide at
+        check-in times. Keeping the key explicit makes the write and the lookup
+        provably the same value, and keeps Store timezone-free.
+        """
         cur = self.connection.execute(
-            "INSERT INTO checkins (kind, scheduled_for) VALUES (?, ?)",
-            (kind, to_utc_iso(scheduled_for)),
+            "INSERT INTO checkins (kind, local_date, scheduled_for) VALUES (?, ?, ?)",
+            (kind, local_date, to_utc_iso(scheduled_for)),
         )
         return int(cur.lastrowid)
 
@@ -916,7 +997,33 @@ class Store:
             "SELECT * FROM checkins WHERE id = ?", (checkin_id,)
         ).fetchone()
         return CheckIn(
-            id=row["id"], kind=row["kind"],
+            id=row["id"], kind=row["kind"], local_date=row["local_date"],
+            scheduled_for=from_utc_iso(row["scheduled_for"]),
+            fired_at=_dt(row["fired_at"]), outcome=row["outcome"],
+            attempts=row["attempts"],
+        )
+
+    def find_open_checkin(self, kind: str, date: str) -> CheckIn | None:
+        """The unresolved check-in of this kind on this local date, if any.
+
+        "Open" means not yet terminal: 'answered' and 'skipped' are settled
+        outcomes, while 'deferred' and 'no_answer' are both still eligible
+        for a retry and so still count as open.
+
+        Matching on local_date rather than date(scheduled_for) is load-bearing:
+        scheduled_for is stored as UTC, and evening 21:00 at UTC-5 lands on
+        the *next* UTC day, so a UTC-date match would miss it.
+        """
+        row = self.connection.execute(
+            "SELECT * FROM checkins WHERE kind = ? AND local_date = ? "
+            "AND outcome NOT IN ('answered','skipped') "
+            "ORDER BY id DESC LIMIT 1",
+            (kind, date),
+        ).fetchone()
+        if row is None:
+            return None
+        return CheckIn(
+            id=row["id"], kind=row["kind"], local_date=row["local_date"],
             scheduled_for=from_utc_iso(row["scheduled_for"]),
             fired_at=_dt(row["fired_at"]), outcome=row["outcome"],
             attempts=row["attempts"],
@@ -1051,7 +1158,13 @@ include = ["src/zeus/**/*.py", "src/zeus/**/*.sql"]
 - [ ] **Step 5: Run the test and verify it passes**
 
 Run: `.venv/bin/pytest tests/memory/test_store.py -v`
-Expected: PASS — 10 tests
+Expected: PASS — 15 tests at the end of THIS task (10 above, plus 5 added in
+review: the interleaved
+`set_goal` upsert-id test, three `find_open_checkin` tests including the
+local-vs-UTC date test, and the `update_goal` notes-preservation test.)
+The file ends up with 17: Task 16's round-4 fix added two thread-safety
+tests, because the daemon writes to this Store from both the main thread and
+the wake-word thread.
 
 - [ ] **Step 6: Commit**
 
@@ -1141,6 +1254,7 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'zeus.memory.journal'`
 """Human-readable daily journal. See spec §6."""
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -1160,6 +1274,15 @@ class Journal:
         self._clock = clock
         self._tz = tz
         self._dir.mkdir(parents=True, exist_ok=True)
+        # append() is check-then-act: it tests for the file, writes a header
+        # if absent, then reopens for append. Two threads racing the FIRST
+        # write of a day can both see "absent", and the second write_text
+        # (mode "w") truncates the first's entry. T16's build_daemon wires
+        # the scheduler thread and the wake-word activation thread to the
+        # SAME Journal, so this is reachable, not theoretical — measured at
+        # 10 lost entries across 40 trials of 8 concurrent writers, with no
+        # error raised. The line simply is not there.
+        self._lock = threading.Lock()
 
     def _local_now(self):
         return self._clock.now_utc().astimezone(self._tz)
@@ -1168,13 +1291,14 @@ class Journal:
         return self._dir / f"{date}.md"
 
     def append(self, line: str) -> None:
-        now = self._local_now()
-        date = now.strftime("%Y-%m-%d")
-        path = self.path_for(date)
-        if not path.exists():
-            path.write_text(f"# {date}\n\n")
-        with path.open("a") as handle:
-            handle.write(f"- {now.strftime('%H:%M')} — {line}\n")
+        with self._lock:
+            now = self._local_now()
+            date = now.strftime("%Y-%m-%d")
+            path = self.path_for(date)
+            if not path.exists():
+                path.write_text(f"# {date}\n\n", encoding="utf-8")
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(f"- {now.strftime('%H:%M')} — {line}\n")
 
     def read(self, date: str) -> str:
         path = self.path_for(date)
@@ -1184,7 +1308,12 @@ class Journal:
 - [ ] **Step 4: Run the test and verify it passes**
 
 Run: `.venv/bin/pytest tests/memory/test_journal.py -v`
-Expected: PASS — 5 tests
+Expected: PASS — 6 tests (5 above, plus
+`test_concurrent_appends_do_not_lose_entries`, added in review. append() is
+check-then-act and T16's build_daemon gives the scheduler thread and the
+wake-word thread the SAME Journal: measured 10 lost entries across 40
+trials of 8 concurrent writers, silently — no error, the line is just
+absent.)
 
 - [ ] **Step 5: Commit**
 
@@ -1474,6 +1603,7 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'zeus.schedule.schedule
 """Generic recurring-job scheduler with startup catch-up. See spec §9."""
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable
@@ -1486,6 +1616,7 @@ from zeus.schedule.cron import next_occurrence, occurrences_between
 Handler = Callable[[datetime], None]
 
 _MAX_SLEEP = 60.0
+_log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -1548,8 +1679,17 @@ class Scheduler:
                 continue
             due = next_occurrence(expression, baseline, self._tz)
             if due <= now_utc:
+                # set_job_run BEFORE the handler, deliberately: the occurrence
+                # is consumed whether or not the handler succeeds. Persisting
+                # after would make a permanently-failing job re-fire on every
+                # poll. Retry policy for check-ins lives in the Task 8 state
+                # machine, not here.
                 self._store.set_job_run(name, due)
-                self._handlers[name](due)
+                try:
+                    self._handlers[name](due)
+                except Exception:
+                    # One job must never abort the sweep for the jobs after it.
+                    _log.exception("scheduled job %r failed at %s", name, due)
                 fired.append(name)
         return fired
 
@@ -1568,7 +1708,11 @@ class Scheduler:
 - [ ] **Step 4: Run the test and verify it passes**
 
 Run: `.venv/bin/pytest tests/schedule/test_scheduler.py -v`
-Expected: PASS — 7 tests
+Expected: PASS — 10 tests (7 above, plus 3 added in review: a raising handler
+must not abort the sweep; `seconds_until_next` must return a real sub-cap
+interval, not just the 60 s cap; and `same_local_day` must be pinned at a
+timestamp where the local and UTC dates genuinely diverge — 00:30 Lagos is
+23:30 UTC the previous day.)
 
 - [ ] **Step 5: Commit**
 
@@ -1810,7 +1954,11 @@ class Presence:
 - [ ] **Step 4: Run the test and verify it passes**
 
 Run: `.venv/bin/pytest tests/context/test_presence.py -v`
-Expected: PASS — 13 tests
+Expected: PASS — 12 tests (9 parametrized decision-table cases + the
+threshold-boundary test + 2 Presence tests. An earlier draft of this plan
+said 13; that was a miscount of the parametrize list, not a dropped case —
+the table above covers every row of spec §8, both DEFER precedence rules,
+and the exclusive `idle > threshold` boundary.)
 
 - [ ] **Step 5: Manually resolve risk R3 — Focus detection**
 
@@ -1920,8 +2068,24 @@ def test_no_answer_exhaustion_skips_an_evening_checkin():
 
 
 def test_notify_is_treated_as_deferred_until_acknowledged():
+    # DEFERRED but NOT retried. This originally expected a 20-minute retry,
+    # which was harmless only while Task 19 was still discarding
+    # Decision.retry_after -- see next_step() below.
     result = next_step("morning", Verdict.NOTIFY, answered=None, attempts=0, config=CONFIG)
-    assert result == Decision(Outcome.DEFERRED, timedelta(minutes=20), False)
+    assert result == Decision(Outcome.DEFERRED, None, False)
+
+
+def test_notify_does_not_schedule_a_retry():
+    result = next_step("morning", Verdict.NOTIFY, answered=None, attempts=0, config=CONFIG)
+    assert result.retry_after is None
+
+
+@pytest.mark.parametrize("attempts", [0, 1, 2, 3, 9])
+def test_notify_never_schedules_a_retry_at_any_attempt_count(attempts):
+    result = next_step(
+        "evening", Verdict.NOTIFY, answered=None, attempts=attempts, config=CONFIG
+    )
+    assert result.retry_after is None
 
 
 def test_notify_that_gets_answered_ends_the_sequence():
@@ -1959,6 +2123,9 @@ Two distinct retry paths with different causes, cadences, and limits:
 
   DEFER      user is away or the screen is locked   20 min × 3
   NO_ANSWER  ZEUS spoke into silence                30 min × 1
+
+TWO, not three. NOTIFY is deliberately absent from that list, and from
+§9.3's table — see next_step().
 
 On exhaustion a morning check-in folds forward into the evening one; an
 evening check-in is recorded as skipped, because there is nothing to fold
@@ -2013,7 +2180,30 @@ def next_step(
     if answered:
         return Decision(Outcome.ANSWERED, None, False)
 
-    if verdict in (Verdict.DEFER, Verdict.NOTIFY) and answered is None:
+    # NOTIFY IS NOT A RETRY PATH. §9.3's table names exactly two causes,
+    # DEFER and NO_ANSWER, and NOTIFY is not among them. NOTIFY used to
+    # fall through to the DEFER branch below, which was invisible while
+    # run() was still discarding Decision.retry_after — one notification
+    # per check-in. Once Task 19 wired the ladder the same fall-through
+    # became FOUR notifications twenty minutes apart, and nothing anywhere
+    # can mark a macOS notification "answered", so it always ran to
+    # exhaustion. In degraded mode DegradedPresence turns every SPEAK into
+    # NOTIFY, so that is not an edge case there but the guaranteed path:
+    # eight notifications a day until the microphone is fixed.
+    #
+    # Retrying would also be redundant rather than merely noisy: §8 says
+    # the notification "speaks on click or wake word", so the user already
+    # holds the way back in.
+    #
+    # `deferred`, not `skipped`: unanswered, not abandoned. Keeping the row
+    # non-terminal is what lets an unanswered morning fold into the evening
+    # opener — the same place an exhausted DEFER ladder ends up. Checked
+    # before the DEFER branch and without consulting `answered`, because
+    # ZEUS never spoke, so "spoke and heard nothing" cannot apply either.
+    if verdict is Verdict.NOTIFY:
+        return Decision(Outcome.DEFERRED, None, False)
+
+    if verdict is Verdict.DEFER and answered is None:
         if attempts + 1 > config.max_defer_retries:
             return _exhausted(kind, Outcome.DEFERRED)
         return Decision(Outcome.DEFERRED, config.defer_retry_after, False)
@@ -2027,7 +2217,12 @@ def next_step(
 - [ ] **Step 4: Run the test and verify it passes**
 
 Run: `.venv/bin/pytest tests/ritual/test_retry.py -v`
-Expected: PASS — 15 tests
+Expected: PASS — `test_defer_retries_up_to_three_times` is parametrized over
+3 attempt counts and `test_notify_never_schedules_a_retry_at_any_attempt_count`
+over 5, so the count is larger than the number of `def`s; count the expansion,
+not the functions. The file covers both retry paths, both exhaustion branches
+for morning and evening, every NOTIFY branch, the DB-constraint match, and a
+custom-config case.
 
 - [ ] **Step 5: Commit**
 
@@ -2087,7 +2282,7 @@ def test_invokes_say_with_the_configured_voice(monkeypatch):
     class DummyProcess:
         returncode = 0
 
-        def wait(self):
+        def wait(self, timeout=None):  # say() passes _MAX_SPEECH_SECONDS
             return 0
 
         def terminate(self):
@@ -2117,7 +2312,7 @@ def test_stop_terminates_the_running_process(monkeypatch):
     class DummyProcess:
         returncode = None
 
-        def wait(self):
+        def wait(self, timeout=None):  # say() passes _MAX_SPEECH_SECONDS
             return 0
 
         def terminate(self):
@@ -2179,6 +2374,12 @@ log = logging.getLogger(__name__)
 
 SAY = "/usr/bin/say"
 
+# A safety valve, not a deadline: say() is meant to block for as long as the
+# speech takes. 120s is ~350 spoken words at say's default rate, far beyond any
+# single ZEUS utterance, so this only fires when the audio subsystem has wedged.
+# Without it a stuck `say` would hang the ritual thread forever.
+_MAX_SPEECH_SECONDS = 120.0
+
 
 class MacSay:
     def __init__(self, voice: str = "Alex") -> None:
@@ -2190,11 +2391,24 @@ class MacSay:
             return
         try:
             self._process = subprocess.Popen([SAY, "-v", self._voice, text])
-            self._process.wait()
+            self._process.wait(timeout=_MAX_SPEECH_SECONDS)
+        except subprocess.TimeoutExpired:
+            # Must precede the broad handler: TimeoutExpired subclasses
+            # Exception, so catching it below would swallow the hang and leave
+            # the process alive. kill(), not terminate() — a process that has
+            # ignored us for two minutes has earned it.
+            log.error("TTS timed out after %ss, killing", _MAX_SPEECH_SECONDS)
+            try:
+                self._process.kill()
+            except Exception:
+                log.debug("failed to kill wedged say", exc_info=True)
         except Exception:
             log.error("TTS failed for %r", text[:60], exc_info=True)
-        finally:
-            self._process = None
+        # NOTE: no `finally: self._process = None`. An earlier draft had one,
+        # which made stop() always see None and turned its terminate() path
+        # into dead code — the plan's own test_stop_terminates_the_running_
+        # process failed against the plan's own implementation. stop() already
+        # guards on `returncode is None`, so keeping the handle is safe.
 
     def stop(self) -> None:
         process = self._process
@@ -2242,7 +2456,10 @@ def build_speaker(config: TtsConfig) -> Speaker:
 - [ ] **Step 4: Run the tests and verify they pass**
 
 Run: `.venv/bin/pytest tests/tts/ -v`
-Expected: PASS — 7 tests
+Expected: PASS — 8 tests (7 above, plus `test_a_wedged_say_is_killed_not_
+swallowed` added in review: `TimeoutExpired` subclasses `Exception`, so
+without its own handler a hung `say` was swallowed by the broad one and the
+process left running.)
 
 - [ ] **Step 5: Commit**
 
@@ -2257,6 +2474,7 @@ git commit -m "feat: Speaker protocol with macOS say and fake implementations"
 
 **Files:**
 - Create: `src/zeus/stt/__init__.py`, `src/zeus/stt/base.py`, `src/zeus/stt/local_whisper.py`, `src/zeus/stt/fake.py`
+- Modify: `pyproject.toml` — add `addopts = ["--import-mode=importlib"]` under `[tool.pytest.ini_options]`. Required, not optional: `tests/stt/test_fake.py` shares a basename with T9's `tests/tts/test_fake.py`, and with no `__init__.py` in either directory the legacy `prepend` import mode makes the whole suite fail to collect. See Global Constraints.
 - Test: `tests/stt/test_fake.py`, `tests/stt/test_local_whisper.py`
 
 **Interfaces:**
@@ -2381,6 +2599,7 @@ never leaves the device.
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -2399,6 +2618,7 @@ class LocalWhisper:
         self._compute = compute
         self._models_dir = models_dir
         self._model = None
+        self._load_lock = threading.Lock()
 
     def _load(self):
         from faster_whisper import WhisperModel
@@ -2417,7 +2637,16 @@ class LocalWhisper:
             return ""
         try:
             if self._model is None:
-                self._model = self._load()
+                # Under a lock: the daemon shares ONE transcriber between the
+                # main thread and the wake thread, and this check-then-act
+                # let both load a model at once. Measured: 4 concurrent
+                # first-calls produced 4 WhisperModel loads, each writing the
+                # same files into models_dir concurrently. Double-checked
+                # inside the lock so the common case stays lock-free after
+                # the first load.
+                with self._load_lock:
+                    if self._model is None:
+                        self._model = self._load()
             segments, _ = self._model.transcribe(
                 pcm_to_float32(pcm), language="en", beam_size=1
             )
@@ -2598,8 +2827,20 @@ log = logging.getLogger(__name__)
 
 FRAME_SAMPLES = 1280        # 80 ms at 16 kHz — openWakeWord's expected chunk
 BYTES_PER_SAMPLE = 2        # int16
-_QUEUE_MAX = 256
-_SENTINEL = object()
+_QUEUE_MAX = 256            # 20.5 s of audio
+_POLL_SECONDS = 0.1
+# How long a subscription waits on a silent device before giving up. Every
+# other capture bound in this codebase counts FRAMES, which cannot advance
+# when the callback has stopped — this is the only wall-clock backstop.
+_IDLE_TIMEOUT_SECONDS = 5.0         # how promptly frames() notices stop()
+
+# NOTE: an earlier draft signalled shutdown by pushing a module-level
+# _SENTINEL onto _queue. That deadlocked: _queue is bounded, so a blocking
+# put() on a full queue hangs stop() forever — and a full queue is exactly
+# the state after ~20 s of unconsumed audio, e.g. the half-duplex window
+# while ZEUS is speaking. It also leaked across restarts, because the
+# sentinel was never cleared, so the next frames() after a restart consumed
+# it and silently returned. Shutdown is out-of-band and now uses an Event.
 
 
 class RingBuffer:
@@ -2627,17 +2868,73 @@ class MicStream:
         self._config = config
         frames_per_second = config.sample_rate / FRAME_SAMPLES
         self._ring = RingBuffer(int(config.ring_seconds * frames_per_second))
-        self._queue: queue.Queue = queue.Queue(maxsize=_QUEUE_MAX)
+        # ONE QUEUE PER CONSUMER, not one queue for the stream. A single
+        # shared queue is a hand-off, not a fan-out: queue.get() removes the
+        # frame, so with two consumers each frame reaches exactly ONE of
+        # them. The daemon has exactly that wiring -- the wake detector
+        # iterates frames() forever on its own thread while a check-in calls
+        # frames() on the main thread -- so the detector would eat roughly
+        # half of the user's spoken answer and hand Whisper non-contiguous
+        # 80 ms chunks. Measured before the fix: 20 frames pushed, consumer A
+        # saw 20, consumer B saw 0, and ZERO frames reached both.
+        #
+        # Copy-on-write list: _on_audio runs on the real-time audio thread
+        # and must never take a lock, so subscribe/_unsubscribe REPLACE the
+        # list rather than mutating it, and _on_audio just reads the
+        # attribute once (an atomic read of an immutable list).
+        self._subscribers: list["Subscription"] = []
+        self._subscriber_lock = threading.Lock()
         self._stream = None
         self._running = False
+        self._stopping = threading.Event()
+        self._lifecycle = threading.Lock()
         self.dropped = 0
+
+    # -- fan-out -------------------------------------------------------
+    def subscribe(self) -> "Subscription":
+        """A private frame queue for one consumer.
+
+        A fresh subscription starts EMPTY, which is why utterance capture no
+        longer needs a drain() before listening: it cannot inherit the audio
+        of ZEUS's own speech, because that audio went to queues that existed
+        while ZEUS was speaking. Long-lived consumers (the wake detector)
+        still need drain(), since their queue does accumulate.
+        """
+        subscription = Subscription(self)
+        with self._subscriber_lock:
+            self._subscribers = [*self._subscribers, subscription]
+        return subscription
+
+    def _unsubscribe(self, subscription: "Subscription") -> None:
+        with self._subscriber_lock:
+            self._subscribers = [
+                s for s in self._subscribers if s is not subscription
+            ]
 
     # -- lifecycle -----------------------------------------------------
     def start(self) -> None:
-        if self._running:
-            raise RuntimeError("MicStream already running")
+        # Locked check-and-set: without it two callers can both pass the
+        # guard and each open a RawInputStream, breaking the single-owner
+        # invariant this class exists to enforce. The lock is deliberately
+        # NOT taken in _on_audio — that runs on the real-time audio thread
+        # and must never contend with a slow caller.
+        with self._lifecycle:
+            if self._running:
+                raise RuntimeError("MicStream already running")
+            self._running = True
         import sounddevice as sd
 
+        # A restarted stream must inherit neither the previous run's shutdown
+        # signal nor its stale audio. Clearing EVERY subscriber is safe here
+        # and ONLY here — but only because this runs BEFORE the device is
+        # started below, so no capture can be in flight to lose. Keep it
+        # before self._stream.start(); moving it after would make the
+        # comment a lie and open a window where a live callback's frames are
+        # discarded. Never drain stream-wide while running — that is exactly
+        # what would delete an in-flight answer.
+        self._stopping.clear()
+        for subscription in self._subscribers:
+            subscription.drain()
         self._stream = sd.RawInputStream(
             samplerate=self._config.sample_rate,
             channels=1,
@@ -2646,11 +2943,14 @@ class MicStream:
             callback=self._on_audio,
         )
         self._stream.start()
-        self._running = True
         log.info("microphone stream started at %d Hz", self._config.sample_rate)
 
     def stop(self) -> None:
-        self._running = False
+        with self._lifecycle:
+            self._running = False
+        # Set BEFORE closing the device, so a consumer blocked in frames() is
+        # released even if the close path raises.
+        self._stopping.set()
         if self._stream is not None:
             try:
                 self._stream.stop()
@@ -2658,7 +2958,6 @@ class MicStream:
             except Exception:
                 log.debug("error closing stream", exc_info=True)
             self._stream = None
-        self._queue.put(_SENTINEL)
 
     def __enter__(self) -> "MicStream":
         self.start()
@@ -2670,42 +2969,150 @@ class MicStream:
     # -- audio path ----------------------------------------------------
     def _on_audio(self, indata, frames, time_info, status) -> None:
         """sounddevice callback. Must never raise — it runs on the audio thread."""
+        if self._stopping.is_set():
+            # Shutdown signalled: stop feeding the queue. frames() ends by
+            # draining to empty, so a producer still pushing after stop()
+            # starves it of that observation and hangs the consumer. The
+            # device close in stop() is best-effort and swallows exceptions,
+            # so we cannot assume the callback has actually ceased.
+            # Event.is_set() is a cheap non-blocking read — safe here.
+            return
         if status:
             log.debug("audio status: %s", status)
         frame = bytes(indata)
         self._ring.push(frame)
-        try:
-            self._queue.put_nowait(frame)
-        except queue.Full:
-            self.dropped += 1
+        # Broadcast: every subscriber gets its OWN copy of every frame.
+        # Read the list once into a local — subscribe() may replace the
+        # attribute concurrently, and iterating the local keeps this loop
+        # over a stable snapshot without a lock.
+        for subscription in self._subscribers:
+            try:
+                subscription._queue.put_nowait(frame)
+            except queue.Full:
+                subscription.dropped += 1
+                self.dropped += 1
 
     def frames(self) -> Iterator[bytes]:
-        """Blocking iterator over live frames. Ends when stop() is called."""
-        while True:
-            item = self._queue.get()
-            if item is _SENTINEL:
-                return
-            yield item
+        """One-off subscription for a single consumer, closed on exit.
+
+        Convenience for consumers that iterate once and stop — utterance
+        capture and the audio self-test. The wake detector must NOT use this:
+        it needs a stable handle so unmute() can drain its own queue, so it
+        calls subscribe() and holds the Subscription.
+        """
+        with self.subscribe() as subscription:
+            yield from subscription.frames()
 
     def pre_roll(self) -> bytes:
         """Audio captured just before now — prepended to a new utterance."""
         return self._ring.snapshot()
 
+
+class Subscription:
+    """One consumer's private view of the microphone.
+
+    Holds its own queue, so what this consumer reads is unaffected by any
+    other consumer's reads. Closing it unregisters the queue — without that,
+    every finished check-in would leave a queue behind that _on_audio keeps
+    filling forever.
+    """
+
+    def __init__(self, mic: MicStream) -> None:
+        self._mic = mic
+        self._queue: queue.Queue = queue.Queue(maxsize=_QUEUE_MAX)
+        self.dropped = 0
+
+    def frames(self) -> Iterator[bytes]:
+        """Blocking iterator over live frames. Ends when stop() is called.
+
+        Polls with a short timeout rather than blocking indefinitely, so
+        stop() is observed promptly without anything having to be pushed
+        onto the queue.
+
+        The stop check sits in the `Empty` branch, NOT at the top of the
+        loop: this is drain-then-stop, not abandon-on-stop. Checking eagerly
+        would discard frames already queued when stop() was called, which is
+        what test_frames_iterator_yields_pushed_audio pins. Termination is
+        guaranteed by _on_audio refusing to push once _stopping is set —
+        the two halves only work together.
+        """
+        idle = 0.0
+        while True:
+            try:
+                yield self._queue.get(timeout=_POLL_SECONDS)
+                idle = 0.0
+            except queue.Empty:
+                if self._mic._stopping.is_set():
+                    return
+                # WALL-CLOCK IDLE BOUND. Without this the iterator waits
+                # forever for a device that has stopped delivering, and every
+                # bound above it is a FRAME COUNT that only advances when a
+                # frame actually arrives — so listen()'s 30s timeout can
+                # never fire. Measured: 10 frames delivered, callback then
+                # silenced, and listen() was still parked indefinitely; the
+                # daemon's tick loop runs on that thread, so the heartbeat
+                # stopped, no further check-in fired, and the wake word
+                # stayed muted at depth 1. The process stays alive, so
+                # launchd's KeepAlive never notices.
+                #
+                # CoreAudio stops calling back without closing the stream on
+                # ordinary events: sleep/wake, a default-input change when
+                # AirPods connect, a USB mic unplug, a coreaudiod restart.
+                #
+                # 5s is ~62 missed 80ms frames — far beyond any normal gap,
+                # since frames arrive during silence too (the endpointer
+                # needs them to detect the end of an utterance). Ending the
+                # iterator makes capture_utterance return what it has; the
+                # check-in records NO_ANSWER and retries, which is the
+                # already-designed path for "heard nothing".
+                idle += _POLL_SECONDS
+                if idle >= _IDLE_TIMEOUT_SECONDS:
+                    log.error(
+                        "no audio for %.0fs — the input device stopped "
+                        "delivering. Ending capture so the daemon keeps "
+                        "running; run 'zeus doctor'.", _IDLE_TIMEOUT_SECONDS,
+                    )
+                    return
+
     def drain(self) -> None:
-        """Discard queued frames, e.g. after ZEUS finishes speaking."""
+        """Discard THIS consumer's queued frames.
+
+        Only the caller's own queue: draining every subscriber would let the
+        wake detector's unmute() wipe the audio of an in-flight check-in
+        answer, which is the bug the fan-out exists to prevent.
+        """
         while True:
             try:
                 self._queue.get_nowait()
             except queue.Empty:
                 return
+
+    def close(self) -> None:
+        self._mic._unsubscribe(self)
+
+    def __enter__(self) -> "Subscription":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.close()
 ```
 
 Create `src/zeus/audio/__init__.py` (empty).
 
+**Testing the shutdown path safely:** the three shutdown/restart tests must
+never `join()` a thread without a timeout. Run `stop()` (or the `frames()`
+consumer) in a `daemon=True` thread and assert on `Event.wait(2)`. A
+regression in this exact area is a *hang*, and an unguarded join turns one
+failing test into a suite that never finishes.
+
 - [ ] **Step 4: Run the test and verify it passes**
 
 Run: `.venv/bin/pytest tests/audio/test_mic.py -v`
-Expected: PASS — 8 tests
+Expected: PASS — 12 tests (8 above, plus 4 added in review: stop() must not
+block on a full queue; frames() must terminate after stop() with an empty
+queue; a restart must not inherit the previous run's stop signal; and
+frames() must still terminate when the audio callback keeps firing after
+stop(), which is reachable because stop()'s device close is best-effort.)
 
 - [ ] **Step 5: Commit**
 
@@ -3019,9 +3426,15 @@ def test_muting_suppresses_detection(monkeypatch):
 def test_unmute_restores_detection(monkeypatch):
     activator = _wake_activator(monkeypatch, [0.9], 1)
     activator.start()
+    # events() is created BEFORE muting, as in production: the detector runs
+    # continuously and is already live long before ZEUS ever speaks. An
+    # earlier draft muted and unmuted before events() existed, which forced
+    # unmute()'s mic.drain() to be deleted to make it pass — reintroducing
+    # self-triggering. See the unmute() docstring below.
+    events = activator.events()
     activator.mute()
     activator.unmute()
-    assert [e.source for e in activator.events()] == ["wake"]
+    assert [e.source for e in events] == ["wake"]
 
 
 def test_factory_builds_wake_word_activator():
@@ -3158,6 +3571,11 @@ class WakeWordActivator:
         self._model = None
         self._muted = False
         self._running = False
+        # Set while events() is iterating; unmute() drains through it.
+        self._subscription = None
+        # Depth, not a flag: mute windows nest across two threads.
+        self._mute_depth = 0
+        self._mute_lock = threading.Lock()
 
     def _load_model(self):
         import openwakeword
@@ -3176,17 +3594,88 @@ class WakeWordActivator:
         self._running = False
 
     def mute(self) -> None:
-        """Suppress detection while ZEUS is speaking (spec §7.3, half-duplex)."""
-        self._muted = True
+        """Suppress detection while ZEUS is speaking (spec §7.3, half-duplex).
+
+        A DEPTH COUNTER, not a boolean. The daemon shares one VoiceIO and
+        one activator between the main thread (scheduled check-ins) and the
+        wake thread (ad-hoc conversations), and they overlap in practice:
+        the user says "hey zeus" at 08:59:55, listen() mutes and opens a
+        window of up to 30s; the morning check-in fires at 09:00:00 on the
+        main thread, speaks its opener, and its `finally: unmute()` clears
+        the mute while the wake thread is STILL capturing. Reproduced: the
+        detector scored 5 of 5 frames of the user's in-flight answer. With
+        a counter, the inner unmute decrements to 1 and the detector stays
+        muted until the outer window closes.
+
+        BOTH WRITES GO INSIDE THE LOCK. An earlier version of this snippet
+        incremented the depth under the lock and then set _muted outside
+        it, which loses a race: thread A increments 0->1 and releases the
+        lock; before A sets _muted, thread B's unmute() takes the lock,
+        decrements 1->0, sees no window open, sets _muted = False and
+        returns; A then sets _muted = True. The result is depth 0 with
+        _muted True — nobody holds a mute, but events() reads _muted, so
+        the wake word is DEAF until some later matched mute/unmute pair
+        happens to clear it. Reproduced deterministically by pausing A
+        between the lock release and the write.
+        """
+        with self._mute_lock:
+            self._mute_depth += 1
+            self._muted = True
 
     def unmute(self) -> None:
-        self._muted = False
-        self._mic.drain()
+        """Re-enable detection after ZEUS has finished speaking.
+
+        The drain is load-bearing, not tidiness. It is tempting to remove it
+        by arguing that events() keeps pulling frames and skipping them
+        while muted — but events() is a generator, and mid-conversation it
+        is SUSPENDED at its yield, consuming nothing. The queue therefore
+        fills with ZEUS's own voice, and without this drain the detector
+        scores all of it on resume and re-triggers itself. Measured against
+        a build with the drain removed: 51 frames of self-audio queued, all
+        51 scored after unmute. drain() on an empty queue is a no-op, so
+        unmute() without a prior mute() stays safe.
+
+        Drains THIS detector's own subscription, never the whole stream: a
+        scheduled check-in capturing an answer on the main thread holds its
+        own subscription, and a stream-wide drain would delete the user's
+        in-flight reply.
+
+        Only the OUTERMOST unmute actually unmutes — see mute() for why.
+
+        Clamped at zero as DEFENCE IN DEPTH, not because anything emits a
+        stray unmute today: both call sites (VoiceIO.speak and
+        VoiceIO.listen) run mute() immediately before a try/finally that
+        unmutes, and no activator defines unmute without mute, so the
+        `if unmute:` guard never fires unpaired. An earlier version of this
+        docstring claimed VoiceIO "calls unmute() in a finally whether or
+        not the paired mute() ran" — that is false, and worth correcting
+        rather than deleting: without the clamp, ONE stray unmute would
+        leave the depth at -1 and the next nested window would unwind a
+        level early, unmuting while an outer window is still open.
+        """
+        with self._mute_lock:
+            self._mute_depth = max(0, self._mute_depth - 1)
+            if self._mute_depth > 0:
+                return
+            self._muted = False
+        if self._subscription is not None:
+            self._subscription.drain()
 
     def events(self) -> Iterator[ActivationEvent]:
         if self._model is None:
             self._model = self._load_model()
-        for frame in self._mic.frames():
+        # subscribe() rather than mic.frames(): the detector is a long-lived
+        # consumer that needs a stable handle for unmute() to drain. Closing
+        # it on exit stops _on_audio filling a queue nobody reads.
+        with self._mic.subscribe() as subscription:
+            self._subscription = subscription
+            try:
+                yield from self._detect(subscription)
+            finally:
+                self._subscription = None
+
+    def _detect(self, subscription) -> Iterator[ActivationEvent]:
+        for frame in subscription.frames():
             if not self._running:
                 return
             if self._muted:
@@ -3204,7 +3693,11 @@ class WakeWordActivator:
 - [ ] **Step 4: Run the test and verify it passes**
 
 Run: `.venv/bin/pytest tests/audio/test_activator.py -v`
-Expected: PASS — 10 tests
+Expected: PASS — 10 tests (the Step 1 file collects 9; an earlier draft said
+10, miscounting. The tenth is `test_unmute_discards_audio_captured_while_speaking`,
+added in review to pin *why* unmute() drains — without it nothing
+distinguishes the correct implementation from one that lets ZEUS hear its
+own voice and re-trigger.)
 
 - [ ] **Step 5: Commit**
 
@@ -3227,9 +3720,10 @@ git commit -m "feat: wake-word and hotkey activators with half-duplex muting"
   - `SYSTEM_PROMPT: str`, `MORNING_OPENER: str`, `EVENING_OPENER(goal_text: str) -> str`, `FOLDED_OPENER: str`
   - `split_sentences(buffer: str) -> tuple[list[str], str]` — pure; returns complete sentences plus the unflushed remainder.
   - `logged_tool(store, conversation_id, name, fn) -> Callable` — wraps a tool callable so every invocation writes an `actions` row with timing and success, and returns `is_error`-shaped text on failure.
-  - `build_tools(store, journal, conversation_id, local_date) -> list` — the `@beta_tool` functions for Slice 1: `save_goal`, `record_outcome`.
+  - `build_tool_callables(store, journal, conversation_id, local_date) -> dict[str, Callable]` — the action-logged **plain** callables, keyed by tool name. Returned separately from `build_tools` so tests and `FakeConversation` can invoke the real tool bodies without depending on what the `@beta_tool` decorator does to `__name__` or to direct callability — neither is guaranteed by the SDK.
+  - `build_tools(store, journal, conversation_id, local_date) -> list` — the `@beta_tool`-decorated functions handed to the Tool Runner: `save_goal`, `record_outcome`. Thin wrappers over `build_tool_callables`.
   - `Conversation(client, config, store, journal, conversation_id, system, tools)` with `send(text: str) -> Iterator[str]` yielding **sentences** for TTS.
-  - `FakeConversation(script: dict[str, list[str]])` — same `send` shape; used by Tasks 15 and 18.
+  - `FakeConversation(script=None, tools=None, tool_calls=None)` — same `send` shape, and can invoke **real** tool callables so an end-to-end test exercises brain → tool → action log → database without a network call. `tools` is the dict from `build_tool_callables`; `tool_calls[i]` is the list of `(name, kwargs)` to invoke on the i-th `send()`. Exposes `sent` and `invoked`. Used by Tasks 15 and 18.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -3245,7 +3739,16 @@ from zeus.brain.prompts import (
 
 
 def test_system_prompt_is_long_enough_to_cache():
-    """Opus 5's prompt-cache minimum is 512 tokens; ~4 chars/token."""
+    """Opus 5's prompt-cache minimum is 512 tokens.
+
+    2048 chars is a deliberately conservative proxy. Measured against the
+    live count_tokens endpoint, the shipped 2049-char prompt is ~640 tokens
+    — about 3.2 chars/token, not the 4 this threshold assumes — so the real
+    floor is nearer 1640 chars and this test leaves ~25% headroom. Below the
+    minimum a cache_control marker does not error; it silently no-ops with
+    cache_creation_input_tokens: 0, which is why this is pinned by a test at
+    all rather than left to inspection.
+    """
     assert len(SYSTEM_PROMPT) > 2048
 
 
@@ -3291,7 +3794,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from zeus.brain.tools import build_tools, logged_tool
+from zeus.brain.tools import build_tool_callables, build_tools, logged_tool
 from zeus.clock import FakeClock
 from zeus.memory.journal import Journal
 from zeus.memory.store import Store
@@ -3338,7 +3841,7 @@ def test_logged_tool_captures_failures_without_raising(wiring):
 
 def test_save_goal_writes_goal_and_journal(wiring):
     store, journal, conv = wiring
-    tools = {t.__name__: t for t in build_tools(store, journal, conv, "2026-08-05")}
+    tools = build_tool_callables(store, journal, conv, "2026-08-05")
     tools["save_goal"](text="Finish the auth flow")
 
     assert store.get_goal("2026-08-05").text == "Finish the auth flow"
@@ -3348,7 +3851,7 @@ def test_save_goal_writes_goal_and_journal(wiring):
 
 def test_record_outcome_updates_status(wiring):
     store, journal, conv = wiring
-    tools = {t.__name__: t for t in build_tools(store, journal, conv, "2026-08-05")}
+    tools = build_tool_callables(store, journal, conv, "2026-08-05")
     tools["save_goal"](text="Ship it")
     tools["record_outcome"](status="partial", notes="tests missing")
 
@@ -3359,7 +3862,7 @@ def test_record_outcome_updates_status(wiring):
 
 def test_record_outcome_without_a_goal_is_reported_not_raised(wiring):
     store, journal, conv = wiring
-    tools = {t.__name__: t for t in build_tools(store, journal, conv, "2026-08-05")}
+    tools = build_tool_callables(store, journal, conv, "2026-08-05")
     result = tools["record_outcome"](status="done")
     assert "no goal" in result.lower()
     assert store.recent_actions()[0].ok is True
@@ -3367,11 +3870,20 @@ def test_record_outcome_without_a_goal_is_reported_not_raised(wiring):
 
 def test_record_outcome_rejects_an_invalid_status(wiring):
     store, journal, conv = wiring
-    tools = {t.__name__: t for t in build_tools(store, journal, conv, "2026-08-05")}
+    tools = build_tool_callables(store, journal, conv, "2026-08-05")
     tools["save_goal"](text="Ship it")
     result = tools["record_outcome"](status="banana")
     assert "banana" in result
     assert store.get_goal("2026-08-05").status == "pending"
+
+
+def test_callables_and_decorated_tools_cover_the_same_surface(wiring):
+    """build_tools wraps exactly the callables build_tool_callables exposes."""
+    store, journal, conv = wiring
+    assert set(build_tool_callables(store, journal, conv, "2026-08-05")) == {
+        "save_goal", "record_outcome",
+    }
+    assert len(build_tools(store, journal, conv, "2026-08-05")) == 2
 ```
 
 `tests/brain/test_conversation.py`:
@@ -3399,9 +3911,15 @@ class StubEvent:
 
 
 class StubStream:
-    def __init__(self, chunks, stop_reason="end_turn"):
+    def __init__(self, chunks, stop_reason="end_turn", content=None):
         self._chunks = chunks
         self._stop_reason = stop_reason
+        # `content` defaults to [] so existing tests are unaffected, but it
+        # MUST be settable: an earlier draft hardcoded [], which made a
+        # malformed multi-round history structurally indistinguishable from a
+        # well-formed one and hid a Critical defect. A round that used a tool
+        # needs a real tool_use block here.
+        self._content = content if content is not None else []
 
     def __iter__(self):
         return iter(StubEvent(c) for c in self._chunks)
@@ -3409,13 +3927,27 @@ class StubStream:
     def get_final_message(self):
         return type("M", (), {
             "stop_reason": self._stop_reason,
-            "content": [],
+            "content": self._content,
             "stop_details": None,
         })()
 
 
 class StubClient:
     def __init__(self, streams):
+        """streams[i] is turn i's response.
+
+        A bare StubStream means that turn is a single round. A LIST of
+        StubStreams means the Tool Runner yielded several rounds within that
+        one turn — model call, tool execution, model call again — which is
+        what the real runner does whenever a tool is used.
+
+        An earlier draft returned the whole list on every call, conflating
+        "later turns" with "more rounds in this turn". A two-turn test then
+        had both streams consumed inside the FIRST send(), so
+        test_history_accumulates_across_turns saw
+        [user, assistant, assistant, user] and failed against the plan's own
+        Conversation.
+        """
         self._streams = streams
         self.calls = []
         beta = type("B", (), {})()
@@ -3424,7 +3956,10 @@ class StubClient:
 
     def _tool_runner(self, **kwargs):
         self.calls.append(kwargs)
-        return iter(self._streams)
+        turn = self._streams[len(self.calls) - 1]
+        # IndexError on more calls than turns is deliberate: loud beats a
+        # silent replay of an earlier turn's stream.
+        return iter(turn if isinstance(turn, list) else [turn])
 
 
 @pytest.fixture
@@ -3504,6 +4039,20 @@ def test_history_accumulates_across_turns(wiring):
     assert [m["role"] for m in second_call] == ["user", "assistant", "user"]
 
 
+def test_a_single_turn_can_span_several_tool_runner_rounds(wiring):
+    """The real runner yields one stream per round whenever a tool is used;
+    send() must surface sentences from every round, not just the first.
+
+    Added in review: fixing StubClient to hand out one turn per call would
+    otherwise have left this path — the whole reason send() iterates the
+    runner rather than reading a single response — with no coverage at all.
+    """
+    client = StubClient([[StubStream(["Saving that."]), StubStream(["Done."])]])
+    assert list(_conversation(client, wiring).send("[morning]")) == [
+        "Saving that.", "Done.",
+    ]
+
+
 def test_fake_conversation_replays_a_script():
     fake = FakeConversation({"[morning]": ["Morning.", "What's the goal?"]})
     assert list(fake.send("[morning]")) == ["Morning.", "What's the goal?"]
@@ -3513,6 +4062,52 @@ def test_fake_conversation_replays_a_script():
 def test_fake_conversation_falls_back_for_unscripted_input():
     fake = FakeConversation({})
     assert list(fake.send("anything")) == ["Got it."]
+
+
+def test_fake_conversation_invokes_real_tools(wiring):
+    """This is what lets the end-to-end test prove the real tool path."""
+    from zeus.brain.tools import build_tool_callables
+
+    store, journal, conv = wiring
+    tools = build_tool_callables(store, journal, conv, "2026-08-05")
+    fake = FakeConversation(
+        tools=tools,
+        tool_calls=[[("save_goal", {"text": "Finish the auth flow"})]],
+    )
+
+    list(fake.send("[morning]"))
+
+    assert store.get_goal("2026-08-05").text == "Finish the auth flow"
+    assert store.recent_actions()[0].tool == "save_goal"
+    assert fake.invoked == [("save_goal", {"text": "Finish the auth flow"})]
+
+
+def test_fake_conversation_invokes_tools_per_turn(wiring):
+    from zeus.brain.tools import build_tool_callables
+
+    store, journal, conv = wiring
+    tools = build_tool_callables(store, journal, conv, "2026-08-05")
+    fake = FakeConversation(
+        tools=tools,
+        tool_calls=[
+            [("save_goal", {"text": "Ship it"})],
+            [],
+            [("record_outcome", {"status": "done"})],
+        ],
+    )
+
+    list(fake.send("turn one"))
+    list(fake.send("turn two"))
+    list(fake.send("turn three"))
+
+    assert [name for name, _ in fake.invoked] == ["save_goal", "record_outcome"]
+    assert store.get_goal("2026-08-05").status == "done"
+
+
+def test_fake_conversation_rejects_an_unknown_tool():
+    fake = FakeConversation(tools={}, tool_calls=[[("nope", {})]])
+    with pytest.raises(KeyError, match="nope"):
+        list(fake.send("x"))
 ```
 
 - [ ] **Step 2: Run the tests and verify they fail**
@@ -3662,16 +4257,16 @@ def logged_tool(
     return wrapper
 
 
-def build_tools(
+def build_tool_callables(
     store: Store, journal: Journal, conversation_id: int, local_date: str
-) -> list[Callable]:
-    """The Slice 1 tool surface.
+) -> dict[str, Callable]:
+    """The action-logged tool bodies, keyed by tool name.
 
-    Deliberately tiny — two tools. Their purpose is to make the Tool Runner
-    path real from day one so later slices add tools to a working mechanism
-    rather than building the mechanism alongside their first tool.
+    Kept separate from `build_tools` so tests and FakeConversation can call
+    the real bodies directly. Depending on the @beta_tool decorator to
+    preserve __name__ or to stay callable is an SDK-internals assumption
+    this codebase does not make.
     """
-    from anthropic import beta_tool
 
     def _save_goal(text: str) -> str:
         store.set_goal(local_date, text)
@@ -3691,10 +4286,26 @@ def build_tools(
         journal.append(f"Outcome: {status}" + (f" — {notes}" if notes else ""))
         return f"Recorded today's goal as {status}."
 
-    save_wrapped = logged_tool(store, conversation_id, "save_goal", _save_goal)
-    outcome_wrapped = logged_tool(
-        store, conversation_id, "record_outcome", _record_outcome
-    )
+    return {
+        "save_goal": logged_tool(store, conversation_id, "save_goal", _save_goal),
+        "record_outcome": logged_tool(
+            store, conversation_id, "record_outcome", _record_outcome
+        ),
+    }
+
+
+def build_tools(
+    store: Store, journal: Journal, conversation_id: int, local_date: str
+) -> list[Callable]:
+    """The Slice 1 tool surface, decorated for the Tool Runner.
+
+    Deliberately tiny — two tools. Their purpose is to make the Tool Runner
+    path real from day one so later slices add tools to a working mechanism
+    rather than building the mechanism alongside their first tool.
+    """
+    from anthropic import beta_tool
+
+    callables = build_tool_callables(store, journal, conversation_id, local_date)
 
     @beta_tool
     def save_goal(text: str) -> str:
@@ -3703,7 +4314,7 @@ def build_tools(
         Args:
             text: The goal, in the user's own words, as concretely as they gave it.
         """
-        return save_wrapped(text=text)
+        return callables["save_goal"](text=text)
 
     @beta_tool
     def record_outcome(status: str, notes: str = "") -> str:
@@ -3713,7 +4324,7 @@ def build_tools(
             status: One of "done", "partial", "missed", or "carried".
             notes: Optional short detail the user gave, in their own words.
         """
-        return outcome_wrapped(status=status, notes=notes or None)
+        return callables["record_outcome"](status=status, notes=notes or None)
 
     return [save_goal, record_outcome]
 ```
@@ -3775,6 +4386,7 @@ class Conversation:
 
         buffer = ""
         spoken: list[str] = []
+        final_content = None
         try:
             runner = self._client.beta.messages.tool_runner(
                 model=self._config.model,
@@ -3815,15 +4427,33 @@ class Conversation:
                     yield REFUSAL_LINE
                     buffer = ""
                     break
-                self._messages.append(
-                    {"role": "assistant", "content": final.content}
-                )
+                # Keep only the LAST round's content, appended once after the
+                # loop. Appending per round produced consecutive assistant
+                # messages carrying an unresolved tool_use with no
+                # tool_result, which the API rejects with a 400 on the NEXT
+                # send() — and the broad except below then reported a fake
+                # outage right after the tool had actually succeeded. The
+                # evening check-in hits exactly that shape: record_outcome
+                # fires, then ZEUS asks whether to carry the goal forward.
+                #
+                # Safe because the runner COPIES the list we pass
+                # (`messages = list(self._params["messages"])` in anthropic
+                # 0.120.2) and resolves tool_use/tool_result internally. What
+                # we keep here is only what the NEXT turn replays, and one
+                # closing assistant message per turn keeps role alternation
+                # valid by construction — without reading SDK internals.
+                final_content = final.content
 
         except Exception:
             log.error("conversation failed", exc_info=True)
             yield ERROR_LINE
             spoken.append(ERROR_LINE)
             buffer = ""
+
+        if final_content is not None:
+            self._messages.append(
+                {"role": "assistant", "content": final_content}
+            )
 
         remainder = buffer.strip()
         if remainder:
@@ -3838,19 +4468,47 @@ class Conversation:
 
 `src/zeus/brain/fake.py`:
 ```python
-"""Conversation test double. Replays a script; never touches the network."""
+"""Conversation test double. Replays a script; never touches the network.
+
+Can also invoke real tool callables, so an end-to-end test exercises the
+genuine brain -> tool -> action log -> database path instead of writing the
+data it then asserts on.
+"""
 from __future__ import annotations
 
-from typing import Iterator
+from typing import Callable, Iterator
+
+ToolCall = tuple[str, dict]
 
 
 class FakeConversation:
-    def __init__(self, script: dict[str, list[str]] | None = None) -> None:
+    def __init__(
+        self,
+        script: dict[str, list[str]] | None = None,
+        tools: dict[str, Callable] | None = None,
+        tool_calls: list[list[ToolCall]] | None = None,
+    ) -> None:
         self._script = script or {}
+        self._tools = tools or {}
+        self._tool_calls = list(tool_calls or [])
         self.sent: list[str] = []
+        self.invoked: list[ToolCall] = []
 
     def send(self, text: str) -> Iterator[str]:
+        turn = len(self.sent)
         self.sent.append(text)
+
+        planned = self._tool_calls[turn] if turn < len(self._tool_calls) else []
+        for name, kwargs in planned:
+            tool = self._tools.get(name)
+            if tool is None:
+                raise KeyError(
+                    f"FakeConversation was asked to call {name!r} but was given "
+                    f"only {sorted(self._tools)}"
+                )
+            tool(**kwargs)
+            self.invoked.append((name, kwargs))
+
         for sentence in self._script.get(text, ["Got it."]):
             yield sentence
 ```
@@ -3876,7 +4534,12 @@ __all__ = [
 - [ ] **Step 6: Run the tests and verify they pass**
 
 Run: `.venv/bin/pytest tests/brain/ -v`
-Expected: PASS — 23 tests
+Expected: PASS — 29 tests (27 above, plus two added in review:
+`test_a_single_turn_can_span_several_tool_runner_rounds`, alongside the
+StubClient fix so the multi-round path keeps coverage; and
+`test_a_tool_using_turn_leaves_history_alternating`, which pins the Critical
+— per-round appends produced consecutive assistant messages with a dangling
+tool_use, which the API rejects with a 400 on the next send().)
 
 - [ ] **Step 7: Commit**
 
@@ -4159,14 +4822,50 @@ class VoiceIO:
                 unmute()
 
     def listen(self) -> str:
-        frames_per_second = self._config.sample_rate / FRAME_SAMPLES
-        timeout_frames = int(
-            self._config.listen_timeout.total_seconds() * frames_per_second
-        )
-        audio = capture_utterance(
-            self._mic.frames(), self._endpointer,
-            pre_roll=b"", listen_timeout_frames=timeout_frames,
-        )
+        """Capture one utterance with the wake detector held muted.
+
+        No drain() is needed any more: mic.frames() opens a FRESH
+        subscription whose queue starts empty, so it cannot inherit the
+        audio of ZEUS's own speech the way the old single shared queue
+        could. That also fixes it for HotkeyActivator, which has no
+        mute/unmute at all — the emptiness is structural now, not something
+        an activator has to remember to do.
+
+        The mute is the other half of the fan-out fix. Once every consumer
+        gets its own copy of every frame, the detector no longer steals the
+        user's answer — but it now HEARS all of it, and a "hey zeus" spoken
+        mid-answer would launch an ad-hoc conversation on top of the running
+        check-in. Muting for the whole listen window closes that. speak()
+        mutes for its own duration; this covers the rest of the turn.
+        """
+        mute = getattr(self._activator, "mute", None)
+        unmute = getattr(self._activator, "unmute", None)
+        if mute:
+            mute()
+        try:
+            frames_per_second = self._config.sample_rate / FRAME_SAMPLES
+            timeout_frames = int(
+                self._config.listen_timeout.total_seconds() * frames_per_second
+            )
+            audio = capture_utterance(
+                # A FRESH Endpointer PER CAPTURE. One shared instance was
+                # mutable state across two threads: the daemon builds one
+                # VoiceIO and hands it to both the wake thread
+                # (_handle_activation) and every CheckIn on the main thread,
+                # and capture_utterance calls reset()/feed() on it and reads
+                # saw_speech after the loop. Two overlapping captures
+                # double-counted the same silence — an utterance ended after
+                # 10 frames instead of 19, cutting the user off mid-sentence
+                # — and a reset() landing between the other capture's loop
+                # exit and its saw_speech check made a complete answer come
+                # back empty, recorded as NO_ANSWER. Endpointer is cheap and
+                # stateless at construction; sharing it bought nothing.
+                self._mic.frames(), Endpointer(self._config),
+                pre_roll=b"", listen_timeout_frames=timeout_frames,
+            )
+        finally:
+            if unmute:
+                unmute()
         if not audio:
             return ""
         return self._transcriber.transcribe(audio, self._config.sample_rate)
@@ -4197,16 +4896,23 @@ class CheckIn:
         return EVENING_OPENER(goal.text) if goal else FOLDED_OPENER
 
     def _find_or_open(self, scheduled_for: datetime) -> int:
-        """Reuse the open check-in row so attempts accumulate across retries."""
+        """Reuse today's open check-in row so attempts accumulate across retries.
+
+        Goes through Store.find_open_checkin rather than raw SQL. That method
+        matches on the stored local_date, which matters twice: scheduled_for is
+        stored as UTC (so a UTC-date match would miss an evening check-in in a
+        western timezone), and the match is for THIS date only — an unresolved
+        check-in left over from a previous day must not be reused, or today's
+        first attempt would inherit yesterday's attempt count and could exhaust
+        its retries before it has run once.
+        """
         date = local_date(scheduled_for, self._tz)
-        for row in self._store.connection.execute(
-            "SELECT id FROM checkins WHERE kind = ? AND outcome IN "
-            "('deferred','no_answer') AND date(scheduled_for) <= ? "
-            "ORDER BY id DESC LIMIT 1",
-            (self._kind, date),
-        ):
-            return row["id"]
-        return self._store.open_checkin(self._kind, scheduled_for)
+        existing = self._store.find_open_checkin(self._kind, date)
+        if existing is not None:
+            return existing.id
+        # Same `date` for the write as for the lookup. That identity is the
+        # whole point — deriving it twice is exactly how they drifted apart.
+        return self._store.open_checkin(self._kind, scheduled_for, date)
 
     def run(self, scheduled_for: datetime) -> Outcome:
         date = local_date(scheduled_for, self._tz)
@@ -4259,7 +4965,15 @@ class CheckIn:
 - [ ] **Step 4: Run the test and verify it passes**
 
 Run: `.venv/bin/pytest tests/ritual/test_checkin.py -v`
-Expected: PASS — 9 tests
+Expected: PASS — 16 tests (the Step 1 file collects 10; an earlier draft
+said 9, miscounting. Plus 6 added in review: 4 covering `VoiceIO` directly,
+which the Step 1 file never exercises — it drives `CheckIn` through a
+`StubVoice` — and 2 more from the review round. The three that matter:
+`speak()` must unmute in a `finally`, or a `say()` that raises leaves the
+wake detector muted forever and ZEUS never wakes again until the daemon
+restarts; a retry must find the SAME row when the local and UTC dates
+differ, which requires a non-Lagos zone to express at all; and `listen()`
+must discard audio buffered before it was called.)
 
 - [ ] **Step 5: Commit**
 
@@ -4421,13 +5135,16 @@ from __future__ import annotations
 
 import logging
 import threading
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from typing import Any
 
 from zeus.audio.endpointer import Endpointer, rms
 from zeus.audio.mic import FRAME_SAMPLES, MicStream
+from zeus.brain.prompts import NOT_CAUGHT_LINE
 from zeus.clock import Clock, SystemClock, resolve_timezone
 from zeus.config import Config, load_config
+from zeus.context.presence import Verdict
 from zeus.schedule.cron import hhmm_to_cron
 from zeus.schedule.scheduler import MissedRun, Scheduler
 
@@ -4437,6 +5154,71 @@ log = logging.getLogger(__name__)
 # day. A goal question at 15:00 is useful; the same question at 09:00 the
 # next morning is noise. See spec §9.2.
 CATCH_UP_ELIGIBLE = {"checkin_morning"}
+
+# HOW LATE A §9.3 RETRY MAY STILL FIRE (see _run_due_retries in Task 19).
+# The ladder's own span is the yardstick, plus slack, because each rung is
+# scheduled from `now` rather than from the occurrence.
+_RETRY_SLACK = timedelta(minutes=30)
+# A hard ceiling regardless of configuration: max_defer_retries is a config
+# value, and a large one would otherwise licence a ladder spanning into the
+# next local day. §9.2 outranks a long ladder.
+_RETRY_MAX_AGE = timedelta(hours=6)
+
+# How long the activation loop waits before re-entering events() after the
+# microphone stopped delivering. Subscription.frames()' idle bound already
+# rate-limits each cycle; this only stops a source that fails INSTANTLY
+# from spinning.
+_ACTIVATION_RESTART_SECONDS = 5.0
+
+# The longest the run loop may go without noticing request_stop(). launchd's
+# default grace period between SIGTERM and SIGKILL is 20 seconds, and the
+# tick loop can otherwise be a full minute from its next wake.
+_SHUTDOWN_POLL_SECONDS = 1.0
+
+
+class DegradedPresence:
+    """Presence adapter used when the microphone self-test failed.
+
+    Speaking is pointless when the mic is dead: ZEUS would talk into a void,
+    call listen() on it, hear nothing, and record NO_ANSWER — precisely the
+    outcome audio_self_test exists to prevent (risk R1). So SPEAK becomes
+    NOTIFY.
+
+    DEFER passes through untouched. Being locked or idle still means defer,
+    regardless of microphone health — a dead mic must not turn "the user is
+    away" into "post a notification anyway".
+
+    An earlier draft set Daemon.degraded and logged "check-ins will notify
+    instead of speaking", but nothing read the flag on the check-in path:
+    CheckIn chooses SPEAK from presence.verdict() alone, which knows nothing
+    about microphone health. The mitigation was wired to nothing.
+    """
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+
+    def verdict(self) -> Verdict:
+        verdict = self._inner.verdict()
+        return Verdict.NOTIFY if verdict is Verdict.SPEAK else verdict
+
+
+class SwitchablePresence:
+    """One level of indirection so the daemon can downgrade after startup.
+
+    The self-test runs after the CheckIns are built, and CheckIn stores its
+    presence at construction. Handing every CheckIn this wrapper means a
+    single degrade() call reaches all of them — no rebuilding them, and no
+    reaching into their private attributes from the daemon.
+    """
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+
+    def verdict(self) -> Verdict:
+        return self._inner.verdict()
+
+    def degrade(self) -> None:
+        self._inner = DegradedPresence(self._inner)
 
 
 def audio_self_test(mic: MicStream, seconds: float = 1.0) -> bool:
@@ -4449,11 +5231,41 @@ def audio_self_test(mic: MicStream, seconds: float = 1.0) -> bool:
     wanted = max(1, int(seconds * 16000 / FRAME_SAMPLES))
     energy = 0.0
     seen = 0
-    for frame in mic.frames():
-        energy = max(energy, rms(frame))
-        seen += 1
-        if seen >= wanted:
-            break
+    done = threading.Event()
+
+    # CONSUME ON A BACKGROUND THREAD. An in-loop deadline check cannot work
+    # here, however natural it looks: `for frame in mic.frames()` only runs
+    # the loop body when the generator YIELDS, and a microphone that has
+    # gone silent mid-capture never yields again. The check would sit in
+    # code that is never reached, Daemon.start() would never return, and the
+    # tick loop would never begin. An earlier draft of this plan had exactly
+    # that bug; the implementer caught it. Waiting on an Event is what makes
+    # the deadline real even though the consuming thread itself may block
+    # forever — the thread is a daemon thread, so it cannot hold up exit.
+    def consume() -> None:
+        nonlocal energy, seen
+        for frame in mic.frames():
+            energy = max(energy, rms(frame))
+            seen += 1
+            if seen >= wanted:
+                break
+        done.set()
+
+    threading.Thread(target=consume, daemon=True).start()
+    # Event.wait is backed by a monotonic clock, so no wall-clock adjustment
+    # (an NTP correction, a DST transition) can defeat it. Budget generously
+    # at 5s: this measures TOTAL capture, not time-to-first-frame, and a
+    # Bluetooth input switching into its HFP profile can take seconds before
+    # the first callback arrives. Too tight a budget makes a slow device
+    # indistinguishable from a dead one — and the consequence is sticky,
+    # because `degraded` is never re-tested or cleared, so ZEUS stays
+    # notification-only until the process restarts.
+    if not done.wait(timeout=max(seconds * 5.0, 5.0)):
+        log.error(
+            "audio self-test: timed out waiting for %d frames (got %d) — "
+            "the microphone stopped delivering audio", wanted, seen,
+        )
+        return False
     if seen == 0:
         log.error("audio self-test: no frames received from the microphone")
         return False
@@ -4493,6 +5305,12 @@ class Daemon:
         self._activator = activator
         self._mic = mic
         self._running = False
+        # Set when shutdown is requested. An Event, not just the _running
+        # bool, because the activation thread has to WAIT on it: a plain
+        # flag would have to be polled, and the restart backoff would then
+        # be waited out in full before a stop() was noticed.
+        self._shutdown = threading.Event()
+        self._activation_thread: threading.Thread | None = None
         self.degraded = False
 
     def run_catch_up(self) -> list[tuple[str, str]]:
@@ -4501,9 +5319,29 @@ class Daemon:
         for run, (job, action) in zip(missed, actions):
             if action == "fire" and job in self._checkins:
                 log.info("catch-up: firing %s missed at %s", job, run.scheduled_for)
-                self._checkins[job].run(run.scheduled_for)
+                try:
+                    self._checkins[job].run(run.scheduled_for)
+                except Exception:
+                    # Mirrors Scheduler.run_pending's per-handler isolation.
+                    # Unguarded, one failing catch-up conversation kills the
+                    # daemon before it ever reaches its tick loop.
+                    log.exception("catch-up run for %r failed", job)
             else:
                 log.info("catch-up: skipping %s missed at %s", job, run.scheduled_for)
+            # Consume the occurrence either way — FIRED OR SKIPPED.
+            # catch_up() reads the heartbeat while run_pending() reads
+            # last_run_at; they are separate state. Without this the very
+            # next tick() recomputes from a stale last_run_at and OVERRIDES
+            # the decision just made: a "skip" gets fired anyway (spec §9.2
+            # forbids asking about yesterday today), and a "fire" runs a
+            # second time, either re-running _converse on the open row or
+            # opening a second row and asking again.
+            #
+            # Only reproducible after a RESTART, when last_run_at already
+            # exists — with a fresh store run_pending merely seeds the
+            # baseline and fires nothing. That is why fixture fakes which
+            # never populate last_run_at cannot catch this.
+            self._store.set_job_run(job, run.scheduled_for)
         return actions
 
     def tick(self) -> None:
@@ -4512,16 +5350,64 @@ class Daemon:
         self._store.set_heartbeat()
 
     def _activation_loop(self) -> None:
+        """Consume activation events, RE-ENTERING events() if it ever ends.
+
+        THE OUTER `while` IS LOAD-BEARING, and it was added late. This
+        method was written when Subscription.frames() returned only on
+        stop(), so `for event in self._activator.events():` really was an
+        endless source. The A1 idle bound changed what "frames() returned"
+        means, and the chain from it is unconditional: frames() returns ->
+        _detect returns -> events() closes its subscription and ends -> a
+        single `for` falls out -> this thread returns. Nothing restarted
+        it; start() launches it exactly once. So sleep/wake, AirPods
+        taking over the default input, a USB mic unplugged or a coreaudiod
+        restart -- any of them over five seconds -- permanently ended "hey
+        jarvis" for the life of the process, with _running still True,
+        nothing logged, and `doctor` unable to see it. Spec §10 inverted.
+
+        WARNING, not INFO: a microphone that stopped delivering is a real
+        fault even though ZEUS recovers, and this is the only evidence of
+        it that ever reaches zeusd.log.
+
+        The backoff is a floor on the cycle time, not the main rate limit
+        -- the idle bound already caps each cycle. It waits on _shutdown
+        rather than sleeping so stop() cuts it short instead of being made
+        to sit through it; launchd escalates SIGTERM to SIGKILL.
+        """
         if self._activator is None:
             return
-        for event in self._activator.events():
-            if not self._running:
-                return
-            log.info("activated via %s", event.source)
+        restarts = 0
+        while self._running and not self._shutdown.is_set():
+            # Named rather than assumed: events() can also end by RAISING —
+            # openWakeWord failing to load its model, say — and a log line
+            # that blamed the microphone for that would be one more false
+            # statement in a codebase already bitten by five.
+            reason = "the microphone stopped delivering audio"
             try:
-                self._handle_activation()
+                for event in self._activator.events():
+                    if not self._running:
+                        return
+                    log.info("activated via %s", event.source)
+                    try:
+                        self._handle_activation()
+                    except Exception:
+                        log.error("ad-hoc conversation failed", exc_info=True)
             except Exception:
-                log.error("ad-hoc conversation failed", exc_info=True)
+                # A raising activator must not end activation either — that
+                # is the same silent death by a different door.
+                reason = "the activation source raised"
+                log.error("the activation source failed", exc_info=True)
+            if not self._running or self._shutdown.is_set():
+                return
+            restarts += 1
+            log.warning(
+                "%s, so wake-word activation ended; restarting it in %.0fs "
+                "(restart #%d). If this keeps repeating, run 'zeus doctor' — "
+                "the input device or the wake-word model is failing.",
+                reason, _ACTIVATION_RESTART_SECONDS, restarts,
+            )
+            if self._shutdown.wait(_ACTIVATION_RESTART_SECONDS):
+                return
 
     def _handle_activation(self) -> None:
         """Ad-hoc conversation triggered by the wake word."""
@@ -4529,6 +5415,12 @@ class Daemon:
             return
         heard = self._voice.listen()
         if not heard:
+            # The wake word fired, so the user IS talking to ZEUS — going
+            # silent here is the worst possible answer. Spec §10: say it
+            # once, then end the turn cleanly. No conversation is started,
+            # so this costs no API call and works even when the brain is
+            # the thing that is down. (A bare `return` here was C-I4.)
+            self._voice.speak([NOT_CAUGHT_LINE])
             return
         conversation_id = self._store.start_conversation("wake")
         try:
@@ -4538,11 +5430,24 @@ class Daemon:
             self._store.end_conversation(conversation_id)
 
     def start(self) -> None:
+        # Cleared FIRST, before _running is raised, so a restarted daemon
+        # does not inherit the previous run's shutdown signal — and so a
+        # request_stop() arriving during the slow part of start() below
+        # cannot be erased by a later clear.
+        self._shutdown.clear()
         self._running = True
         if self._mic is not None:
             self._mic.start()
             if not audio_self_test(self._mic):
                 self.degraded = True
+                # Wire the flag to the behaviour it claims. Without this the
+                # log line below is a lie: CheckIn picks SPEAK from
+                # presence.verdict() alone and would still speak into a dead
+                # microphone and record NO_ANSWER. Every CheckIn was handed
+                # this same SwitchablePresence at construction, so one call
+                # reaches all of them — no rebuild, no reaching into their
+                # internals.
+                self._presence.degrade()
                 log.error(
                     "ZEUS is running in DEGRADED mode: no working microphone. "
                     "Check-ins will notify instead of speaking. "
@@ -4555,11 +5460,36 @@ class Daemon:
                     )
         if self._activator is not None and not self.degraded:
             self._activator.start()
-            threading.Thread(target=self._activation_loop, daemon=True).start()
+            # Kept as an attribute so shutdown is OBSERVABLE: without a
+            # handle, "the activation thread ended" can only be inferred
+            # from threading.active_count(), which counts every other
+            # thread in the process too — an oracle weak enough that an
+            # uninterruptible backoff survived a mutation run against it.
+            self._activation_thread = threading.Thread(
+                target=self._activation_loop, daemon=True
+            )
+            self._activation_thread.start()
         self.run_catch_up()
 
-    def stop(self) -> None:
+    def request_stop(self) -> None:
+        """Ask the daemon to shut down. SAFE TO CALL FROM A SIGNAL HANDLER.
+
+        It flips a bool and sets an Event, and the restraint is the point:
+        stop() is NOT safe from a handler. stop() -> MicStream.stop() takes
+        _lifecycle_lock, a plain non-reentrant Lock that MicStream.start()
+        holds across the sounddevice import and the PortAudio open —
+        seconds, on a Bluetooth input. Signal handlers run on the main
+        thread, which is the thread inside start(), so a SIGTERM in that
+        window self-deadlocked until launchd escalated to SIGKILL.
+
+        run_forever's loop observes this within _SHUTDOWN_POLL_SECONDS and
+        its `finally` does the real teardown, on a thread holding no lock.
+        """
         self._running = False
+        self._shutdown.set()
+
+    def stop(self) -> None:
+        self.request_stop()
         if self._activator is not None:
             self._activator.stop()
         if self._mic is not None:
@@ -4570,11 +5500,30 @@ class Daemon:
         try:
             while self._running:
                 self.tick()
-                self._clock.sleep(
-                    self._scheduler.seconds_until_next(self._clock.now_utc())
-                )
+                self._sleep_until_next()
         finally:
             self.stop()
+
+    def _sleep_until_next(self) -> None:
+        """Sleep to the next occurrence, in slices, so a stop is noticed.
+
+        SLICED, not one long sleep. seconds_until_next() returns up to
+        _MAX_SLEEP (60s), and PEP 475 makes an interrupted time.sleep()
+        resume for its full remaining time — so a SIGTERM arriving just
+        after a tick would go unacted-on for another minute, and launchd
+        sends SIGKILL after twenty seconds. Slicing costs one wakeup a
+        second on a process already running wake-word inference twelve
+        times a second.
+
+        Still self._clock.sleep, not _shutdown.wait: the Clock is the seam
+        the whole scheduler is tested through, and a FakeClock advances
+        virtual time here exactly as a SystemClock burns real time.
+        """
+        remaining = self._scheduler.seconds_until_next(self._clock.now_utc())
+        while remaining > 0 and not self._shutdown.is_set():
+            interval = min(remaining, _SHUTDOWN_POLL_SECONDS)
+            self._clock.sleep(interval)
+            remaining -= interval
 
 
 def build_daemon(config: Config | None = None) -> Daemon:
@@ -4627,7 +5576,11 @@ def build_daemon(config: Config | None = None) -> Daemon:
 
     from zeus.context.presence import Presence
 
-    presence = Presence(config.context)
+    # Wrapped so a failed self-test can downgrade every CheckIn at once.
+    # The CheckIns below are built before start() runs the self-test, and
+    # each stores its presence at construction — this indirection is what
+    # lets Daemon.start() reach them afterwards.
+    presence = SwitchablePresence(Presence(config.context))
     scheduler = Scheduler(store, clock, tz)
 
     checkins: dict[str, Any] = {"_adhoc_factory": adhoc_factory}
@@ -4657,7 +5610,19 @@ def build_daemon(config: Config | None = None) -> Daemon:
 - [ ] **Step 4: Run the test and verify it passes**
 
 Run: `.venv/bin/pytest tests/test_daemon.py -v`
-Expected: PASS — 13 tests
+Expected: PASS — 19 tests (13 above, plus 6 added in review):
+- shutdown must stop the MIC, not just the activator —
+  `WakeWordActivator.events()` checks `_running` only AFTER `mic.frames()`
+  yields, so stopping the activator alone never terminates it;
+- a **skipped** catch-up must not be re-fired by the next `tick()`, and a
+  **fired** one must not run twice. Both need a RESTART setup —
+  `store.set_job_run(...)` before the run — or they pass vacuously, since a
+  fresh store makes `run_pending` merely seed the baseline;
+- a failed self-test must make check-ins NOTIFY instead of speak (assert
+  the notifier fired and the speaker said nothing — asserting the flag
+  proves nothing), and `DegradedPresence` must pass DEFER through unchanged;
+- `audio_self_test` must return `False` within a bounded wait when the mic
+  goes silent mid-capture, rather than hanging `Daemon.start()` forever.
 
 - [ ] **Step 5: Commit**
 
@@ -4677,7 +5642,8 @@ git commit -m "feat: daemon with audio self-test, catch-up policy, and heartbeat
 **Interfaces:**
 - Consumes: `build_daemon`, `load_config`, presence probes.
 - Produces:
-  - `launch_agent_plist(python_path: Path, log_path: Path) -> str`
+  - `launch_agent_plist(python_path: Path, log_path: Path, env_path: Path) -> str`
+  - `_load_env_file(path: Path) -> int` — KEY=VALUE into os.environ; existing environment wins
   - `cmd_doctor(config) -> int` — prints an environment report; exit 0 healthy, 1 unhealthy.
   - `cmd_selftest(config) -> int` — the **only** code path that touches real hardware.
   - `cmd_install_agent(config) -> int`, `cmd_run(config) -> int`
@@ -4687,14 +5653,21 @@ git commit -m "feat: daemon with audio self-test, catch-up policy, and heartbeat
 
 `tests/test_cli.py`:
 ```python
+import os
 import plistlib
+import sys
 from pathlib import Path
 
 from zeus.cli import launch_agent_plist, main
 
 
+ENV = Path("/Users/x/.zeus/env")
+
+
 def test_plist_is_valid_and_uses_absolute_paths():
-    xml = launch_agent_plist(Path("/opt/zeus/.venv/bin/python"), Path("/tmp/z.log"))
+    xml = launch_agent_plist(
+        Path("/opt/zeus/.venv/bin/python"), Path("/tmp/z.log"), ENV
+    )
     parsed = plistlib.loads(xml.encode())
 
     assert parsed["Label"] == "com.zeus.daemon"
@@ -4704,7 +5677,7 @@ def test_plist_is_valid_and_uses_absolute_paths():
 
 def test_plist_enables_keepalive_and_runatload():
     parsed = plistlib.loads(
-        launch_agent_plist(Path("/x/python"), Path("/tmp/z.log")).encode()
+        launch_agent_plist(Path("/x/python"), Path("/tmp/z.log"), ENV).encode()
     )
     assert parsed["KeepAlive"] is True
     assert parsed["RunAtLoad"] is True
@@ -4712,7 +5685,7 @@ def test_plist_enables_keepalive_and_runatload():
 
 def test_plist_routes_both_streams_to_the_log():
     parsed = plistlib.loads(
-        launch_agent_plist(Path("/x/python"), Path("/tmp/z.log")).encode()
+        launch_agent_plist(Path("/x/python"), Path("/tmp/z.log"), ENV).encode()
     )
     assert parsed["StandardOutPath"] == "/tmp/z.log"
     assert parsed["StandardErrorPath"] == "/tmp/z.log"
@@ -4720,9 +5693,55 @@ def test_plist_routes_both_streams_to_the_log():
 
 def test_plist_invokes_the_module_not_a_shell():
     parsed = plistlib.loads(
-        launch_agent_plist(Path("/x/python"), Path("/tmp/z.log")).encode()
+        launch_agent_plist(Path("/x/python"), Path("/tmp/z.log"), ENV).encode()
     )
     assert parsed["ProgramArguments"][1:] == ["-m", "zeus.cli", "run"]
+
+
+def test_plist_points_at_the_env_file_and_never_holds_the_key():
+    """launchd inherits no shell environment, so the daemon needs SOME way
+    to find the key — but the spec says the key is environment-only and
+    never written to config, and this plist is config. The path is what the
+    plist may carry; the secret is not."""
+    xml = launch_agent_plist(Path("/x/python"), Path("/tmp/z.log"), ENV)
+    parsed = plistlib.loads(xml.encode())
+    assert parsed["EnvironmentVariables"]["ZEUS_ENV_FILE"] == str(ENV)
+    assert "ANTHROPIC_API_KEY" not in xml
+    assert "sk-ant" not in xml
+
+
+def test_env_file_is_loaded_into_the_environment(monkeypatch, tmp_path):
+    from zeus.cli import _load_env_file
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    env = tmp_path / "env"
+    env.write_text(
+        "# a comment\n"
+        "\n"
+        "ANTHROPIC_API_KEY=sk-ant-test-value\n"
+        'QUOTED="quoted-value"\n'
+    )
+    assert _load_env_file(env) == 2
+    assert os.environ["ANTHROPIC_API_KEY"] == "sk-ant-test-value"
+    assert os.environ["QUOTED"] == "quoted-value"
+
+
+def test_env_file_does_not_override_the_real_environment(monkeypatch, tmp_path):
+    """A key exported in the shell wins over the file, so running the daemon
+    by hand behaves the same as launchd loading it."""
+    from zeus.cli import _load_env_file
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "from-the-shell")
+    env = tmp_path / "env"
+    env.write_text("ANTHROPIC_API_KEY=from-the-file\n")
+    assert _load_env_file(env) == 0
+    assert os.environ["ANTHROPIC_API_KEY"] == "from-the-shell"
+
+
+def test_a_missing_env_file_is_not_an_error(tmp_path):
+    from zeus.cli import _load_env_file
+
+    assert _load_env_file(tmp_path / "nope") == 0
 
 
 def test_main_with_no_arguments_prints_usage(capsys):
@@ -4731,6 +5750,9 @@ def test_main_with_no_arguments_prints_usage(capsys):
 
 
 def test_main_rejects_an_unknown_command(capsys):
+    """RETURNS 2 — it does not raise. argparse calls parser.error() on an
+    invalid subparser choice, which raises SystemExit(2); main() catches it
+    so its declared `main(argv) -> int` contract holds on every path."""
     assert main(["frobnicate"]) == 2
 
 
@@ -4740,6 +5762,7 @@ def test_doctor_reports_and_returns_a_status(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(cli, "_probe_say", lambda: True)
     monkeypatch.setattr(cli, "_probe_afplay", lambda: True)
     monkeypatch.setattr(cli, "_probe_api_key", lambda: True)
+    monkeypatch.setattr(cli, "_probe_transcriber", lambda: True)
 
     code = main(["doctor", "--root", str(tmp_path)])
     output = capsys.readouterr().out
@@ -4747,11 +5770,38 @@ def test_doctor_reports_and_returns_a_status(monkeypatch, tmp_path, capsys):
     assert "say" in output and "ANTHROPIC_API_KEY" in output
 
 
+def test_doctor_accepts_any_supported_python(monkeypatch, tmp_path, capsys):
+    """Global Constraints say 3.11+, so doctor must not report a FAILURE on
+    3.11 or 3.13 merely because it was developed on 3.12."""
+    import zeus.cli as cli
+
+    for probe in ("_probe_say", "_probe_afplay", "_probe_api_key",
+                  "_probe_transcriber"):
+        monkeypatch.setattr(cli, probe, lambda: True)
+    assert sys.version_info[:2] >= (3, 11)
+    assert main(["doctor", "--root", str(tmp_path)]) == 0
+
+
+def test_doctor_fails_when_the_transcriber_is_missing(monkeypatch, tmp_path, capsys):
+    """A broken transcriber is silent at runtime — LocalWhisper.transcribe()
+    returns "" for every failure — so doctor is where it must surface."""
+    import zeus.cli as cli
+
+    monkeypatch.setattr(cli, "_probe_say", lambda: True)
+    monkeypatch.setattr(cli, "_probe_afplay", lambda: True)
+    monkeypatch.setattr(cli, "_probe_api_key", lambda: True)
+    monkeypatch.setattr(cli, "_probe_transcriber", lambda: False)
+
+    assert main(["doctor", "--root", str(tmp_path)]) == 1
+    assert "transcriber" in capsys.readouterr().out
+
+
 def test_doctor_fails_when_the_api_key_is_missing(monkeypatch, tmp_path, capsys):
     import zeus.cli as cli
 
     monkeypatch.setattr(cli, "_probe_say", lambda: True)
     monkeypatch.setattr(cli, "_probe_afplay", lambda: True)
+    monkeypatch.setattr(cli, "_probe_transcriber", lambda: True)
     monkeypatch.setattr(cli, "_probe_api_key", lambda: False)
 
     assert main(["doctor", "--root", str(tmp_path)]) == 1
@@ -4769,44 +5819,150 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'zeus.cli'`
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import logging
 import os
-import shutil
+import plistlib
 import sys
 from pathlib import Path
 
 from zeus.config import Config, load_config
 
+log = logging.getLogger(__name__)
+
 LABEL = "com.zeus.daemon"
 PLIST_PATH = Path.home() / "Library/LaunchAgents" / f"{LABEL}.plist"
 
 
-def launch_agent_plist(python_path: Path, log_path: Path) -> str:
+def launch_agent_plist(python_path: Path, log_path: Path, env_path: Path) -> str:
     """Generate the LaunchAgent plist.
 
     The interpreter is referenced by absolute path so nothing depends on
     shell initialisation or PATH (spec §4.1).
+
+    ENV_PATH, NOT THE KEY ITSELF. launchd does not read .env, and a
+    LaunchAgent inherits none of your shell environment — so without this
+    the daemon starts with no ANTHROPIC_API_KEY and every brain call fails
+    at runtime, quietly. The obvious fix is an EnvironmentVariables entry
+    holding the key, but the spec says the key lives in the environment
+    only and is "never written to config or source", and a plist in
+    ~/Library/LaunchAgents is config. So the plist carries only a PATH to
+    the key file; cmd_run loads it (see _load_env_file). launchctl setenv
+    was the other candidate and was rejected: it does not survive a reboot,
+    so ZEUS would come back deaf to its own API after every restart.
+
+    BUILT WITH plistlib, NOT AN f-STRING. Interpolating paths into XML by
+    hand breaks on any path containing an XML metacharacter: a checkout
+    under /Users/me/R&D/zeus produced "ExpatError: not well-formed" and a
+    plist launchctl refuses to load, while cmd_install_agent still printed
+    "Wrote ..." and the load instructions. A path containing < produced
+    "mismatched tag".
+
+    It is also a security property, not just robustness. With hand-built
+    XML, a crafted path can CLOSE the surrounding element and inject its
+    own — a review demonstrated an env_path that produced a *valid* plist
+    carrying EnvironmentVariables -> ANTHROPIC_API_KEY: sk-ant-pwned. That
+    turns "the plist never holds the key" from an invariant into a property
+    of whichever inputs the tests happen to use. plistlib escapes by
+    construction, so the guarantee holds for every input.
     """
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key><string>{LABEL}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{python_path}</string>
-        <string>-m</string>
-        <string>zeus.cli</string>
-        <string>run</string>
-    </array>
-    <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key><true/>
-    <key>StandardOutPath</key><string>{log_path}</string>
-    <key>StandardErrorPath</key><string>{log_path}</string>
-</dict>
-</plist>
-"""
+    return plistlib.dumps(
+        {
+            "Label": LABEL,
+            "ProgramArguments": [str(python_path), "-m", "zeus.cli", "run"],
+            "EnvironmentVariables": {"ZEUS_ENV_FILE": str(env_path)},
+            "RunAtLoad": True,
+            "KeepAlive": True,
+            "StandardOutPath": str(log_path),
+            "StandardErrorPath": str(log_path),
+        }
+    ).decode()
+
+
+def _load_env_file(path: Path) -> int:
+    """Load KEY=VALUE lines into os.environ. Returns how many were set.
+
+    Ten lines of stdlib instead of python-dotenv: Global Constraints forbid
+    new dependencies. Deliberately minimal — no interpolation, no `export`
+    prefix, no multi-line values. It exists for one variable.
+
+    Existing environment wins, so running the daemon by hand from a shell
+    that already exported ANTHROPIC_API_KEY behaves the same as launchd
+    loading it from the file.
+    """
+    # THE GUARD GOES INSIDE THE TRY. is_file() is not the safe probe it looks
+    # like: pathlib swallows only ENOENT/ENOTDIR/EBADF/ELOOP and RE-RAISES
+    # EACCES, EPERM and ENAMETOOLONG. Verified — a file inside a mode-000
+    # directory raises PermissionError straight out of is_file(). So an
+    # untraversable parent, a TCC-protected folder (a LaunchAgent statting
+    # ~/Documents gets EPERM), or a >1024-char path all escaped this function
+    # from the very line written to make it safe.
+    #
+    # Worse now that cmd_doctor calls this too: the health oracle would crash
+    # on exactly the condition it exists to diagnose, and cmd_run would
+    # crash-loop under KeepAlive:true.
+    #
+    # is_file() over exists() is still right — a directory passes exists() and
+    # then read_text() raises IsADirectoryError, and ZEUS_ENV_FILE="" resolves
+    # to Path(".") and hits that. It just has to be guarded like everything
+    # else.
+    try:
+        if not path.is_file():
+            return 0
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        # A mode-000 file, a non-UTF-8 file, a dangling symlink. Degrade the
+        # way cmd_run already degrades when the key is simply absent: log and
+        # carry on. Raising here would propagate out of cmd_run, and under
+        # launchd with KeepAlive:true that is a respawn loop.
+        log.error("could not read %s; continuing without it", path, exc_info=True)
+        return 0
+    loaded = 0
+    for line in text.splitlines():
+        line = line.strip().lstrip("\ufeff")     # a UTF-8 BOM would become
+        if not line or line.startswith("#") or "=" not in line:  # part of key 1
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        # Skip keys with whitespace instead of setting them. `export FOO=bar`
+        # would otherwise create a variable literally named "export FOO" and
+        # report success while the real key stays unset — the worst shape,
+        # since it looks like it worked. The docstring says `export` is
+        # unsupported; this makes the code agree.
+        value = value.strip().strip("'\"")
+        # A NUL anywhere is fatal to os.environ: CPython rejects it with
+        # ValueError, which is NOT an OSError and so slips past the guard
+        # above — and this assignment sits outside that try in any case.
+        #
+        # It is reachable, because NUL is valid UTF-8 and read_text() passes
+        # it straight through. A file saved as UTF-16LE — by `iconv -t
+        # UTF-16LE`, an editor's "Unicode" option, or a truncated write —
+        # decodes cleanly and then EVERY assignment raises, uncaught, out of
+        # cmd_run and cmd_doctor. That is I2's failure mode again: a respawn
+        # loop under KeepAlive:true, and a health oracle that dies on the
+        # condition it exists to diagnose.
+        #
+        # Skip the bad line and keep the good ones, exactly as the
+        # whitespace-key skip does — one corrupt line must not cost you a
+        # valid ANTHROPIC_API_KEY on the next.
+        if (not key or " " in key or "\t" in key
+                or "\x00" in key or "\x00" in value):
+            continue
+        if key not in os.environ:
+            os.environ[key] = value
+            loaded += 1
+    return loaded
+
+
+def _probe_python() -> bool:
+    """A function, not an inline expression, so a test can monkeypatch it.
+
+    Inline, the check can only ever be tested against the interpreter
+    running the tests — so `== (3, 12)` and `>= (3, 11)` are
+    indistinguishable on a 3.12 venv, and the test that exists to pin the
+    floor pins nothing.
+    """
+    return sys.version_info[:2] >= (3, 11)
 
 
 def _probe_say() -> bool:
@@ -4821,15 +5977,60 @@ def _probe_api_key() -> bool:
     return bool(os.environ.get("ANTHROPIC_API_KEY"))
 
 
+def _probe_transcriber() -> bool:
+    """Is the speech-to-text backend actually importable?
+
+    LocalWhisper.transcribe() catches Exception and returns "", so a missing
+    faster_whisper or a corrupt model is indistinguishable from a quiet room
+    — ZEUS just never hears anything and says so to nobody. This is the
+    cheap half of the check; cmd_selftest does the real one by transcribing
+    audio it actually captured.
+    """
+    return importlib.util.find_spec("faster_whisper") is not None
+
+
+def _probe_env_file(path: Path) -> bool:
+    """is_file() re-raises EACCES/EPERM/ENAMETOOLONG — see _load_env_file."""
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
+def _probe_sounddevice() -> bool:
+    """Hard import inside MicStream.start(); without it ZEUS cannot hear."""
+    return importlib.util.find_spec("sounddevice") is not None
+
+
+def _probe_openwakeword() -> bool:
+    """Hard import when the wake detector loads its model."""
+    return importlib.util.find_spec("openwakeword") is not None
+
+
 def cmd_doctor(config: Config) -> int:
+    # Load the env file FIRST, exactly as cmd_run does. Without this, doctor
+    # reads only os.environ: a key exported in ~/.zshrc makes doctor report
+    # all-OK, and then the LaunchAgent — which inherits no shell environment —
+    # starts with no key and fails every brain call, with one line in
+    # zeusd.log as the only signal. Being blind to that is being blind to the
+    # exact failure ZEUS_ENV_FILE exists to prevent.
+    env_file = Path(os.environ.get("ZEUS_ENV_FILE", config.env_path))
+    _load_env_file(env_file)
     checks = [
         ("python", f"{sys.version_info.major}.{sys.version_info.minor}",
-         sys.version_info[:2] == (3, 12)),
+         _probe_python()),
         ("say", "/usr/bin/say", _probe_say()),
-        ("afplay", "/usr/bin/afplay", _probe_afplay()),
-        ("ANTHROPIC_API_KEY", "environment", _probe_api_key()),
+        ("ANTHROPIC_API_KEY", "environment or env file", _probe_api_key()),
+        ("transcriber", "faster_whisper", _probe_transcriber()),
+        ("audio input", "sounddevice", _probe_sounddevice()),
+        ("wake word", "openwakeword", _probe_openwakeword()),
         ("zeus root", str(config.root), config.root.exists()),
         ("database", str(config.db_path), config.db_path.exists()),
+        # env_file, NOT config.env_path: ZEUS_ENV_FILE overrides it, so
+        # reporting the default while having loaded the override is the same
+        # lying-oracle bug this check was added to fix.
+        ("env file", str(env_file), _probe_env_file(env_file)),
+        ("afplay", "/usr/bin/afplay", _probe_afplay()),
         ("LaunchAgent", str(PLIST_PATH), PLIST_PATH.exists()),
     ]
     print("ZEUS environment report\n")
@@ -4837,7 +6038,16 @@ def cmd_doctor(config: Config) -> int:
     for name, detail, ok in checks:
         print(f"  {'OK  ' if ok else 'FAIL'}  {name:<20} {detail}")
         # A missing database or LaunchAgent is expected before first run.
-        if not ok and name in {"python", "say", "afplay", "ANTHROPIC_API_KEY"}:
+        # FATAL = things that stop ZEUS working. afplay is NOT one: nothing
+        # in src/ invokes it (TTS goes through /usr/bin/say), so it is
+        # reported and ignored. sounddevice and openwakeword ARE fatal —
+        # both are hard imports on the capture path, and neither was checked
+        # at all before. A missing database, env file, or LaunchAgent is
+        # expected before first run.
+        if not ok and name in {
+            "python", "say", "ANTHROPIC_API_KEY", "transcriber",
+            "audio input", "wake word",
+        }:
             healthy = False
     print()
     if not healthy:
@@ -4846,8 +6056,18 @@ def cmd_doctor(config: Config) -> int:
 
 
 def cmd_selftest(config: Config) -> int:
-    """Capture, transcribe, and speak. Requires real hardware — never in CI."""
-    from zeus.audio.mic import MicStream
+    """Capture, TRANSCRIBE, and speak. Requires real hardware — never in CI.
+
+    The transcription step is the point, not a bonus. audio_self_test only
+    proves frames are arriving with non-zero energy; it says nothing about
+    whether those frames become words. LocalWhisper.transcribe() swallows
+    every exception and returns "", so a missing model file, an
+    uninstalled faster_whisper, or a corrupt download all present as ZEUS
+    silently never understanding anything. Printing what came back is the
+    only way a user can tell "you said nothing" from "I am broken".
+    """
+    from zeus.audio.endpointer import Endpointer, capture_utterance
+    from zeus.audio.mic import FRAME_SAMPLES, MicStream
     from zeus.daemon import audio_self_test
     from zeus.stt import build_transcriber
     from zeus.tts import build_speaker
@@ -4865,24 +6085,88 @@ def cmd_selftest(config: Config) -> int:
             )
             return 1
         print("OK: microphone is producing audio.")
+
+        print("Now say a short sentence, then stop...")
+        frames_per_second = config.audio.sample_rate / FRAME_SAMPLES
+        audio = capture_utterance(
+            mic.frames(), Endpointer(config.audio), pre_roll=b"",
+            listen_timeout_frames=int(10 * frames_per_second),
+        )
     finally:
         mic.stop()
 
+    if not audio:
+        print("FAIL: captured no utterance — the endpointer heard only silence.")
+        return 1
+    transcriber = build_transcriber(config.stt, config.models_dir)
+    heard = transcriber.transcribe(audio, config.audio.sample_rate)
+    if not heard:
+        print(
+            "FAIL: audio was captured but transcription returned nothing.\n"
+            "  The model may be missing or corrupt. Check that faster_whisper\n"
+            f"  is installed and that {config.models_dir} holds the model."
+        )
+        return 1
+    print(f'OK: transcription works — I heard "{heard}"')
+
     speaker = build_speaker(config.tts)
     speaker.say("ZEUS self test complete. I can hear you and you can hear me.")
+    # ASK. MacSay.say() swallows every exception and ignores the return code —
+    # deliberately, so one failed sentence cannot abort a check-in — which
+    # means nothing downstream can tell whether a sound was actually produced.
+    # A misspelled or uninstalled voice exits 1 silently, and this function's
+    # entire purpose is detecting exactly that. selftest is interactive by
+    # design, so asking is the honest oracle.
+    #
+    # RuntimeError as well as EOFError: input() raises EOFError at end of
+    # input, but RuntimeError("lost sys.stdin") when fd 0 is closed outright,
+    # as in `zeus selftest 0<&-`. Either way, treat it as "not heard" — a
+    # self-test that cannot confirm must not claim success.
+    try:
+        heard_it = input("Did you hear that? [y/N] ").strip().lower()
+    except (EOFError, RuntimeError):
+        heard_it = ""
+    if heard_it not in ("y", "yes"):
+        print(
+            "FAIL: speech synthesis did not produce audible output.\n"
+            "  Check System Settings > Sound > Output, and that the voice\n"
+            f"  {config.tts.voice!r} is installed (System Settings >\n"
+            "  Accessibility > Spoken Content > System Voice > Manage Voices)."
+        )
+        return 1
     print("OK: speech synthesis worked.")
     return 0
 
 
 def cmd_install_agent(config: Config) -> int:
-    python_path = Path(sys.executable).resolve()
+    # sys.executable AS-IS. It is already absolute, and NOT .resolve()d:
+    # .resolve() follows the venv symlink out of the venv, to the real
+    # interpreter behind it. Measured here:
+    #   sys.executable  .../.venv/bin/python                -> imports zeus
+    #   .resolve()      ~/.local/share/uv/python/.../python3.12
+    #                                                       -> ModuleNotFoundError
+    # A venv works by the PATH the interpreter is invoked through, so the
+    # resolved binary has none of the venv's site-packages. The plist would
+    # name an interpreter that cannot run `-m zeus.cli`, and KeepAlive:true
+    # turns that into an infinite respawn loop.
+    python_path = Path(sys.executable)
     config.log_path.parent.mkdir(parents=True, exist_ok=True)
     PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
-    PLIST_PATH.write_text(launch_agent_plist(python_path, config.log_path))
+    PLIST_PATH.write_text(
+        launch_agent_plist(python_path, config.log_path, config.env_path)
+    )
     print(f"Wrote {PLIST_PATH}\n")
     print("Load it with:")
     print(f"  launchctl unload {PLIST_PATH} 2>/dev/null")
     print(f"  launchctl load {PLIST_PATH}\n")
+    if not config.env_path.exists():
+        print(
+            f"BEFORE loading it, put your API key in {config.env_path}:\n"
+            f"  printf 'ANTHROPIC_API_KEY=sk-ant-...\\n' > {config.env_path}\n"
+            f"  chmod 600 {config.env_path}\n"
+            "launchd inherits none of your shell environment, so without this\n"
+            "file the daemon starts fine and then fails on every request.\n"
+        )
     print(
         "IMPORTANT: run 'zeus selftest' from Terminal FIRST so macOS prompts\n"
         "for microphone access. A LaunchAgent that has never been granted\n"
@@ -4898,8 +6182,80 @@ def cmd_run(config: Config) -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    build_daemon(config).run_forever()
+    # Under launchd the environment is empty but ZEUS_ENV_FILE points at the
+    # key file (see launch_agent_plist). Run from a shell and the file is
+    # usually absent while the variable is already exported — both paths end
+    # with ANTHROPIC_API_KEY in os.environ, which is the only place the
+    # Anthropic client reads it from.
+    env_file = Path(os.environ.get("ZEUS_ENV_FILE", config.env_path))
+    _load_env_file(env_file)
+    if not _probe_api_key():
+        log.error(
+            "ANTHROPIC_API_KEY is not set and %s did not supply it. "
+            "Every conversation will fail. Run 'zeus doctor'.", env_file,
+        )
+    daemon = build_daemon(config)
+    _install_sigterm_handler(daemon)
+    daemon.run_forever()
     return 0
+
+
+def _install_sigterm_handler(daemon) -> None:
+    """Make Daemon shutdown reachable under launchd.
+
+    Without this the whole shutdown path is dead code as deployed: nothing
+    installed a handler, so SIGTERM took its default disposition and the
+    process died on the spot. Daemon.stop(), MicStream.stop() and the
+    PortAudio close never ran — and SIGTERM is how launchd stops a
+    LaunchAgent (`launchctl unload`, logout, shutdown), so that was every
+    ordinary stop. KeyboardInterrupt was the only path that reached the
+    carefully ordered shutdown, i.e. only when run in a terminal by hand.
+
+    THE HANDLER ASKS; IT DOES NOT DO. An earlier version called
+    daemon.stop() here, under a comment claiming stop() "takes no lock the
+    main thread could already be holding". That was false, and provably so:
+    Daemon.stop() -> MicStream.stop() takes _lifecycle_lock, a plain
+    non-reentrant Lock that MicStream.start() holds across the sounddevice
+    import and the PortAudio open — which this very file notes can take
+    seconds on Bluetooth. Signal handlers run on the main thread, and the
+    main thread is the one inside start(), so a SIGTERM in that window
+    self-deadlocked. Demonstrated in a subprocess: SIGTERM 0.3s into a 2.0s
+    hold hung until the process was killed.
+
+    daemon.request_stop() flips a bool and sets an Event, and takes no lock
+    at all. run_forever's loop sleeps in _SHUTDOWN_POLL_SECONDS slices
+    precisely so this is observed promptly — PEP 475 resumes an interrupted
+    sleep for its full remaining time, so without slicing the loop could be
+    a minute from noticing and launchd sends SIGKILL after twenty seconds.
+    The real teardown then happens in run_forever's `finally`, on a thread
+    that holds no lock.
+
+    What that costs: if the main thread is mid-check-in when SIGTERM
+    arrives, shutdown waits for that conversation rather than yanking the
+    device out from under it. That is a bound on real work in flight, not a
+    deadlock, and it is the direction to err in.
+
+    Failures are swallowed: raising from a signal handler would propagate
+    into whatever the main thread happened to be doing, which is a worse
+    exit than an untidy one.
+    """
+    import signal
+
+    def handle(signum, frame):
+        log.info("SIGTERM received; shutting down")
+        try:
+            daemon.request_stop()
+        except Exception:
+            log.error("error during shutdown", exc_info=True)
+
+    try:
+        signal.signal(signal.SIGTERM, handle)
+    except ValueError:
+        # signal.signal() only works on the main thread. cmd_run always is
+        # one, but a caller embedding it need not be, and refusing to run
+        # the daemon over a missing shutdown nicety would be the wrong
+        # trade.
+        log.warning("could not install a SIGTERM handler off the main thread")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -4912,9 +6268,32 @@ def main(argv: list[str] | None = None) -> int:
         ("doctor", "print an environment report"),
         ("install-agent", "write the LaunchAgent plist"),
     ]:
-        sub.add_parser(name, help=help_text)
+        subparser = sub.add_parser(name, help=help_text)
+        # `--root` is declared on the TOP-level parser above, but argparse
+        # subparsers consume every token after the subcommand name and hand
+        # them to the chosen subparser — one that knows nothing about
+        # `--root`. So `zeus doctor --root DIR` (root AFTER the subcommand,
+        # the form every test below and every real invocation uses) raised
+        # "unrecognized arguments" and SystemExit(2), while
+        # `zeus --root DIR doctor` worked. Mirroring the flag fixes it.
+        # default=argparse.SUPPRESS, NOT None: a subparser re-applies its own
+        # defaults onto the shared namespace after parsing, so default=None
+        # here would silently clobber a --root the top-level parser had
+        # already captured when it appears BEFORE the subcommand.
+        subparser.add_argument(
+            "--root", type=Path, default=argparse.SUPPRESS, help="ZEUS data directory"
+        )
 
-    args = parser.parse_args(argv if argv is not None else sys.argv[1:])
+    # argparse RAISES SystemExit(2) on an unknown subcommand rather than
+    # returning — so without this, main() only sometimes returns an int and
+    # `main(["frobnicate"]) == 2` is unreachable. Catching it here keeps the
+    # declared `main(argv) -> int` contract true on every path, which is
+    # what makes main() callable as a library function and testable without
+    # pytest.raises.
+    try:
+        args = parser.parse_args(argv if argv is not None else sys.argv[1:])
+    except SystemExit as exit_request:
+        return int(exit_request.code or 0)
     if not args.command:
         parser.print_usage()
         return 2
@@ -4935,7 +6314,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run the test and verify it passes**
 
 Run: `.venv/bin/pytest tests/test_cli.py -v`
-Expected: PASS — 8 tests
+Expected: PASS — 14 tests
 
 - [ ] **Step 5: Commit**
 
@@ -4967,19 +6346,39 @@ import pytest
 from zoneinfo import ZoneInfo
 
 from zeus.brain.fake import FakeConversation
+from zeus.brain.tools import build_tool_callables
 from zeus.clock import FakeClock
 from zeus.config import Config, ScheduleConfig
 from zeus.context.presence import Verdict
 from zeus.daemon import Daemon
 from zeus.memory.journal import Journal
 from zeus.memory.store import Store
-from zeus.ritual.checkin import CheckIn, FakeNotifier
+from zeus.ritual.checkin import CheckIn, FakeNotifier, local_date
 from zeus.schedule.scheduler import Scheduler
-from zeus.tts.fake import FakeSpeaker
 
-LAGOS = ZoneInfo("Africa/Lagos")
-MORNING = datetime(2026, 8, 5, 10, 0, tzinfo=timezone.utc)   # 11:00 Lagos
-EVENING = datetime(2026, 8, 5, 20, 0, tzinfo=timezone.utc)   # 21:00 Lagos
+# RUN THE WHOLE GOLDEN PATH IN TWO ZONES. The original version hardcoded UTC
+# instants and read them through Africa/Lagos (UTC+1), where 10:00Z and 20:00Z
+# are 11:00 and 21:00 local ON THE SAME CALENDAR DATE. A UTC-vs-local date
+# defect therefore could not fail this test — which is exactly how the Task 15
+# Critical (open_checkin writing the UTC date) survived fourteen passing tests.
+#
+# Swapping the zone is NOT enough: in America/Los_Angeles those same instants
+# are 03:00 and 13:00 local, still the same date. The instants themselves must
+# stop being hardcoded. Defining the ritual by LOCAL WALL CLOCK and converting
+# per zone puts the LA evening at 04:00Z the NEXT day, so the goal saved that
+# morning must still be found under local date 2026-08-05 while the stored
+# instant reads 2026-08-06. That is the assertion with teeth.
+#
+# Lagos stays because it is the user's real timezone; LA is added because it
+# is the one that can fail.
+ZONES = [
+    pytest.param("Africa/Lagos", id="lagos_utc_plus_1"),
+    pytest.param("America/Los_Angeles", id="los_angeles_utc_minus_7"),
+]
+
+LOCAL_DAY = "2026-08-05"
+MORNING_LOCAL = (2026, 8, 5, 11, 0)   # 11:00 local, whatever the zone
+EVENING_LOCAL = (2026, 8, 5, 21, 0)   # 21:00 local, whatever the zone
 
 
 class StubPresence:
@@ -5002,73 +6401,154 @@ class ScriptedVoice:
         return self.replies.pop(0) if self.replies else ""
 
 
-@pytest.fixture
-def rig(tmp_path):
-    clock = FakeClock(MORNING)
+@pytest.fixture(params=ZONES)
+def rig(request, tmp_path):
+    tz = ZoneInfo(request.param)
+    morning = datetime(*MORNING_LOCAL, tzinfo=tz).astimezone(timezone.utc)
+    evening = datetime(*EVENING_LOCAL, tzinfo=tz).astimezone(timezone.utc)
+    clock = FakeClock(morning)
     store = Store(tmp_path / "zeus.db", clock)
-    journal = Journal(tmp_path / "journal", clock, LAGOS)
+    journal = Journal(tmp_path / "journal", clock, tz)
     presence = StubPresence()
     voice = ScriptedVoice()
     notifier = FakeNotifier()
 
-    def make_checkin(kind, script):
+    def make_checkin(kind, script=None, tool_calls=None):
+        """Build a CheckIn whose fake brain drives the REAL tool callables.
+
+        The conversation is faked (no network), but save_goal and
+        record_outcome are the genuine action-logged implementations, so
+        the assertions below check data the production code wrote.
+        """
+
+        def factory(conversation_id, date):
+            return FakeConversation(
+                script=script,
+                tools=build_tool_callables(store, journal, conversation_id, date),
+                tool_calls=tool_calls,
+            )
+
         return CheckIn(
             kind=kind, store=store, journal=journal, presence=presence,
-            voice=voice, notifier=notifier,
-            conversation_factory=lambda cid, date: FakeConversation(script),
-            config=ScheduleConfig(), tz=LAGOS, clock=clock,
+            voice=voice, notifier=notifier, conversation_factory=factory,
+            config=ScheduleConfig(), tz=tz, clock=clock,
         )
 
     return {
         "clock": clock, "store": store, "journal": journal,
         "presence": presence, "voice": voice, "notifier": notifier,
         "make_checkin": make_checkin, "tmp_path": tmp_path,
+        "tz": tz, "morning": morning, "evening": evening,
+        "local_day": LOCAL_DAY,
     }
 
 
+def test_the_two_zones_actually_exercise_the_utc_local_seam():
+    """Guards the guard.
+
+    If someone later "simplifies" the parametrisation back to instants that
+    share a UTC date in both zones, every other test here keeps passing while
+    silently losing the ability to detect a UTC-vs-local defect. This test
+    fails loudly instead: in exactly one of the two zones, morning and evening
+    must land on DIFFERENT UTC dates while sharing one local date.
+    """
+    straddles = []
+    for zone in ("Africa/Lagos", "America/Los_Angeles"):
+        tz = ZoneInfo(zone)
+        morning = datetime(*MORNING_LOCAL, tzinfo=tz).astimezone(timezone.utc)
+        evening = datetime(*EVENING_LOCAL, tzinfo=tz).astimezone(timezone.utc)
+        assert local_date(morning, tz) == LOCAL_DAY
+        assert local_date(evening, tz) == LOCAL_DAY
+        straddles.append(morning.date() != evening.date())
+
+    assert straddles == [False, True], (
+        "Lagos must NOT straddle the UTC date boundary and Los Angeles MUST — "
+        "otherwise this suite cannot catch a UTC-vs-local date defect"
+    )
+
+
 def test_full_day_morning_goal_to_evening_review(rig):
+    """The golden path: nothing in this test writes the data it asserts on.
+
+    Turn 0 of each conversation is ZEUS's opener; turn 1 is its reply to the
+    user's answer, which is where the real tool fires.
+
+    Runs once per zone. In Los Angeles the evening instant is 04:00Z on
+    2026-08-06 while the local day is still 2026-08-05, so every lookup below
+    keyed on LOCAL_DAY fails if any layer reaches for the UTC date instead.
+    """
     store, journal, voice, clock = (
         rig["store"], rig["journal"], rig["voice"], rig["clock"]
     )
+    day, morning_at, evening_at = rig["local_day"], rig["morning"], rig["evening"]
 
-    # --- 11:00 — morning check-in --------------------------------------
+    # --- 11:00 local — morning check-in --------------------------------
     voice.replies = ["Finish the auth flow"]
-    morning = rig["make_checkin"]("morning", {})
-    assert morning.run(MORNING).value == "answered"
+    morning = rig["make_checkin"](
+        "morning",
+        tool_calls=[[], [("save_goal", {"text": "Finish the auth flow"})]],
+    )
+    assert morning.run(morning_at).value == "answered"
 
-    # The brain's save_goal tool is faked here, so write the goal directly
-    # to represent what the real tool call would have persisted.
-    store.set_goal("2026-08-05", "Finish the auth flow")
-    journal.append("Goal set: Finish the auth flow")
+    # Written by the real save_goal tool, via the real action-log wrapper.
+    goal = store.get_goal(day)
+    assert goal.text == "Finish the auth flow"
+    assert goal.status == "pending"
+    assert "Finish the auth flow" in journal.read(day)
+    assert voice.spoken                     # ZEUS actually said something
 
-    assert store.get_goal("2026-08-05").status == "pending"
-    assert voice.spoken  # ZEUS actually said something
+    save_action = store.recent_actions()[0]
+    assert save_action.tool == "save_goal"
+    assert save_action.ok is True
 
-    # --- 21:00 — evening check-in --------------------------------------
-    clock.advance(EVENING - MORNING)
+    # --- 21:00 local — evening check-in --------------------------------
+    clock.advance(evening_at - morning_at)
     voice.replies = ["Mostly, the tests are still missing"]
-    evening = rig["make_checkin"]("evening", {})
-    assert evening.run(EVENING).value == "answered"
+    evening = rig["make_checkin"](
+        "evening",
+        tool_calls=[
+            [],
+            [("record_outcome", {"status": "partial", "notes": "tests missing"})],
+        ],
+    )
+    assert evening.run(evening_at).value == "answered"
 
-    store.update_goal(store.get_goal("2026-08-05").id, "partial", "tests missing")
-
-    goal = store.get_goal("2026-08-05")
+    # THE ASSERTION WITH TEETH: in Los Angeles this evening instant carries
+    # UTC date 2026-08-06, so a lookup by UTC date returns None here and the
+    # morning's goal is silently orphaned.
+    goal = store.get_goal(day)
+    assert goal is not None, (
+        f"the evening at {evening_at:%Y-%m-%dT%H:%MZ} lost the goal saved "
+        f"under local date {day} — a UTC-vs-local date defect"
+    )
     assert goal.status == "partial"
     assert goal.notes == "tests missing"
-    assert "Finish the auth flow" in journal.read("2026-08-05")
+    assert goal.reviewed_at is not None
+
+    # The evening's own words must also land in the LOCAL day's journal file,
+    # not tomorrow's. NO `or journal.read(day)` TAIL: that made the assertion
+    # unconditional, because the morning's "Goal set: ..." line already makes
+    # read(day) truthy. Proven vacuous by deleting the evening's
+    # journal.append() from _record_outcome — both zones still passed.
+    assert "tests missing" in journal.read(day)
+
+    assert [a.tool for a in store.recent_actions()] == [
+        "record_outcome", "save_goal",      # recent_actions is newest-first
+    ]
 
 
 def test_away_all_morning_then_present_defers_then_speaks(rig):
     store, presence, voice = rig["store"], rig["presence"], rig["voice"]
-    checkin = rig["make_checkin"]("morning", {})
+    checkin = rig["make_checkin"]("morning")
+    morning_at = rig["morning"]
 
     presence.verdict_value = Verdict.DEFER
-    assert checkin.run(MORNING).value == "deferred"
+    assert checkin.run(morning_at).value == "deferred"
     assert voice.spoken == []
 
     presence.verdict_value = Verdict.SPEAK
     voice.replies = ["Ship the parser"]
-    assert checkin.run(MORNING).value == "answered"
+    assert checkin.run(morning_at).value == "answered"
 
     # Same check-in row reused, so attempts accumulated
     assert store.get_checkin(1).attempts == 2
@@ -5076,10 +6556,11 @@ def test_away_all_morning_then_present_defers_then_speaks(rig):
 
 def test_silence_all_day_never_loses_the_checkin_row(rig):
     store = rig["store"]
-    checkin = rig["make_checkin"]("morning", {})
+    checkin = rig["make_checkin"]("morning")
+    morning_at = rig["morning"]
 
-    assert checkin.run(MORNING).value == "no_answer"
-    assert checkin.run(MORNING).value == "no_answer"   # retry exhausted → folds
+    assert checkin.run(morning_at).value == "no_answer"
+    assert checkin.run(morning_at).value == "no_answer"   # retry exhausted → folds
 
     row = store.get_checkin(1)
     assert row.attempts == 2
@@ -5090,11 +6571,12 @@ def test_downtime_across_two_days_replays_only_today(rig):
     store, clock = rig["store"], rig["clock"]
     fired: list[str] = []
 
-    scheduler = Scheduler(store, clock, LAGOS)
+    tz = rig["tz"]
+    scheduler = Scheduler(store, clock, tz)
     scheduler.register("checkin_morning", "0 11 * * *", fired.append)
     scheduler.register("checkin_evening", "0 21 * * *", fired.append)
 
-    # Heartbeat two days ago, now 13:00 Lagos today.
+    # Heartbeat two days ago, now 13:00 LOCAL today — in either zone.
     clock.advance(timedelta(days=-2))
     store.set_heartbeat()
     clock.advance(timedelta(days=2) + timedelta(hours=2))
@@ -5114,10 +6596,9 @@ def test_downtime_across_two_days_replays_only_today(rig):
 def test_every_tool_call_is_visible_to_a_future_dashboard(rig):
     """Slice 2's dashboard can only show what Slice 1 recorded."""
     store, journal = rig["store"], rig["journal"]
-    from zeus.brain.tools import build_tools
 
     conv = store.start_conversation("schedule")
-    tools = {t.__name__: t for t in build_tools(store, journal, conv, "2026-08-05")}
+    tools = build_tool_callables(store, journal, conv, rig["local_day"])
     tools["save_goal"](text="Finish the auth flow")
     tools["record_outcome"](status="done")
 
@@ -5211,6 +6692,351 @@ git commit -m "test: end-to-end golden path across the assembled spine"
 
 ---
 
+### Task 19: Wire the retry ladder (added after the final review)
+
+**Why this task exists.** The final whole-branch review found that spec §9.3's
+retry ladder is computed and then discarded. `next_step()` returns
+`Decision(outcome, retry_after, fold_forward)`; `CheckIn.run` reads `.outcome`
+and drops the rest, and its return value is discarded by both call sites.
+`Scheduler` has only a cron `register()` — no one-shot API — and `build_daemon`
+registers exactly two cron jobs. Nothing anywhere schedules a run at
+`now + retry_after`.
+
+Proven end to end with the real `Scheduler` and a real `CheckIn`, presence
+pinned to DEFER, ticking every 5 minutes from 10:00 to 23:00 local:
+
+```
+handler fired 1 time(s):  11:00 PDT
+checkins: kind=morning outcome=deferred attempts=1
+spec requires 3 attempts (11:00 / 11:20 / 11:40); got 1
+```
+
+So if the user is away from the desk at 11:00, ZEUS asks once and gives up for
+the day — the exact situation the ladder was designed for.
+`defer_retry_after`, `max_defer_retries`, `no_answer_retry_after` and
+`max_no_answer_retries` currently have no runtime effect, and because
+`attempts` never reaches 2, `_exhausted()` and the whole morning→evening
+fold-forward path are unreachable.
+
+It hid because the two tests that look like retry tests call
+`checkin.run(morning_at)` twice at the SAME instant with no scheduler and no
+clock advance. They pin the state machine and row reuse — never the
+scheduling.
+
+**Scope note:** folding needs no new code. `_opener()` already falls back to
+`FOLDED_OPENER` when the evening finds no goal, so `fold_forward` is
+informational. The only missing mechanism is "run this check-in again at T".
+
+**Design — durable, not in-memory.** The retry lives in the database, so a
+daemon restarted between 11:00 and 11:20 still honours it. A `retry_at` column
+on `checkins` is the natural home: that row already carries `attempts`,
+`outcome`, and the original `scheduled_for` the retry must re-use, and it is
+already found by `_find_or_open`.
+
+**Files:**
+- Modify: `src/zeus/memory/schema.sql` — add `retry_at TEXT` to `checkins`
+- Modify: `src/zeus/memory/store.py` — `update_checkin(..., retry_at=...)`, new `due_retries()`
+- Modify: `src/zeus/ritual/checkin.py` — persist `retry_at`; wrap `_converse`
+- Modify: `src/zeus/daemon.py` — run due retries each tick
+- Test: `tests/memory/test_store.py`, `tests/ritual/test_checkin.py`, `tests/test_daemon.py`
+
+**Interfaces:**
+- Produces: `Store.due_retries(now_utc: datetime) -> list[DueRetry]` where
+  `DueRetry` carries `id: int`, `kind: str`, `scheduled_for: datetime`.
+- `Store.update_checkin` gains `retry_at: datetime | None`, written as UTC ISO
+  via `to_utc_iso`, or `NULL` to clear.
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# tests/memory/test_store.py
+def test_due_retries_returns_only_checkins_whose_retry_time_has_passed(tmp_path):
+    clock = FakeClock(START)
+    store = Store(tmp_path / "z.db", clock)
+    early = store.open_checkin("morning", START, "2026-08-05")
+    late = store.open_checkin("evening", START, "2026-08-05")
+    store.update_checkin(early, outcome="deferred", attempts=1,
+                         retry_at=START + timedelta(minutes=20))
+    store.update_checkin(late, outcome="deferred", attempts=1,
+                         retry_at=START + timedelta(hours=5))
+
+    assert [d.id for d in store.due_retries(START + timedelta(minutes=19))] == []
+    due = store.due_retries(START + timedelta(minutes=21))
+    assert [d.id for d in due] == [early]
+    assert due[0].kind == "morning"
+    assert due[0].scheduled_for == START      # the ORIGINAL occurrence, not now
+
+
+def test_clearing_retry_at_removes_it_from_due_retries(tmp_path):
+    """An answered check-in must not keep retrying."""
+    clock = FakeClock(START)
+    store = Store(tmp_path / "z.db", clock)
+    cid = store.open_checkin("morning", START, "2026-08-05")
+    store.update_checkin(cid, outcome="deferred", attempts=1,
+                         retry_at=START + timedelta(minutes=20))
+    store.update_checkin(cid, outcome="answered", attempts=2, retry_at=None)
+    assert store.due_retries(START + timedelta(hours=1)) == []
+```
+
+```python
+# tests/ritual/test_checkin.py
+def test_a_deferred_checkin_schedules_its_own_retry(tmp_path):
+    """The ladder, at the unit level: DEFER must leave a retry_at behind."""
+    rig = _deferring_checkin(tmp_path)          # presence returns DEFER
+    rig.checkin.run(NOW)
+    row = rig.store.get_checkin(1)
+    assert row.outcome == "deferred"
+    assert row.retry_at == NOW + rig.config.defer_retry_after
+
+
+def test_an_exhausted_checkin_stops_scheduling_retries(tmp_path):
+    rig = _deferring_checkin(tmp_path)
+    for _ in range(rig.config.max_defer_retries):
+        rig.checkin.run(NOW)
+    assert rig.store.get_checkin(1).retry_at is None
+
+
+def test_a_conversation_that_raises_still_counts_as_an_attempt(tmp_path):
+    """Without this, a failing brain retries forever: the exception escaped
+    run() before update_checkin, so attempts never incremented."""
+    rig = _raising_checkin(tmp_path)
+    rig.checkin.run(NOW)                        # must not raise
+    assert rig.store.get_checkin(1).attempts == 1
+```
+
+```python
+# tests/test_daemon.py
+def test_the_daemon_runs_a_retry_when_it_comes_due(tmp_path):
+    """THE REGRESSION TEST FOR THE WHOLE FINDING. Drives the real Scheduler
+    and a real CheckIn across a simulated morning with the user away, and
+    asserts the ladder actually fires three times."""
+    rig = _away_all_morning(tmp_path, tz=LOS_ANGELES)
+    for _ in range(13 * 12):                    # 10:00 -> 23:00 local, every 5 min
+        rig.daemon.tick()
+        rig.clock.advance(timedelta(minutes=5))
+    assert rig.store.get_checkin(1).attempts == 3
+    assert [f.astimezone(LOS_ANGELES).strftime("%H:%M")
+            for f in rig.fired] == ["11:00", "11:20", "11:40"]
+```
+
+- [ ] **Step 2: Run them and watch them fail**
+
+Run: `.venv/bin/pytest tests/ -k "retry or due_retries" -v`
+Expected: FAIL — `Store.due_retries` does not exist; `attempts == 1`, not 3.
+
+- [ ] **Step 3: Add the column**
+
+`src/zeus/memory/schema.sql`, in `checkins`:
+
+```sql
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    retry_at      TEXT                          -- UTC ISO; NULL = no retry due
+```
+
+The schema runs through `executescript` with `CREATE TABLE IF NOT EXISTS`, so
+an existing database will NOT gain the column. Add a guarded migration in
+`Store.__init__`, after the `executescript`:
+
+```python
+        # CREATE TABLE IF NOT EXISTS will not add a column to a table that
+        # already exists, and this database is already on someone's disk.
+        columns = {row["name"] for row in self.connection.execute(
+            "PRAGMA table_info(checkins)")}
+        if "retry_at" not in columns:
+            self.connection.execute("ALTER TABLE checkins ADD COLUMN retry_at TEXT")
+```
+
+- [ ] **Step 4: Store support**
+
+`update_checkin` gains `retry_at: datetime | None = _UNSET`. Use a sentinel,
+not `None`, as the default: `None` is a meaningful value here (clear the
+retry), so a plain default would silently wipe the retry on every call that
+does not mention it. Write with `to_utc_iso`.
+
+```python
+@dataclass(frozen=True)
+class DueRetry:
+    id: int
+    kind: str
+    scheduled_for: datetime
+
+
+    def due_retries(self, now_utc: datetime) -> list[DueRetry]:
+        """Check-ins whose retry time has arrived, oldest first."""
+        with self._lock:
+            rows = self.connection.execute(
+                "SELECT id, kind, scheduled_for FROM checkins "
+                "WHERE retry_at IS NOT NULL AND retry_at <= ? "
+                "ORDER BY retry_at",
+                (to_utc_iso(now_utc),),
+            ).fetchall()
+        return [DueRetry(int(r["id"]), r["kind"], from_utc_iso(r["scheduled_for"]))
+                for r in rows]
+```
+
+- [ ] **Step 5: Persist the decision in CheckIn.run**
+
+Two changes. First, `_converse` must not be able to skip the bookkeeping —
+otherwise a brain that raises never increments `attempts` and, once retries
+are live, retries forever:
+
+```python
+        elif verdict is Verdict.SPEAK:
+            try:
+                answered = self._converse(checkin_id, date)
+            except Exception:
+                # An attempt that died is still an attempt. Before retries
+                # were wired this merely lost a row update; with them, a
+                # persistently failing brain would retry until the day ended.
+                log.error("check-in conversation failed", exc_info=True)
+                answered = False
+```
+
+Then persist the retry alongside the outcome:
+
+```python
+        retry_at = (
+            self._clock.now_utc() + decision.retry_after
+            if decision.retry_after is not None else None
+        )
+        self._store.update_checkin(
+            checkin_id,
+            outcome=decision.outcome.value,
+            attempts=previous + 1,
+            fired_at=self._clock.now_utc() if verdict is Verdict.SPEAK else None,
+            retry_at=retry_at,
+        )
+```
+
+- [ ] **Step 6: Run due retries from the daemon tick**
+
+In `Daemon.tick()`, before `run_pending` so a due retry is not delayed by a
+cron job's work:
+
+```python
+    def _run_due_retries(self, now: datetime) -> None:
+        """Fire check-ins whose retry_at has arrived (spec §9.3).
+
+        Re-runs with the ORIGINAL scheduled_for, so local_date and the
+        check-in row stay the ones the ritual started with — a retry at 11:20
+        belongs to the 11:00 occurrence, not to a new one.
+
+        THAT DURABILITY IS ALSO WHY STALENESS HAS TO BE CHECKED HERE.
+        due_retries() filters only on `retry_at <= now`, and a Mac that
+        sleeps with the lid closed keeps both the row and the process. So a
+        morning check-in that deferred at 11:00 fired its 11:20 rung at
+        09:00 the next day, re-running with the ORIGINAL scheduled_for —
+        right for a twenty-minute retry, catastrophic for a twenty-two-hour
+        one, since `date` is then yesterday and save_goal's upsert rewrites
+        yesterday's goal row (status and notes reset) while today records
+        nothing.
+
+        The bound is on the retry's AGE, not on its local calendar date.
+        The catch-up path's same_local_day rule cannot be reused verbatim:
+        an evening check-in at 23:50 defers to 00:10, a live rung twenty
+        minutes old that merely falls on the next date, and the day rule
+        would settle it as skipped and never review the day. Age also keeps
+        the decision out of the UTC/local seam entirely.
+        """
+        deadline = self._retry_deadline()
+        for due in self._store.due_retries(now):
+            if now - due.scheduled_for > deadline:
+                self._settle_stale_retry(due, now)
+                continue
+            checkin = self._checkins.get(f"checkin_{due.kind}")
+            if checkin is None:
+                continue
+            try:
+                checkin.run(due.scheduled_for)
+            except Exception:
+                # One failing retry must not stop the others or the tick.
+                log.error("retry for %s failed", due.kind, exc_info=True)
+
+    def _retry_deadline(self) -> timedelta:
+        """How long after its occurrence a retry may still fire (§9.2, §9.3).
+
+        Derived from the configured ladder rather than hardcoded, so a user
+        who lengthens defer_retry_after does not silently lose their last
+        rungs — and capped, so one who lengthens it absurdly cannot licence
+        a replay on the following day.
+        """
+        schedule = self._config.schedule
+        ladder = max(
+            schedule.defer_retry_after * schedule.max_defer_retries,
+            schedule.no_answer_retry_after * schedule.max_no_answer_retries,
+        )
+        return min(ladder + _RETRY_SLACK, _RETRY_MAX_AGE)
+
+    def _settle_stale_retry(self, due, now: datetime) -> None:
+        """Record a retry that outlived its ladder as skipped, and clear it.
+
+        Settling is not optional housekeeping: retry_at is what
+        due_retries() selects on, so a stale row that is merely skipped over
+        comes back on the very next tick — once a minute, forever.
+        update_checkin targets DueRetry.id, so it lands on exactly the row
+        that was due rather than on whatever find_open_checkin would resolve
+        for that (kind, date).
+
+        attempts is carried across unchanged, for the reason
+        _record_skipped gives: a retry that never fired is not an attempt,
+        and attempts is the one column the §9.3 ladder reads.
+        """
+        log.warning(
+            "retry: dropping the %s retry for the occurrence at %s — it came "
+            "due %s after that occurrence, so its moment has passed (spec "
+            "§9.2). Recording it as skipped.",
+            due.kind, due.scheduled_for, now - due.scheduled_for,
+        )
+        try:
+            attempts = self._store.get_checkin(due.id).attempts
+            self._store.update_checkin(
+                due.id, outcome="skipped", attempts=attempts, retry_at=None
+            )
+            self._journal.append(
+                f"{due.kind.title()} check-in: skipped (its retry came due "
+                f"long after the check-in's moment had passed)"
+            )
+        except Exception:
+            # Same isolation as every other per-item failure on this path.
+            # Loud, and the row keeps its retry_at, so the next tick tries
+            # to settle it again rather than pretending it is gone.
+            log.exception("could not settle the stale %s retry", due.kind)
+```
+
+**Staleness is part of this task, not an afterthought.** The first version of
+`_run_due_retries` had no bound at all, and that is a data-loss defect, not a
+tidiness one: `due_retries()` selects on `retry_at <= now` and nothing else,
+so an overnight sleep turns a live rung into a next-day replay that writes
+today's answer onto yesterday's row. Both triggers are covered in
+`tests/test_daemon.py`:
+
+- an evening check-in deferring at 21:00 and firing at 08:05 the next
+  morning — §9.2's "do not ask about yesterday today";
+- a morning check-in deferring at 11:00 and firing at 09:00 the next day,
+  destroying a completed goal review. That test asserts yesterday's goal
+  still reads `status='done'` with its notes intact.
+
+`DueRetry.id` exists for this: it is what makes the settle target the exact
+row that was due.
+
+The daemon already wakes at least once a minute (`seconds_until_next` caps at
+`_MAX_SLEEP`), so no new sleep machinery is needed — a 20-minute retry is
+observed within a minute of coming due.
+
+- [ ] **Step 7: Run the tests**
+
+Run: `.venv/bin/pytest -q --import-mode=importlib`
+Expected: PASS, including the daemon regression test showing 11:00/11:20/11:40.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add src/zeus/memory/ src/zeus/ritual/ src/zeus/daemon.py tests/
+git commit -m "fix: wire the retry ladder so a deferred check-in actually retries"
+```
+
+---
+
 ## Plan Self-Review
 
 Run after the plan is written, before execution begins.
@@ -5272,12 +7098,48 @@ Verified across task boundaries:
 - `build_tools(store, journal, conversation_id, local_date)` in T14 matches
   its call sites in T16's `build_daemon` and T18.
 
-### Known simplification, flagged deliberately
+### Amendments made before execution
 
-`CheckIn._find_or_open` reuses an open check-in row by matching on kind and
-date via raw SQL rather than a dedicated `Store` method. This is the one place
-a task reaches past the `Store` façade. It is acceptable for Slice 1 and should
-become `Store.find_open_checkin(kind, date)` when Slice 2 touches this file.
+Two defects found in the pre-flight scan and fixed in this document before
+Task 1 was dispatched:
+
+1. **Task 18's golden path asserted on data the test itself wrote.** Because
+   `FakeConversation` could not invoke tools, the end-to-end test called
+   `store.set_goal(...)` and then asserted the goal existed — proving
+   nothing. `FakeConversation` now accepts real tool callables and a
+   per-turn `tool_calls` list, so the golden path exercises the genuine
+   brain → tool → action log → database chain. Nothing in that test now
+   writes the data it checks.
+2. **Tests assumed `@beta_tool` preserves `__name__` and direct
+   callability.** Several tests did `{t.__name__: t for t in build_tools(...)}`,
+   which depends on undocumented SDK decorator behaviour. `build_tools` is
+   now a thin wrapper over a new `build_tool_callables`, which returns the
+   plain action-logged bodies keyed by name. Tests and `FakeConversation`
+   use the callables; only the Tool Runner gets the decorated versions.
+
+`.gitignore` also already exists (it ignores `.worktrees/` and
+`.superpowers/`), so Task 1 verifies and extends it rather than creating it.
+
+### Resolved during execution (was: known simplification)
+
+`CheckIn._find_or_open` originally reused an open check-in row via raw SQL
+against `store.connection`, reaching past the `Store` façade, with
+`Store.find_open_checkin` deferred to Slice 2. Task 3's review found that the
+deferral left `find_open_checkin` named in Task 3's Produces block but
+implemented nowhere. It is now implemented in Task 3 and `_find_or_open` calls
+it, which also retired two latent defects in the raw SQL: it compared a UTC
+`date(scheduled_for)` against a local date, and its `<=` would reuse an
+unresolved check-in from an earlier day.
+
+### Naming collision, flagged deliberately
+
+Two different classes are named `CheckIn`: the `Store` row dataclass in
+`zeus.memory.store` (Task 3) and the ritual runner in `zeus.ritual` (Task 15).
+They live in different modules and do not collide in practice: Task 15 never
+imports the store's dataclass by name, it only receives instances back from
+`store.get_checkin()` / `store.find_open_checkin()` and reads `.id` and
+`.attempts`. Renaming is a Slice 2 concern; do not rename mid-slice, as the
+store dataclass name is already committed and referenced across tasks.
 
 ---
 

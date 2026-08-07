@@ -1,0 +1,44 @@
+[project]
+name = "zeus"
+version = "0.1.0"
+# 3.11+, matching cli.py's _probe_python() (`>= (3, 11)`), the "Python
+# 3.11+" global constraint, and what the source actually needs: tomllib is
+# the newest stdlib module used, and it landed in 3.11. The old
+# ">=3.12,<3.13" contradicted all three and would refuse to install on the
+# floor the code is written and tested against. Verified: every file in
+# src/ and tests/ compiles clean under a real 3.11.15, and nothing here
+# uses PEP 695 generics or any other 3.12-only syntax.
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic",
+    "croniter==6.2.4",
+    "sounddevice==0.5.5",
+    "openwakeword==0.6.0",
+    "onnxruntime==1.19.2",
+    "faster-whisper==1.2.1",
+    "ctranslate2==4.8.1",
+    "av==18.0.0",
+    "numpy==2.5.1",
+    "pyobjc-framework-quartz==12.2.1",
+]
+
+[project.scripts]
+zeus = "zeus.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest==8.3.4"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/zeus"]
+
+[tool.hatch.build]
+include = ["src/zeus/**/*.py", "src/zeus/**/*.sql"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = ["--import-mode=importlib"]

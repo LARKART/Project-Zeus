@@ -8,6 +8,11 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
+# --- secrets (never commit; .env.example is the committed template) ---
+.env
+.env.*
+!.env.example
+
 # --- zeus runtime artifacts ---
 models/
 *.db
