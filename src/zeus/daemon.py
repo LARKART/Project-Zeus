@@ -6,7 +6,7 @@ import threading
 from datetime import datetime
 from typing import Any
 
-from zeus.audio.endpointer import Endpointer, rms
+from zeus.audio.endpointer import rms
 from zeus.audio.mic import FRAME_SAMPLES, MicStream
 from zeus.clock import Clock, SystemClock, resolve_timezone
 from zeus.config import Config, load_config
@@ -328,7 +328,7 @@ def build_daemon(config: Config | None = None) -> Daemon:
     mic = MicStream(config.audio)
     activator = build_activator(config.wake, mic)
     voice = VoiceIO(
-        activator, mic, Endpointer(config.audio),
+        activator, mic,
         build_transcriber(config.stt, config.models_dir),
         build_speaker(config.tts), config.audio,
     )

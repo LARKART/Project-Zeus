@@ -362,6 +362,87 @@ def test_a_closed_subscription_stops_collecting_frames():
     assert list(subscription.frames()) == []
 
 
+# -- A1 (CRITICAL): the device stops delivering ------------------------
+
+
+def test_frames_ends_when_the_device_stops_delivering(monkeypatch):
+    """A1: frames() must end on a silent device, not wait forever.
+
+    Nothing here calls stop(): the stream is still "running", the callback
+    has simply ceased firing -- what CoreAudio does on sleep/wake, an
+    AirPods connect, a USB mic unplug or a coreaudiod restart. Before the
+    idle bound, `_stopping` was the iterator's ONLY exit, so this shape
+    parked the consumer forever, and every bound above it counts FRAMES,
+    which cannot advance when no frame arrives.
+
+    The timeout constant is monkeypatched so the test costs 0.3s instead of
+    5s. The 5.0s production value is a judgement call documented in mic.py;
+    what is pinned here is the mechanism, and that it is armed at all.
+    """
+    monkeypatch.setattr("zeus.audio.mic._IDLE_TIMEOUT_SECONDS", 0.3)
+
+    stream = MicStream(AudioConfig())
+    stream._running = True
+    subscription = stream.subscribe()
+    stream._on_audio(FRAME, FRAME_SAMPLES, None, None)
+
+    collected = []
+    finished = threading.Event()
+
+    def consume():
+        collected.extend(subscription.frames())
+        finished.set()
+
+    threading.Thread(target=consume, daemon=True).start()
+
+    assert finished.wait(5), (
+        "frames() never returned on a device that stopped delivering -- "
+        "the daemon's tick loop runs on that thread, so the heartbeat "
+        "stops, no further check-in fires, and the process stays ALIVE so "
+        "launchd's KeepAlive never restarts it"
+    )
+    assert collected == [FRAME], "the frames delivered before the silence were lost"
+    assert not stream._stopping.is_set(), (
+        "the test proved the wrong thing: the stream was stopped, which is "
+        "the exit path that already worked"
+    )
+
+
+def test_the_idle_bound_does_not_fire_while_frames_keep_arriving(monkeypatch):
+    """The other half: a live device must never be judged dead.
+
+    Frames arrive during silence too -- the endpointer needs them to detect
+    the end of an utterance -- so an idle bound that did not reset on every
+    delivered frame would cut a long answer off mid-sentence.
+    """
+    monkeypatch.setattr("zeus.audio.mic._IDLE_TIMEOUT_SECONDS", 0.3)
+
+    stream = MicStream(AudioConfig())
+    stream._running = True
+    subscription = stream.subscribe()
+
+    collected = []
+    finished = threading.Event()
+
+    def consume():
+        collected.extend(subscription.frames())
+        finished.set()
+
+    threading.Thread(target=consume, daemon=True).start()
+
+    # 0.75s of delivery -- well past the 0.3s bound, in 0.05s steps.
+    for _ in range(15):
+        stream._on_audio(FRAME, FRAME_SAMPLES, None, None)
+        time.sleep(0.05)
+    assert not finished.is_set(), (
+        "the idle bound fired while the device was still delivering audio"
+    )
+
+    stream.stop()
+    assert finished.wait(5)
+    assert len(collected) == 15
+
+
 def test_frames_closes_its_one_off_subscription_on_exit():
     """mic.frames() is a convenience wrapper around subscribe(); the queue it
     opens must not outlive the iteration."""

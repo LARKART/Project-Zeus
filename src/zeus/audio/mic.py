@@ -21,7 +21,11 @@ log = logging.getLogger(__name__)
 FRAME_SAMPLES = 1280        # 80 ms at 16 kHz — openWakeWord's expected chunk
 BYTES_PER_SAMPLE = 2        # int16
 _QUEUE_MAX = 256
-_POLL_SECONDS = 0.1
+_POLL_SECONDS = 0.1         # how promptly frames() notices stop()
+# How long a subscription waits on a silent device before giving up. Every
+# other capture bound in this codebase counts FRAMES, which cannot advance
+# when the callback has stopped — this is the only wall-clock backstop.
+_IDLE_TIMEOUT_SECONDS = 5.0
 
 
 class RingBuffer:
@@ -59,10 +63,25 @@ class MicStream:
         # 80 ms chunks. Measured before the fix: 20 frames pushed, consumer A
         # saw 20, consumer B saw 0, and ZERO frames reached both.
         #
-        # Copy-on-write list: _on_audio runs on the real-time audio thread
-        # and must never take a lock, so subscribe/_unsubscribe REPLACE the
-        # list rather than mutating it, and _on_audio just reads the
-        # attribute once (an atomic read of an immutable list).
+        # Copy-on-write list: subscribe/_unsubscribe REPLACE the list rather
+        # than mutating it, and _on_audio just reads the attribute once (an
+        # atomic read of an immutable list) — so a subscription appearing or
+        # closing mid-callback cannot be seen half-applied.
+        #
+        # THE RULE _on_audio ACTUALLY OBEYS: no UNBOUNDED and no BLOCKING
+        # call. Not "no locks" — an earlier version of this comment said
+        # that, and it was already false when written. _on_audio takes two
+        # locks today: RingBuffer.push, and queue.put_nowait (which opens
+        # `with self.not_full:`). Both are brief and effectively
+        # uncontended: the ring lock is held ~8.5µs, and _on_audio measures
+        # p50 9.3µs / p99 498µs against an 80ms frame budget on a load-140
+        # machine. What must never appear here is anything that can WAIT —
+        # a blocking put(), an unbounded queue, this stream's
+        # _lifecycle_lock or _subscriber_lock (both held across slow work
+        # by callers), disk or network I/O, or a raise. The false version
+        # was the dangerous one: it invited a maintainer to add something
+        # genuinely blocking in the belief that they were preserving an
+        # invariant that did not exist.
         self._subscribers: list["Subscription"] = []
         self._subscriber_lock = threading.Lock()
         self._stream = None
@@ -208,7 +227,10 @@ class Subscription:
         self.dropped = 0
 
     def frames(self) -> Iterator[bytes]:
-        """Blocking iterator over live frames. Ends when stop() is called.
+        """Blocking iterator over live frames.
+
+        Ends when stop() is called, OR after _IDLE_TIMEOUT_SECONDS with no
+        frame delivered — see the idle bound below.
 
         Polls with a short timeout rather than blocking indefinitely so that
         stop() is observed promptly without needing anything pushed onto the
@@ -219,11 +241,42 @@ class Subscription:
         that regresses test_frames_iterator_yields_pushed_audio, which
         (correctly) expects a drain-then-stop iterator, not abandon-on-stop.
         """
+        idle = 0.0
         while True:
             try:
                 yield self._queue.get(timeout=_POLL_SECONDS)
+                idle = 0.0
             except queue.Empty:
                 if self._mic._stopping.is_set():
+                    return
+                # WALL-CLOCK IDLE BOUND. Without this the iterator waits
+                # forever for a device that has stopped delivering, and every
+                # bound above it is a FRAME COUNT that only advances when a
+                # frame actually arrives — so listen()'s 30s timeout can
+                # never fire. Measured: 10 frames delivered, callback then
+                # silenced, and listen() was still parked indefinitely; the
+                # daemon's tick loop runs on that thread, so the heartbeat
+                # stopped, no further check-in fired, and the wake word
+                # stayed muted at depth 1. The process stays alive, so
+                # launchd's KeepAlive never notices.
+                #
+                # CoreAudio stops calling back without closing the stream on
+                # ordinary events: sleep/wake, a default-input change when
+                # AirPods connect, a USB mic unplug, a coreaudiod restart.
+                #
+                # 5s is ~62 missed 80ms frames — far beyond any normal gap,
+                # since frames arrive during silence too (the endpointer
+                # needs them to detect the end of an utterance). Ending the
+                # iterator makes capture_utterance return what it has; the
+                # check-in records NO_ANSWER and retries, which is the
+                # already-designed path for "heard nothing".
+                idle += _POLL_SECONDS
+                if idle >= _IDLE_TIMEOUT_SECONDS:
+                    log.error(
+                        "no audio for %.0fs — the input device stopped "
+                        "delivering. Ending capture so the daemon keeps "
+                        "running; run 'zeus doctor'.", _IDLE_TIMEOUT_SECONDS,
+                    )
                     return
 
     def drain(self) -> None:

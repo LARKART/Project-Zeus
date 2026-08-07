@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Callable, Iterable, Protocol
 from zoneinfo import ZoneInfo
 
-from zeus.audio.endpointer import capture_utterance
+from zeus.audio.endpointer import Endpointer, capture_utterance
 from zeus.audio.mic import FRAME_SAMPLES
 from zeus.brain.prompts import EVENING_OPENER, FOLDED_OPENER, MORNING_OPENER
 from zeus.clock import Clock
@@ -57,10 +57,14 @@ class FakeNotifier:
 class VoiceIO:
     """Speak-then-listen, honouring the half-duplex rule (spec §7.3)."""
 
-    def __init__(self, activator, mic, endpointer, transcriber, speaker, audio_config):
+    def __init__(self, activator, mic, transcriber, speaker, audio_config):
+        # NO endpointer PARAMETER. listen() builds one per capture (see
+        # there for why); accepting a shared instance here is what let the
+        # daemon hand the SAME mutable Endpointer to two threads, so the
+        # parameter is gone rather than left dangling and unused for
+        # someone to wire back up.
         self._activator = activator
         self._mic = mic
-        self._endpointer = endpointer
         self._transcriber = transcriber
         self._speaker = speaker
         self._config = audio_config
@@ -104,7 +108,19 @@ class VoiceIO:
                 self._config.listen_timeout.total_seconds() * frames_per_second
             )
             audio = capture_utterance(
-                self._mic.frames(), self._endpointer,
+                # A FRESH Endpointer PER CAPTURE. One shared instance was
+                # mutable state across two threads: the daemon builds one
+                # VoiceIO and hands it to both the wake thread
+                # (_handle_activation) and every CheckIn on the main thread,
+                # and capture_utterance calls reset()/feed() on it and reads
+                # saw_speech after the loop. Two overlapping captures
+                # double-counted the same silence — an utterance ended after
+                # 10 frames instead of 19, cutting the user off mid-sentence
+                # — and a reset() landing between the other capture's loop
+                # exit and its saw_speech check made a complete answer come
+                # back empty, recorded as NO_ANSWER. Endpointer is cheap and
+                # stateless at construction; sharing it bought nothing.
+                self._mic.frames(), Endpointer(self._config),
                 pre_roll=b"", listen_timeout_frames=timeout_frames,
             )
         finally:

@@ -414,11 +414,8 @@ def _loud_mic():
 
 def _voice(activator, speaker, transcriber=None, mic=None):
     from zeus.config import AudioConfig
-    from zeus.audio.endpointer import Endpointer
     config = AudioConfig()
-    return VoiceIO(
-        activator, mic, Endpointer(config), transcriber, speaker, config
-    )
+    return VoiceIO(activator, mic, transcriber, speaker, config)
 
 
 def test_speak_brackets_the_utterance_in_mute_and_unmute():
