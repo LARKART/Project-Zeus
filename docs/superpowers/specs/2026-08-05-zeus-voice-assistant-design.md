@@ -483,10 +483,20 @@ transcript_retention_days = 90
   Anthropic API. Audio does not, because STT runs locally. This is a stronger privacy
   position than the "cloud-first" choice implied, and is a consequence of D2.
 - **The API key is read from the environment**, never written into config or source.
-- **Destructive tools are gated.** No destructive tool exists in Slice 1, but the
-  permission mechanism is built here: any tool marked destructive causes ZEUS to state the
-  action aloud and require explicit spoken confirmation before executing. Slices 2 and 3
-  add tools behind this gate; they do not add the gate.
+- **Destructive tools are gated.** Any tool marked destructive causes ZEUS to state the
+  action aloud and require explicit spoken confirmation before executing.
+  **Amended 2026-08-07 — the gate moves to Slice 2.** This clause originally
+  said the mechanism was built in Slice 1, ahead of its first caller, so that
+  Slices 2 and 3 would not each invent one. The final whole-branch review
+  found it absent from the code *and* from the implementation plan: no
+  `destructive` marker, no confirmation path, nothing. Slice 1 ships no
+  destructive tool, so nothing is exploitable — but the spec was claiming a
+  mechanism that did not exist, which is worse than an acknowledged gap.
+  Ruled: build the gate in Slice 2, beside the first tool that needs it. A
+  permission mechanism with zero callers is hard to design well and easy to
+  get subtly wrong; the original reasoning (don't invent it three times) is
+  still honoured as long as Slice 2 builds it once, before its first
+  destructive tool ships.
 - **The dashboard binds to `127.0.0.1` only** (Slice 2) and is never exposed to the local
   network.
 
