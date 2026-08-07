@@ -1,7 +1,14 @@
 [project]
 name = "zeus"
 version = "0.1.0"
-requires-python = ">=3.12,<3.13"
+# 3.11+, matching cli.py's _probe_python() (`>= (3, 11)`), the "Python
+# 3.11+" global constraint, and what the source actually needs: tomllib is
+# the newest stdlib module used, and it landed in 3.11. The old
+# ">=3.12,<3.13" contradicted all three and would refuse to install on the
+# floor the code is written and tested against. Verified: every file in
+# src/ and tests/ compiles clean under a real 3.11.15, and nothing here
+# uses PEP 695 generics or any other 3.12-only syntax.
+requires-python = ">=3.11"
 dependencies = [
     "anthropic",
     "croniter==6.2.4",

@@ -13,7 +13,12 @@ from zoneinfo import ZoneInfo
 
 from zeus.audio.endpointer import Endpointer, capture_utterance
 from zeus.audio.mic import FRAME_SAMPLES
-from zeus.brain.prompts import EVENING_OPENER, FOLDED_OPENER, MORNING_OPENER
+from zeus.brain.prompts import (
+    EVENING_OPENER,
+    FOLDED_OPENER,
+    MORNING_OPENER,
+    NOT_CAUGHT_LINE,
+)
 from zeus.clock import Clock
 from zeus.config import ScheduleConfig
 from zeus.context.presence import Verdict
@@ -246,6 +251,20 @@ class CheckIn:
             for _ in range(MAX_EXCHANGES):
                 reply = self._voice.listen()
                 if not reply:
+                    # SAY SO, ONCE, then end the turn (spec §10). This used
+                    # to be a bare `break`: ZEUS asked its question, heard
+                    # nothing, and went silent — indistinguishable, from the
+                    # user's side, from a daemon that had crashed. §10's
+                    # governing rule is "fail loudly, never pretend… a voice
+                    # assistant that silently stops listening is worse than
+                    # one that says it is broken".
+                    #
+                    # Once per TURN, not once per empty reply: the break
+                    # after it is what guarantees that, and it is also what
+                    # §10 asks for — "then end the turn cleanly". The
+                    # check-in still records NO_ANSWER and the §9.3 ladder
+                    # still retries later; this only stops the silence.
+                    self._voice.speak([NOT_CAUGHT_LINE])
                     break
                 heard_anything = True
                 self._voice.speak(conversation.send(reply))

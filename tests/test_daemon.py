@@ -388,6 +388,212 @@ def test_a_fired_catch_up_is_not_refired_by_the_next_tick(tmp_path):
     )
 
 
+# ---- C-I4: an activation that heard nothing must not end in silence ------
+
+
+def test_an_activation_that_heard_nothing_says_so(tmp_path):
+    """Spec §10, the wake-word half. The user said "hey zeus" -- they ARE
+    talking to it -- and `if not heard: return` walked away without a word.
+    No conversation is started, so this costs no API call and still works
+    when the brain is the thing that is down."""
+    from zeus.brain.prompts import NOT_CAUGHT_LINE
+
+    clock = FakeClock(NOW)
+    store = Store(tmp_path / "zeus.db", clock)
+    journal = Journal(tmp_path / "journal", clock, LAGOS)
+    scheduler = Scheduler(store, clock, LAGOS)
+    voice = _StubVoice()                     # listen() always returns ""
+    instance = Daemon(
+        config=Config(root=tmp_path), store=store, journal=journal,
+        scheduler=scheduler, presence=None, voice=voice, notifier=None,
+        checkins={}, clock=clock,
+    )
+
+    instance._handle_activation()
+
+    assert voice.spoken == [NOT_CAUGHT_LINE]
+    assert store.messages(1) == [], "a conversation was started for no input"
+
+
+# ---- C-I1: catch-up must record what it skipped --------------------------
+
+
+def _skipping_daemon(tmp_path, tz, kind, cron, missed_at, restart_at):
+    """A daemon restarting after downtime that swallowed one occurrence."""
+    clock = FakeClock(missed_at - timedelta(hours=1))
+    store = Store(tmp_path / "zeus.db", clock)
+    journal = Journal(tmp_path / "journal", clock, tz)
+    scheduler = Scheduler(store, clock, tz)
+
+    class _RecordingCheckIn:
+        def __init__(self):
+            self.runs = []
+
+        def run(self, scheduled_for):
+            self.runs.append(scheduled_for)
+
+    checkin = _RecordingCheckIn()
+    name = f"checkin_{kind}"
+    scheduler.register(name, cron, checkin.run)
+    store.set_heartbeat()                    # last seen an hour before
+
+    clock.advance(restart_at - clock.now_utc())
+    instance = Daemon(
+        config=Config(root=tmp_path), store=store, journal=journal,
+        scheduler=scheduler, presence=None, voice=None, notifier=None,
+        checkins={name: checkin}, clock=clock, tz=tz,
+    )
+    return SimpleNamespace(
+        daemon=instance, store=store, journal=journal, checkin=checkin,
+    )
+
+
+def test_a_skipped_evening_catch_up_is_recorded_as_skipped(tmp_path):
+    """Spec §9.2: "Evening check-in missed -> record outcome=skipped".
+
+    The skip branch logged a line and called set_job_run, and that was all
+    -- nothing reached the `checkins` table, so a week of downtime left NO
+    trace that seven evenings had been skipped. checkins.outcome has
+    carried 'skipped' in its CHECK constraint from the first migration for
+    exactly this, and D10's justification for building the action log in
+    Slice 1 is that the Slice 2 dashboard can only show history that was
+    recorded from the beginning.
+    """
+    rig = _skipping_daemon(
+        tmp_path, LAGOS, "evening", "0 21 * * *",
+        missed_at=datetime(2026, 8, 5, 20, 0, tzinfo=timezone.utc),
+        restart_at=datetime(2026, 8, 5, 22, 0, tzinfo=timezone.utc),
+    )
+
+    assert rig.daemon.run_catch_up() == [("checkin_evening", "skip")]
+
+    rows = rig.store.connection.execute(
+        "SELECT kind, local_date, outcome, attempts, retry_at FROM checkins"
+    ).fetchall()
+    assert len(rows) == 1, f"expected one skipped check-in row, got {len(rows)}"
+    assert rows[0]["kind"] == "evening"
+    assert rows[0]["outcome"] == "skipped"
+    assert rows[0]["local_date"] == "2026-08-05"
+    # It never fired, so counting an attempt would be a lie in the one
+    # column the §9.3 ladder reads; and a settled check-in must not still
+    # be pending a retry.
+    assert rows[0]["attempts"] == 0
+    assert rows[0]["retry_at"] is None
+    assert "skipped" in rig.journal.read("2026-08-05").lower()
+
+
+def test_a_stale_morning_catch_up_is_recorded_as_skipped(tmp_path):
+    """Spec §9.2: "Morning check-in missed, day has rolled over -> do not
+    fire; record outcome=skipped"."""
+    rig = _skipping_daemon(
+        tmp_path, LAGOS, "morning", "0 11 * * *",
+        missed_at=datetime(2026, 8, 4, 10, 0, tzinfo=timezone.utc),
+        restart_at=datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc),
+    )
+
+    actions = rig.daemon.run_catch_up()
+
+    assert ("checkin_morning", "skip") in actions
+    skipped = rig.store.connection.execute(
+        "SELECT local_date FROM checkins WHERE outcome = 'skipped'"
+    ).fetchall()
+    assert [r["local_date"] for r in skipped] == ["2026-08-04"], (
+        "the skip was recorded against the wrong day"
+    )
+
+
+def test_the_skipped_row_uses_the_local_date_not_the_utc_one(tmp_path):
+    """The seam that has broken this codebase twice already: the scheduler
+    always produces UTC-tagged datetimes, so deriving the date from
+    scheduled_for.date() writes the UTC calendar date. Los Angeles is where
+    those diverge -- 21:00 PDT on the 5th is 04:00 UTC on the 6th -- and a
+    row keyed on the wrong date is invisible to every later lookup."""
+    rig = _skipping_daemon(
+        tmp_path, LOS_ANGELES, "evening", "0 21 * * *",
+        missed_at=datetime(2026, 8, 6, 4, 0, tzinfo=timezone.utc),
+        restart_at=datetime(2026, 8, 6, 6, 0, tzinfo=timezone.utc),
+    )
+
+    rig.daemon.run_catch_up()
+
+    row = rig.store.connection.execute(
+        "SELECT local_date, scheduled_for FROM checkins"
+    ).fetchone()
+    assert row["local_date"] == "2026-08-05", (
+        "the skipped evening was filed under the UTC date, not the local one"
+    )
+    assert from_utc_iso(row["scheduled_for"]) == datetime(
+        2026, 8, 6, 4, 0, tzinfo=timezone.utc
+    )
+
+
+def test_a_fired_catch_up_is_not_also_recorded_as_skipped(tmp_path):
+    """The morning ZEUS actually asks about must be left to CheckIn.run to
+    record. A 'skipped' row written beside it would mark the day settled
+    and hide the real outcome."""
+    rig = _skipping_daemon(
+        tmp_path, LAGOS, "morning", "0 11 * * *",
+        missed_at=datetime(2026, 8, 5, 10, 0, tzinfo=timezone.utc),
+        restart_at=datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc),
+    )
+
+    assert rig.daemon.run_catch_up() == [("checkin_morning", "fire")]
+
+    assert len(rig.checkin.runs) == 1
+    assert rig.store.connection.execute(
+        "SELECT count(*) AS n FROM checkins WHERE outcome = 'skipped'"
+    ).fetchone()["n"] == 0
+
+
+def test_a_skip_settles_the_open_row_instead_of_opening_a_second(tmp_path):
+    """A morning deferred before the daemon died, then rolled over: THAT
+    row has to be settled, not a second one opened beside it. Two rows for
+    one occurrence is how attempts stopped accumulating the last time."""
+    rig = _skipping_daemon(
+        tmp_path, LAGOS, "morning", "0 11 * * *",
+        missed_at=datetime(2026, 8, 4, 10, 0, tzinfo=timezone.utc),
+        restart_at=datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc),
+    )
+    existing = rig.store.open_checkin(
+        "morning", datetime(2026, 8, 4, 10, 0, tzinfo=timezone.utc), "2026-08-04"
+    )
+    rig.store.update_checkin(existing, outcome="deferred", attempts=2)
+
+    rig.daemon.run_catch_up()
+
+    rows = rig.store.connection.execute(
+        "SELECT id, outcome, attempts FROM checkins ORDER BY id"
+    ).fetchall()
+    assert [r["id"] for r in rows] == [existing], (
+        f"the skip opened a second row instead of settling the open one: "
+        f"{[dict(r) for r in rows]}"
+    )
+    assert rows[0]["outcome"] == "skipped"
+    assert rows[0]["attempts"] == 2, "the attempts already made were discarded"
+
+
+def test_recording_a_skip_never_breaks_catch_up(tmp_path, monkeypatch):
+    """Isolation, matching the fire branch: run_catch_up must still consume
+    the occurrence and return, or start() dies before the daemon has ticked
+    once -- and under KeepAlive that is a respawn loop."""
+    rig = _skipping_daemon(
+        tmp_path, LAGOS, "evening", "0 21 * * *",
+        missed_at=datetime(2026, 8, 5, 20, 0, tzinfo=timezone.utc),
+        restart_at=datetime(2026, 8, 5, 22, 0, tzinfo=timezone.utc),
+    )
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(rig.store, "open_checkin", boom)
+
+    assert rig.daemon.run_catch_up() == [("checkin_evening", "skip")]
+    consumed = {job.name: job.last_run_at for job in rig.store.jobs()}
+    assert consumed["checkin_evening"] is not None, (
+        "the occurrence was not consumed, so the next tick re-decides it"
+    )
+
+
 @pytest.fixture
 def daemon(tmp_path):
     clock = FakeClock(NOW)

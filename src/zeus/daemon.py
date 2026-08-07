@@ -8,9 +8,16 @@ from typing import Any
 
 from zeus.audio.endpointer import rms
 from zeus.audio.mic import FRAME_SAMPLES, MicStream
+from zeus.brain.prompts import NOT_CAUGHT_LINE
 from zeus.clock import Clock, SystemClock, resolve_timezone
 from zeus.config import Config, load_config
 from zeus.context.presence import Verdict
+# local_date at module scope, unlike the rest of zeus.ritual.checkin (which
+# build_daemon imports lazily): _record_skipped needs it on the catch-up
+# path, and there must be exactly ONE definition of "the local calendar
+# date a check-in belongs to" — re-deriving it here is how the UTC/local
+# split that broke every retry got in last time.
+from zeus.ritual.checkin import local_date
 from zeus.schedule.cron import hhmm_to_cron
 from zeus.schedule.scheduler import MissedRun, Scheduler
 
@@ -135,9 +142,15 @@ class Daemon:
     def __init__(
         self, config: Config, store, journal, scheduler: Scheduler,
         presence, voice, notifier, checkins: dict[str, Any], clock: Clock,
-        activator=None, mic=None,
+        activator=None, mic=None, tz=None,
     ) -> None:
         self._config = config
+        # The zone catch-up records local_date in — the same convention
+        # goals.date and checkins.local_date use everywhere else. Derived
+        # from config when not supplied so no caller is forced to pass it,
+        # but build_daemon passes the one it already resolved rather than
+        # resolving /etc/localtime a second time.
+        self._tz = tz or resolve_timezone(config.schedule.timezone)
         self._store = store
         self._journal = journal
         self._scheduler = scheduler
@@ -180,6 +193,7 @@ class Daemon:
                     log.exception("catch-up run for %r failed", job)
             else:
                 log.info("catch-up: skipping %s missed at %s", job, when)
+                self._record_skipped(job, when)
             # Consume the occurrence either way — fired OR skipped.
             # Scheduler.catch_up() reads the heartbeat while run_pending()
             # reads each job's last_run_at; they are separate state, so
@@ -195,6 +209,57 @@ class Daemon:
             # See review round 2, Critical #1.
             self._store.set_job_run(job, when)
         return actions
+
+    def _record_skipped(self, job: str, when: datetime) -> None:
+        """Write the `skipped` row spec §9.2 asks for.
+
+        "Morning check-in missed, day has rolled over -> do not fire; record
+        outcome=skipped" and "Evening check-in missed -> record
+        outcome=skipped". The skip branch used to log a line and call
+        set_job_run, and that was all: nothing reached the `checkins` table,
+        so a week of downtime left NO trace that seven mornings and seven
+        evenings had been skipped. checkins.outcome has carried 'skipped'
+        in its CHECK constraint since the first migration for exactly this,
+        and D10's whole justification for building the action log in Slice
+        1 is that the Slice 2 dashboard can only ever show what was
+        recorded from the beginning.
+
+        find_open_checkin, not raw SQL, and reusing an open row rather than
+        always inserting: a morning that was deferred before the daemon
+        died and then rolled over must have THAT row settled, not a second
+        row opened beside it. 'answered' and 'skipped' are terminal to
+        find_open_checkin, so an already-settled check-in is never
+        overwritten.
+
+        attempts is left where it was -- a skipped check-in never fired, so
+        counting an attempt would be a lie in the one column the retry
+        ladder reads. retry_at is cleared: a settled check-in must not
+        still be pending a retry.
+        """
+        kind = job.removeprefix("checkin_")
+        if kind not in ("morning", "evening"):
+            return
+        try:
+            date = local_date(when, self._tz)
+            existing = self._store.find_open_checkin(kind, date)
+            if existing is None:
+                checkin_id = self._store.open_checkin(kind, when, date)
+                attempts = 0
+            else:
+                checkin_id = existing.id
+                attempts = existing.attempts
+            self._store.update_checkin(
+                checkin_id, outcome="skipped", attempts=attempts, retry_at=None
+            )
+            self._journal.append(
+                f"{kind.title()} check-in: skipped (missed while ZEUS was "
+                f"not running)"
+            )
+        except Exception:
+            # Same isolation as the fire branch above: recording a skip
+            # must never abort catch-up or crash start() before the daemon
+            # has ticked once.
+            log.exception("could not record %r as skipped", job)
 
     def _run_due_retries(self, now: datetime) -> None:
         """Fire check-ins whose retry_at has arrived (spec §9.3).
@@ -249,6 +314,12 @@ class Daemon:
             return
         heard = self._voice.listen()
         if not heard:
+            # The wake word fired, so the user IS talking to ZEUS — going
+            # silent here is the worst possible answer. Spec §10: say it
+            # once, then end the turn cleanly. No conversation is started,
+            # so this costs no API call and works even when the brain is
+            # the thing that is down.
+            self._voice.speak([NOT_CAUGHT_LINE])
             return
         conversation_id = self._store.start_conversation("wake")
         try:
@@ -313,7 +384,7 @@ def build_daemon(config: Config | None = None) -> Daemon:
     from zeus.brain.tools import build_tools
     from zeus.memory.journal import Journal
     from zeus.memory.store import Store
-    from zeus.ritual.checkin import CheckIn, MacNotifier, VoiceIO, local_date
+    from zeus.ritual.checkin import CheckIn, MacNotifier, VoiceIO
     from zeus.stt import build_transcriber
     from zeus.tts import build_speaker
 
@@ -380,5 +451,5 @@ def build_daemon(config: Config | None = None) -> Daemon:
     return Daemon(
         config=config, store=store, journal=journal, scheduler=scheduler,
         presence=presence, voice=voice, notifier=notifier, checkins=checkins,
-        clock=clock, activator=activator, mic=mic,
+        clock=clock, activator=activator, mic=mic, tz=tz,
     )

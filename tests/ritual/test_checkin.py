@@ -102,6 +102,53 @@ def test_silence_produces_no_answer_and_a_retry(wiring):
     assert checkin_row.attempts == 1
 
 
+def test_silence_is_answered_out_loud_once(wiring):
+    """C-I4, spec §10: "Empty or unintelligible transcript -> 'I didn't catch
+    that' ONCE, then end the turn cleanly."
+
+    `if not reply: break` ended the turn in silence, which from the user's
+    side is indistinguishable from a daemon that has crashed -- and §10's
+    governing rule is "fail loudly, never pretend: a voice assistant that
+    silently stops listening is worse than one that says it is broken".
+    """
+    from zeus.brain.prompts import NOT_CAUGHT_LINE
+
+    checkin, voice, _, _, _ = _checkin("morning", wiring, Verdict.SPEAK, heard=[])
+    checkin.run(NOW)
+
+    assert voice.spoken.count(NOT_CAUGHT_LINE) == 1, (
+        f"expected exactly one {NOT_CAUGHT_LINE!r}, spoke {voice.spoken}"
+    )
+    assert voice.spoken[-1] == NOT_CAUGHT_LINE
+
+
+def test_silence_after_a_reply_is_still_answered_exactly_once(wiring):
+    """ONCE PER TURN, not once per empty reply in the loop. The user
+    answered the first question and then walked away."""
+    from zeus.brain.prompts import NOT_CAUGHT_LINE
+
+    checkin, voice, _, _, _ = _checkin(
+        "morning", wiring, Verdict.SPEAK, heard=["Finish the auth flow"]
+    )
+    checkin.run(NOW)
+
+    assert voice.spoken.count(NOT_CAUGHT_LINE) == 1
+    assert voice.spoken[-1] == NOT_CAUGHT_LINE
+
+
+def test_a_conversation_that_is_answered_throughout_never_says_it(wiring):
+    """The other half: a turn that ends because it ran out of exchanges, not
+    because it heard nothing, must not accuse the user of being inaudible."""
+    from zeus.brain.prompts import NOT_CAUGHT_LINE
+
+    checkin, voice, _, _, _ = _checkin(
+        "morning", wiring, Verdict.SPEAK, heard=["one", "two", "three"]
+    )
+    checkin.run(NOW)
+
+    assert NOT_CAUGHT_LINE not in voice.spoken
+
+
 def test_defer_verdict_never_speaks(wiring):
     checkin, voice, notifier, store, _ = _checkin(
         "morning", wiring, Verdict.DEFER, heard=["ignored"]

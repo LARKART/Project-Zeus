@@ -62,7 +62,15 @@ def test_naive_datetime_is_rejected():
 
 
 def test_resolve_system_timezone_malformed_falls_back(monkeypatch):
-    """Malformed system timezone (invalid IANA key) falls back to UTC."""
+    """Malformed system timezone (invalid IANA key) falls back to UTC.
+
+    TZ is cleared because resolve_timezone falls back to it BEFORE UTC --
+    correctly, since a shell that exports TZ means it. Without this the
+    test asserts the wrong branch and fails under any exported TZ:
+    `TZ=Africa/Lagos pytest -q` gave `assert 'Africa/Lagos' == 'UTC'`. The
+    code was right; the test was environment-dependent.
+    """
+    monkeypatch.delenv("TZ", raising=False)
     with TemporaryDirectory() as tmpdir:
         # Create a fake zoneinfo directory with an invalid zone key
         zoneinfo_dir = Path(tmpdir) / "zoneinfo"

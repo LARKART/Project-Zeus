@@ -56,6 +56,14 @@ FOLDED_OPENER = (
 )
 
 
+# Spec §10: an empty or unintelligible transcript gets this ONCE, then the
+# turn ends cleanly. Not routed through the model: it must be said when the
+# model is not in the loop at all (a wake-word activation that heard
+# nothing never starts a conversation), and it must cost nothing when the
+# API is the thing that is broken.
+NOT_CAUGHT_LINE = "I didn't catch that."
+
+
 def EVENING_OPENER(goal_text: str) -> str:
     return (
         f"[evening check-in] Today's goal was: {goal_text}. "
