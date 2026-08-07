@@ -7,6 +7,7 @@ never leaves the device.
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -25,6 +26,7 @@ class LocalWhisper:
         self._compute = compute
         self._models_dir = models_dir
         self._model = None
+        self._load_lock = threading.Lock()
 
     def _load(self):
         from faster_whisper import WhisperModel
@@ -43,7 +45,16 @@ class LocalWhisper:
             return ""
         try:
             if self._model is None:
-                self._model = self._load()
+                # Under a lock: the daemon shares ONE transcriber between the
+                # main thread and the wake thread, and this check-then-act
+                # let both load a model at once. Measured: 4 concurrent
+                # first-calls produced 4 WhisperModel loads, each writing the
+                # same files into models_dir concurrently. Double-checked
+                # inside the lock so the common case stays lock-free after
+                # the first load.
+                with self._load_lock:
+                    if self._model is None:
+                        self._model = self._load()
             segments, _ = self._model.transcribe(
                 pcm_to_float32(pcm), language="en", beam_size=1
             )
