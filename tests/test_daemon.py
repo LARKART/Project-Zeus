@@ -1,6 +1,7 @@
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -9,7 +10,7 @@ from zoneinfo import ZoneInfo
 from zeus.audio.activator import FakeActivator
 from zeus.audio.mic import FRAME_SAMPLES, MicStream
 from zeus.brain.fake import FakeConversation
-from zeus.clock import FakeClock
+from zeus.clock import FakeClock, from_utc_iso
 from zeus.config import AudioConfig, Config, ScheduleConfig
 from zeus.context.presence import Verdict
 from zeus.daemon import (
@@ -27,6 +28,7 @@ from zeus.ritual.retry import Outcome
 from zeus.schedule.scheduler import MissedRun, Scheduler
 
 LAGOS = ZoneInfo("Africa/Lagos")
+LOS_ANGELES = ZoneInfo("America/Los_Angeles")
 NOW = datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc)
 
 SILENCE = np.zeros(FRAME_SAMPLES, dtype=np.int16).tobytes()
@@ -630,6 +632,296 @@ def test_each_catch_up_decision_consumes_its_own_occurrence(tmp_path):
         "a catch-up decision was recorded against an occurrence other than "
         "the one it was made about"
     )
+
+
+# ---- the §9.3 retry ladder, end to end (Task 19) -------------------------
+#
+# THE REGRESSION TESTS FOR THE WHOLE FINDING.
+#
+# next_step() has always computed Decision(outcome, retry_after,
+# fold_forward). CheckIn.run read .outcome and dropped the rest; Scheduler
+# had only a cron register(); nothing anywhere scheduled a run at
+# `now + retry_after`. So a user away from the desk at 11:00 was asked once
+# and ZEUS gave up for the day.
+#
+# It hid because the two tests that LOOK like retry tests
+# (test_attempts_accumulate_across_repeated_runs,
+# test_silence_all_day_never_loses_the_checkin_row) call checkin.run(...)
+# twice at the SAME instant with no scheduler and no clock advance. They pin
+# the state machine and the row reuse -- never the scheduling. Every layer
+# was tested; the wire between them was not. So these drive the REAL
+# Scheduler and a REAL CheckIn across a simulated morning with a moving
+# clock. Calling run() by hand proves nothing about this bug.
+
+
+class _TimestampingCheckIn:
+    """Delegates to a real CheckIn, recording the WALL-CLOCK time of each run.
+
+    The `scheduled_for` a retry re-runs with is deliberately the original
+    11:00 occurrence, so it cannot distinguish the rungs of the ladder --
+    what the ladder is about is when each run actually HAPPENS.
+    """
+
+    def __init__(self, inner, clock, fired):
+        self._inner = inner
+        self._clock = clock
+        self._fired = fired
+
+    def run(self, scheduled_for):
+        self._fired.append(self._clock.now_utc())
+        return self._inner.run(scheduled_for)
+
+
+def _away(tmp_path, tz, kind, cron, start):
+    """Real Store, Scheduler and CheckIn; the user is away from the desk.
+
+    Presence is pinned to DEFER for the whole run, which is exactly the
+    situation §9.3's ladder was designed for. `start` is an hour before the
+    scheduled occurrence, so the scheduler's first run_pending() seeds its
+    baseline without firing -- as it does on a real fresh start.
+    """
+    clock = FakeClock(start)
+    store = Store(tmp_path / "zeus.db", clock)
+    journal = Journal(tmp_path / "journal", clock, tz)
+    scheduler = Scheduler(store, clock, tz)
+    config = ScheduleConfig()
+    fired: list[datetime] = []
+
+    checkin = _TimestampingCheckIn(
+        CheckIn(
+            kind=kind, store=store, journal=journal,
+            presence=_StubPresence(Verdict.DEFER), voice=_StubVoice(),
+            notifier=FakeNotifier(),
+            conversation_factory=lambda conv_id, local: FakeConversation({}),
+            config=config, tz=tz, clock=clock,
+        ),
+        clock, fired,
+    )
+    name = f"checkin_{kind}"
+    scheduler.register(name, cron, checkin.run)
+
+    instance = Daemon(
+        config=Config(root=tmp_path), store=store, journal=journal,
+        scheduler=scheduler, presence=None, voice=None, notifier=None,
+        checkins={name: checkin}, clock=clock,
+    )
+    return SimpleNamespace(
+        daemon=instance, store=store, clock=clock, fired=fired,
+        config=config, tz=tz,
+    )
+
+
+def _away_all_morning(tmp_path, tz):
+    return _away(
+        tmp_path, tz, "morning", "0 11 * * *",
+        datetime(2026, 8, 5, 10, 0, tzinfo=tz),
+    )
+
+
+def _local_times(moments, tz):
+    return [m.astimezone(tz).strftime("%H:%M") for m in moments]
+
+
+def test_the_daemon_runs_a_retry_when_it_comes_due(tmp_path):
+    """The ladder actually fires, on the clock, without anyone calling run().
+
+    The expected rungs are 11:00 (the cron occurrence) plus
+    `max_defer_retries` retries 20 minutes apart. max_defer_retries counts
+    RETRIES, not total attempts -- see next_step()'s
+    `attempts + 1 > config.max_defer_retries` and test_retry.py's
+    test_defer_retries_up_to_three_times, which pins a retry at attempts=0,
+    1 AND 2 -- so with the shipped defaults (20m x 3) that is FOUR runs:
+    11:00, 11:20, 11:40, 12:00.
+
+    Before the fix this list was ["11:00"] and attempts was 1.
+    """
+    rig = _away_all_morning(tmp_path, tz=LOS_ANGELES)
+
+    for _ in range(13 * 12):                    # 10:00 -> 23:00 local, every 5 min
+        rig.daemon.tick()
+        rig.clock.advance(timedelta(minutes=5))
+
+    expected = ["11:00", "11:20", "11:40", "12:00"]
+    assert _local_times(rig.fired, LOS_ANGELES) == expected, (
+        "the §9.3 retry ladder did not fire: a user away from the desk at "
+        "11:00 is asked once and ZEUS gives up for the day"
+    )
+    assert rig.store.get_checkin(1).attempts == rig.config.max_defer_retries + 1
+
+
+def test_the_ladder_stops_once_the_retries_are_exhausted(tmp_path):
+    """The other half: a ladder that never terminates is as broken as one
+    that never starts. Once exhausted the morning check-in folds forward
+    into the evening (§9.3) -- it must not keep asking every 20 minutes
+    until midnight, and it must never poll on every tick.
+    """
+    rig = _away_all_morning(tmp_path, tz=LOS_ANGELES)
+
+    for _ in range(13 * 12):
+        rig.daemon.tick()
+        rig.clock.advance(timedelta(minutes=5))
+
+    row = rig.store.get_checkin(1)
+    assert row.retry_at is None
+    assert row.outcome == "deferred"            # still open, so the evening folds
+    assert rig.store.due_retries(rig.clock.now_utc()) == []
+    assert len(rig.fired) == rig.config.max_defer_retries + 1
+
+
+def test_every_rung_of_the_ladder_reuses_the_original_checkin(tmp_path):
+    """A retry belongs to the occurrence the ritual started with.
+
+    Re-running with `now` instead of the original `scheduled_for` would
+    compute a fresh local_date at a day boundary and open a second row, so
+    attempts would restart at 1 and the ladder would never exhaust. Los
+    Angeles is used throughout because its UTC offset is negative -- the
+    seam where local and UTC dates diverge, which Africa/Lagos can never
+    expose.
+    """
+    rig = _away_all_morning(tmp_path, tz=LOS_ANGELES)
+
+    for _ in range(13 * 12):
+        rig.daemon.tick()
+        rig.clock.advance(timedelta(minutes=5))
+
+    rows = rig.store.connection.execute(
+        "SELECT id, local_date, scheduled_for FROM checkins ORDER BY id"
+    ).fetchall()
+    assert [r["id"] for r in rows] == [1], (
+        f"the retries opened {len(rows)} check-in rows instead of reusing one"
+    )
+    assert rows[0]["local_date"] == "2026-08-05"
+    assert from_utc_iso(rows[0]["scheduled_for"]).astimezone(
+        LOS_ANGELES
+    ).strftime("%H:%M") == "11:00"
+
+
+def test_a_retry_across_midnight_still_belongs_to_the_original_day(tmp_path):
+    """A retry must re-run with the ORIGINAL scheduled_for, never with `now`.
+
+    This is the one arrangement where the two differ, and it is why
+    test_every_rung_of_the_ladder_reuses_the_original_checkin cannot stand
+    in for it: at 11:00 the occurrence and `now` fall on the same local
+    date, so passing either reuses the same row and the defect is invisible.
+
+    A 23:50 check-in deferred at 23:50 retries at 00:10 -- the next local
+    day. Re-running with `now` computes local_date "2026-08-06", finds no
+    open check-in for it, and opens a SECOND row whose attempts restart at
+    1. Worse, the first row's retry_at is then never rewritten, so it stays
+    due on every subsequent tick and the ladder becomes an unbounded loop.
+    """
+    rig = _away(
+        tmp_path, LOS_ANGELES, "evening", "50 23 * * *",
+        datetime(2026, 8, 5, 23, 0, tzinfo=LOS_ANGELES),
+    )
+
+    for _ in range(2 * 12):                      # 23:00 -> 01:00 local
+        rig.daemon.tick()
+        rig.clock.advance(timedelta(minutes=5))
+
+    assert _local_times(rig.fired, LOS_ANGELES) == [
+        "23:50", "00:10", "00:30", "00:50",
+    ]
+    rows = rig.store.connection.execute(
+        "SELECT id, local_date, attempts FROM checkins ORDER BY id"
+    ).fetchall()
+    assert [r["id"] for r in rows] == [1], (
+        f"the retry opened a second check-in row across the day boundary: "
+        f"{[dict(r) for r in rows]}"
+    )
+    assert rows[0]["local_date"] == "2026-08-05"
+    assert rows[0]["attempts"] == rig.config.max_defer_retries + 1
+
+
+def test_a_retry_survives_a_daemon_restart(tmp_path):
+    """The retry is durable, not in-memory: a daemon that dies at 11:05 and
+    comes back at 11:25 must still honour the 11:20 rung. An in-process
+    timer would lose it, and the LaunchAgent's KeepAlive makes restarts a
+    routine event, not an edge case.
+    """
+    rig = _away_all_morning(tmp_path, tz=LOS_ANGELES)
+
+    for _ in range(13):                          # 10:00 -> 11:00, fires once
+        rig.daemon.tick()
+        rig.clock.advance(timedelta(minutes=5))
+    assert _local_times(rig.fired, LOS_ANGELES) == ["11:00"]
+    pending = rig.store.get_checkin(1).retry_at
+    rig.store.close()
+
+    # A fresh process: new Store, new Scheduler, new CheckIn, same database.
+    clock = FakeClock(datetime(2026, 8, 5, 11, 25, tzinfo=LOS_ANGELES))
+    store = Store(tmp_path / "zeus.db", clock)
+    journal = Journal(tmp_path / "journal", clock, LOS_ANGELES)
+    scheduler = Scheduler(store, clock, LOS_ANGELES)
+    fired: list[datetime] = []
+    checkin = _TimestampingCheckIn(
+        CheckIn(
+            kind="morning", store=store, journal=journal,
+            presence=_StubPresence(Verdict.DEFER), voice=_StubVoice(),
+            notifier=FakeNotifier(),
+            conversation_factory=lambda conv_id, local: FakeConversation({}),
+            config=ScheduleConfig(), tz=LOS_ANGELES, clock=clock,
+        ),
+        clock, fired,
+    )
+    scheduler.register("checkin_morning", "0 11 * * *", checkin.run)
+    restarted = Daemon(
+        config=Config(root=tmp_path), store=store, journal=journal,
+        scheduler=scheduler, presence=None, voice=None, notifier=None,
+        checkins={"checkin_morning": checkin}, clock=clock,
+    )
+
+    assert pending.astimezone(LOS_ANGELES).strftime("%H:%M") == "11:20"
+    restarted.tick()
+
+    assert _local_times(fired, LOS_ANGELES) == ["11:25"], (
+        "the 11:20 retry was lost across the restart"
+    )
+    assert store.get_checkin(1).attempts == 2
+    store.close()
+
+
+def test_a_retry_that_raises_does_not_stop_the_tick(tmp_path):
+    """One failing retry must not abort the sweep or crash run_forever --
+    the same isolation Scheduler.run_pending already gives the cron path."""
+    clock = FakeClock(datetime(2026, 8, 5, 11, 30, tzinfo=LOS_ANGELES))
+    store = Store(tmp_path / "zeus.db", clock)
+    journal = Journal(tmp_path / "journal", clock, LOS_ANGELES)
+    scheduler = Scheduler(store, clock, LOS_ANGELES)
+
+    morning = store.open_checkin(
+        "morning", clock.now_utc() - timedelta(minutes=30), "2026-08-05"
+    )
+    evening = store.open_checkin(
+        "evening", clock.now_utc() - timedelta(minutes=30), "2026-08-05"
+    )
+    store.update_checkin(morning, outcome="deferred", attempts=1,
+                         retry_at=clock.now_utc() - timedelta(minutes=10))
+    store.update_checkin(evening, outcome="deferred", attempts=1,
+                         retry_at=clock.now_utc() - timedelta(minutes=5))
+
+    ran: list[str] = []
+
+    class _Boom:
+        def run(self, scheduled_for):
+            ran.append("morning")
+            raise RuntimeError("the API is unreachable")
+
+    class _Fine:
+        def run(self, scheduled_for):
+            ran.append("evening")
+
+    instance = Daemon(
+        config=Config(root=tmp_path), store=store, journal=journal,
+        scheduler=scheduler, presence=None, voice=None, notifier=None,
+        checkins={"checkin_morning": _Boom(), "checkin_evening": _Fine()},
+        clock=clock,
+    )
+
+    instance.tick()                              # must not raise
+
+    assert ran == ["morning", "evening"]
+    assert store.heartbeat() == clock.now_utc()  # the tick still completed
 
 
 def test_build_daemon_wraps_presence_so_a_failed_self_test_can_degrade_it(

@@ -18,6 +18,21 @@ def _dt(value: str | None) -> datetime | None:
     return from_utc_iso(value) if value else None
 
 
+def _checkin_row(row: Any) -> "CheckIn":
+    """Build a CheckIn from a `SELECT *` row.
+
+    A module-level function, not a Store method: Store's lock is plain and
+    non-reentrant, so a Store method that calls another Store method would
+    deadlock rather than raise.
+    """
+    return CheckIn(
+        id=row["id"], kind=row["kind"], local_date=row["local_date"],
+        scheduled_for=from_utc_iso(row["scheduled_for"]),
+        fired_at=_dt(row["fired_at"]), outcome=row["outcome"],
+        attempts=row["attempts"], retry_at=_dt(row["retry_at"]),
+    )
+
+
 @dataclass
 class Goal:
     id: int
@@ -29,6 +44,11 @@ class Goal:
     notes: str | None
 
 
+# A default of None would be indistinguishable from "clear the retry", which
+# is a meaningful instruction here -- see update_checkin.
+_UNSET: Any = object()
+
+
 @dataclass
 class CheckIn:
     id: int
@@ -38,6 +58,21 @@ class CheckIn:
     fired_at: datetime | None
     outcome: str
     attempts: int
+    retry_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class DueRetry:
+    """A check-in whose §9.3 retry has come due.
+
+    Carries scheduled_for, not `now`: a retry at 11:20 belongs to the 11:00
+    occurrence, so re-running it must use the ORIGINAL scheduled time or the
+    ritual computes a fresh local_date and opens a second row.
+    """
+
+    id: int
+    kind: str
+    scheduled_for: datetime
 
 
 @dataclass
@@ -102,6 +137,24 @@ class Store:
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA busy_timeout = 5000")
         self.connection.executescript(_SCHEMA.read_text())
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Additive schema migrations for databases already on disk.
+
+        schema.sql runs through executescript with CREATE TABLE IF NOT
+        EXISTS, which is a no-op against an existing table -- it will NOT
+        add a column to it. A database that predates a column therefore
+        never gains it from schema.sql alone, and this one is already on
+        someone's disk. Each step is guarded so it is safe to run on every
+        startup.
+        """
+        columns = {
+            row["name"]
+            for row in self.connection.execute("PRAGMA table_info(checkins)")
+        }
+        if "retry_at" not in columns:
+            self.connection.execute("ALTER TABLE checkins ADD COLUMN retry_at TEXT")
 
     def close(self) -> None:
         with self._lock:
@@ -175,12 +228,7 @@ class Store:
             row = self.connection.execute(
                 "SELECT * FROM checkins WHERE id = ?", (checkin_id,)
             ).fetchone()
-            return CheckIn(
-                id=row["id"], kind=row["kind"], local_date=row["local_date"],
-                scheduled_for=from_utc_iso(row["scheduled_for"]),
-                fired_at=_dt(row["fired_at"]), outcome=row["outcome"],
-                attempts=row["attempts"],
-            )
+            return _checkin_row(row)
 
     def find_open_checkin(self, kind: str, date: str) -> CheckIn | None:
         """The unresolved check-in of this kind on this local date, if any.
@@ -198,23 +246,51 @@ class Store:
             ).fetchone()
             if row is None:
                 return None
-            return CheckIn(
-                id=row["id"], kind=row["kind"], local_date=row["local_date"],
-                scheduled_for=from_utc_iso(row["scheduled_for"]),
-                fired_at=_dt(row["fired_at"]), outcome=row["outcome"],
-                attempts=row["attempts"],
-            )
+            return _checkin_row(row)
 
     def update_checkin(
         self, checkin_id: int, *, outcome: str, attempts: int,
-        fired_at: datetime | None = None,
+        fired_at: datetime | None = None, retry_at: datetime | None = _UNSET,
     ) -> None:
+        """Record the result of one check-in attempt.
+
+        retry_at defaults to a SENTINEL, not to None. None is a meaningful
+        value here -- it clears a pending §9.3 retry when the sequence
+        terminates -- so a plain `= None` default would silently wipe the
+        retry on every call that does not mention it, including every call
+        site written before the retry ladder existed. Omitting the argument
+        leaves whatever retry is already on the row untouched.
+        """
+        fired = to_utc_iso(fired_at) if fired_at else None
         with self._lock:
-            self.connection.execute(
-                "UPDATE checkins SET outcome = ?, attempts = ?, "
-                "fired_at = COALESCE(?, fired_at) WHERE id = ?",
-                (outcome, attempts, to_utc_iso(fired_at) if fired_at else None, checkin_id),
-            )
+            if retry_at is _UNSET:
+                self.connection.execute(
+                    "UPDATE checkins SET outcome = ?, attempts = ?, "
+                    "fired_at = COALESCE(?, fired_at) WHERE id = ?",
+                    (outcome, attempts, fired, checkin_id),
+                )
+            else:
+                self.connection.execute(
+                    "UPDATE checkins SET outcome = ?, attempts = ?, "
+                    "fired_at = COALESCE(?, fired_at), retry_at = ? WHERE id = ?",
+                    (outcome, attempts, fired,
+                     to_utc_iso(retry_at) if retry_at is not None else None,
+                     checkin_id),
+                )
+
+    def due_retries(self, now_utc: datetime) -> list[DueRetry]:
+        """Check-ins whose retry time has arrived, oldest first."""
+        with self._lock:
+            rows = self.connection.execute(
+                "SELECT id, kind, scheduled_for FROM checkins "
+                "WHERE retry_at IS NOT NULL AND retry_at <= ? "
+                "ORDER BY retry_at",
+                (to_utc_iso(now_utc),),
+            ).fetchall()
+        return [
+            DueRetry(int(r["id"]), r["kind"], from_utc_iso(r["scheduled_for"]))
+            for r in rows
+        ]
 
     # ---- actions -----------------------------------------------------
     def log_action(

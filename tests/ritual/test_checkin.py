@@ -1,6 +1,7 @@
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -214,6 +215,132 @@ def test_a_retry_finds_the_same_row_when_local_and_utc_dates_differ(wiring):
         f"expected the retry to reuse row {first_id}, found rows {after_second}"
     )
     assert store.get_checkin(first_id).attempts == 2
+
+
+# ---- the §9.3 ladder, at the unit level (Task 19) ------------------------
+#
+# next_step() has always returned Decision(outcome, retry_after,
+# fold_forward); run() read .outcome and dropped the rest, so no retry was
+# ever recorded anywhere. These pin the persistence half. The scheduling
+# half -- that a recorded retry actually FIRES -- is only observable with a
+# real Scheduler and a moving clock, and lives in tests/test_daemon.py.
+
+
+class BoomConversation:
+    """A brain that is down. Models an Anthropic API hard failure."""
+
+    def send(self, text):
+        raise RuntimeError("the API is unreachable")
+
+
+def _rig(tmp_path, verdict, conversation):
+    clock = FakeClock(NOW)
+    store = Store(tmp_path / "zeus.db", clock)
+    journal = Journal(tmp_path / "journal", clock, LAGOS)
+    config = ScheduleConfig()
+    checkin = CheckIn(
+        kind="morning", store=store, journal=journal,
+        presence=StubPresence(verdict), voice=StubVoice(),
+        notifier=FakeNotifier(),
+        conversation_factory=lambda conv_id, local: conversation,
+        config=config, tz=LAGOS, clock=clock,
+    )
+    return SimpleNamespace(checkin=checkin, store=store, config=config, clock=clock)
+
+
+def _deferring_checkin(tmp_path):
+    return _rig(tmp_path, Verdict.DEFER, FakeConversation({}))
+
+
+def _raising_checkin(tmp_path):
+    return _rig(tmp_path, Verdict.SPEAK, BoomConversation())
+
+
+def test_a_deferred_checkin_schedules_its_own_retry(tmp_path):
+    """The ladder, at the unit level: DEFER must leave a retry_at behind."""
+    rig = _deferring_checkin(tmp_path)
+    rig.checkin.run(NOW)
+    row = rig.store.get_checkin(1)
+    assert row.outcome == "deferred"
+    assert row.retry_at == NOW + rig.config.defer_retry_after
+
+
+def test_the_retry_is_measured_from_now_not_from_the_scheduled_time(tmp_path):
+    """A retry that comes due at 11:20 must next come due at 11:40, not at
+    11:20 again. Anchoring the interval on `scheduled_for` (the 11:00
+    occurrence, which every retry re-runs with) would leave retry_at pinned
+    at 11:20 forever and turn the daemon tick into a hot loop.
+    """
+    rig = _deferring_checkin(tmp_path)
+    rig.checkin.run(NOW)
+    rig.clock.advance(rig.config.defer_retry_after)
+
+    rig.checkin.run(NOW)                       # the retry re-runs with 11:00
+
+    assert rig.store.get_checkin(1).retry_at == (
+        NOW + 2 * rig.config.defer_retry_after
+    )
+
+
+def test_an_exhausted_checkin_stops_scheduling_retries(tmp_path):
+    """`max_defer_retries` counts RETRIES, not total attempts, so the ladder
+    is one initial run plus that many retries -- see next_step()'s
+    `attempts + 1 > config.max_defer_retries` and
+    tests/ritual/test_retry.py::test_defer_retries_up_to_three_times, which
+    pins a retry at attempts=0, 1 AND 2. Hence the `+ 1`.
+    """
+    rig = _deferring_checkin(tmp_path)
+    for _ in range(rig.config.max_defer_retries + 1):
+        rig.checkin.run(NOW)
+        rig.clock.advance(rig.config.defer_retry_after)
+    assert rig.store.get_checkin(1).attempts == rig.config.max_defer_retries + 1
+    assert rig.store.get_checkin(1).retry_at is None
+
+
+def test_an_answered_checkin_clears_its_pending_retry(tmp_path):
+    """The user was away at 11:00 and answered at 11:20. Nothing must fire
+    at 11:40 -- the pending retry has to be cleared, not merely left behind
+    on a row whose outcome happens to have changed."""
+    rig = _deferring_checkin(tmp_path)
+    rig.checkin.run(NOW)
+    assert rig.store.get_checkin(1).retry_at is not None
+
+    rig.clock.advance(rig.config.defer_retry_after)
+    answering = CheckIn(
+        kind="morning", store=rig.store,
+        journal=Journal(tmp_path / "journal", rig.clock, LAGOS),
+        presence=StubPresence(Verdict.SPEAK),
+        voice=StubVoice(heard=["Finish the auth flow"]),
+        notifier=FakeNotifier(),
+        conversation_factory=lambda conv_id, local: FakeConversation({}),
+        config=rig.config, tz=LAGOS, clock=rig.clock,
+    )
+    answering.run(NOW)
+
+    row = rig.store.get_checkin(1)
+    assert row.outcome == "answered"
+    assert row.retry_at is None
+    assert rig.store.due_retries(NOW + timedelta(hours=6)) == []
+
+
+def test_a_conversation_that_raises_still_counts_as_an_attempt(tmp_path):
+    """Without this, a failing brain retries forever: the exception escaped
+    run() before update_checkin, so attempts never incremented."""
+    rig = _raising_checkin(tmp_path)
+    rig.checkin.run(NOW)                        # must not raise
+    assert rig.store.get_checkin(1).attempts == 1
+
+
+def test_a_conversation_that_raises_is_recorded_as_no_answer(tmp_path):
+    """A dead attempt walks the NO_ANSWER ladder (30m x 1), not the DEFER
+    one: ZEUS did try to speak. The row must still carry a retry so a
+    transient API failure gets a second chance."""
+    rig = _raising_checkin(tmp_path)
+    outcome = rig.checkin.run(NOW)
+    row = rig.store.get_checkin(1)
+    assert outcome is Outcome.NO_ANSWER
+    assert row.outcome == "no_answer"
+    assert row.retry_at == NOW + rig.config.no_answer_retry_after
 
 
 # ---- VoiceIO: the half-duplex seam --------------------------------------

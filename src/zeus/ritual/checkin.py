@@ -181,16 +181,39 @@ class CheckIn:
                 else "Evening check-in"
             )
         elif verdict is Verdict.SPEAK:
-            answered = self._converse(checkin_id, date)
+            try:
+                answered = self._converse(checkin_id, date)
+            except Exception:
+                # An attempt that died is still an attempt. Before retries
+                # were wired this merely lost a row update; with them, a
+                # persistently failing brain (the Anthropic API unreachable,
+                # say) would retry until the day ended, because the
+                # exception escaped run() before update_checkin and so
+                # `attempts` never incremented past whatever it already was.
+                log.error("check-in conversation failed", exc_info=True)
+                answered = False
 
         decision = next_step(
             self._kind, verdict, answered, previous, self._config
+        )
+        # Persisting retry_at is what makes the §9.3 ladder real. next_step
+        # has always computed retry_after; until now run() read .outcome and
+        # dropped the rest, so nothing anywhere scheduled a second attempt
+        # and a user away from the desk at 11:00 was asked exactly once.
+        #
+        # Measured from NOW, not from scheduled_for: every rung re-runs with
+        # the original occurrence, so anchoring on scheduled_for would pin
+        # retry_at at 11:20 forever and turn the daemon tick into a hot loop.
+        retry_at = (
+            self._clock.now_utc() + decision.retry_after
+            if decision.retry_after is not None else None
         )
         self._store.update_checkin(
             checkin_id,
             outcome=decision.outcome.value,
             attempts=previous + 1,
             fired_at=self._clock.now_utc() if verdict is Verdict.SPEAK else None,
+            retry_at=retry_at,
         )
         if decision.outcome is Outcome.NO_ANSWER:
             self._journal.append(f"{self._kind.title()} check-in: no answer")

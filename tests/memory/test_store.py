@@ -1,5 +1,5 @@
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -114,6 +114,96 @@ def test_find_open_checkin_uses_local_not_utc_date(store):
     store.open_checkin("evening", local_dt, "2026-08-05")
     assert store.find_open_checkin("evening", "2026-08-05") is not None
     assert store.find_open_checkin("evening", "2026-08-06") is None
+
+
+# ---- the §9.3 retry ladder's durable half (Task 19) ---------------------
+#
+# The retry lives in the database, not in memory, so a daemon restarted
+# between 11:00 and 11:20 still honours it. `checkins` is the natural home:
+# that row already carries `attempts`, `outcome`, and the original
+# `scheduled_for` the retry must re-use.
+
+
+def test_due_retries_returns_only_checkins_whose_retry_time_has_passed(tmp_path):
+    clock = FakeClock(START)
+    store = Store(tmp_path / "z.db", clock)
+    early = store.open_checkin("morning", START, "2026-08-05")
+    late = store.open_checkin("evening", START, "2026-08-05")
+    store.update_checkin(early, outcome="deferred", attempts=1,
+                         retry_at=START + timedelta(minutes=20))
+    store.update_checkin(late, outcome="deferred", attempts=1,
+                         retry_at=START + timedelta(hours=5))
+
+    assert [d.id for d in store.due_retries(START + timedelta(minutes=19))] == []
+    due = store.due_retries(START + timedelta(minutes=21))
+    assert [d.id for d in due] == [early]
+    assert due[0].kind == "morning"
+    assert due[0].scheduled_for == START      # the ORIGINAL occurrence, not now
+
+
+def test_clearing_retry_at_removes_it_from_due_retries(tmp_path):
+    """An answered check-in must not keep retrying."""
+    clock = FakeClock(START)
+    store = Store(tmp_path / "z.db", clock)
+    cid = store.open_checkin("morning", START, "2026-08-05")
+    store.update_checkin(cid, outcome="deferred", attempts=1,
+                         retry_at=START + timedelta(minutes=20))
+    store.update_checkin(cid, outcome="answered", attempts=2, retry_at=None)
+    assert store.due_retries(START + timedelta(hours=1)) == []
+
+
+def test_omitting_retry_at_leaves_a_pending_retry_alone(store):
+    """`retry_at` needs a SENTINEL default, not None.
+
+    None is a meaningful value here -- it clears the retry -- so a plain
+    `retry_at: datetime | None = None` default would silently wipe the
+    pending retry on every update_checkin call that does not mention it,
+    including every existing call site written before Task 19.
+    """
+    cid = store.open_checkin("morning", START, "2026-08-05")
+    store.update_checkin(cid, outcome="deferred", attempts=1,
+                         retry_at=START + timedelta(minutes=20))
+
+    store.update_checkin(cid, outcome="deferred", attempts=1)   # no retry_at
+
+    assert store.get_checkin(cid).retry_at == START + timedelta(minutes=20)
+    assert [d.id for d in store.due_retries(START + timedelta(hours=1))] == [cid]
+
+
+def test_the_retry_column_is_added_to_a_database_that_predates_it(tmp_path):
+    """schema.sql runs through executescript with CREATE TABLE IF NOT EXISTS,
+    which will NOT add a column to a table that already exists -- and this
+    database is already on someone's disk. Only a guarded ALTER TABLE gets
+    `retry_at` onto it.
+    """
+    import sqlite3
+
+    db_path = tmp_path / "legacy.db"
+    legacy = sqlite3.connect(db_path)
+    legacy.executescript(
+        """
+        CREATE TABLE checkins (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind          TEXT NOT NULL CHECK (kind IN ('morning','evening')),
+            local_date    TEXT NOT NULL,
+            scheduled_for TEXT NOT NULL,
+            fired_at      TEXT,
+            outcome       TEXT NOT NULL DEFAULT 'deferred'
+                          CHECK (outcome IN ('answered','no_answer','deferred','skipped')),
+            attempts      INTEGER NOT NULL DEFAULT 0
+        );
+        """
+    )
+    legacy.commit()
+    legacy.close()
+
+    store = Store(db_path, FakeClock(START))
+    cid = store.open_checkin("morning", START, "2026-08-05")
+    store.update_checkin(cid, outcome="deferred", attempts=1,
+                         retry_at=START + timedelta(minutes=20))
+
+    assert [d.id for d in store.due_retries(START + timedelta(hours=1))] == [cid]
+    store.close()
 
 
 def test_action_log(store):

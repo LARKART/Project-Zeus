@@ -196,8 +196,38 @@ class Daemon:
             self._store.set_job_run(job, when)
         return actions
 
+    def _run_due_retries(self, now: datetime) -> None:
+        """Fire check-ins whose retry_at has arrived (spec §9.3).
+
+        Re-runs with the ORIGINAL scheduled_for, so local_date and the
+        check-in row stay the ones the ritual started with — a retry at 11:20
+        belongs to the 11:00 occurrence, not to a new one. Passing `now`
+        instead would compute a fresh local date at a day boundary, open a
+        second row, restart `attempts` at 1, and never exhaust.
+
+        The retry lives in the database rather than an in-process timer, so a
+        daemon restarted between 11:00 and 11:20 still honours it — and with
+        KeepAlive, restarts are routine.
+        """
+        for due in self._store.due_retries(now):
+            checkin = self._checkins.get(f"checkin_{due.kind}")
+            if checkin is None:
+                continue
+            log.info("retry: firing %s for the occurrence at %s",
+                     due.kind, due.scheduled_for)
+            try:
+                checkin.run(due.scheduled_for)
+            except Exception:
+                # One failing retry must not stop the others or the tick.
+                log.error("retry for %s failed", due.kind, exc_info=True)
+
     def tick(self) -> None:
         now = self._clock.now_utc()
+        # Before run_pending, so a due retry is not delayed by a cron job's
+        # work. The daemon already wakes at least once a minute
+        # (seconds_until_next caps at _MAX_SLEEP), so a 20-minute retry is
+        # observed within a minute of coming due — no new sleep machinery.
+        self._run_due_retries(now)
         self._scheduler.run_pending(now)
         self._store.set_heartbeat()
 
