@@ -43,6 +43,12 @@ _RETRY_SLACK = timedelta(minutes=30)
 # completed goal row. §9.2 outranks a long ladder.
 _RETRY_MAX_AGE = timedelta(hours=6)
 
+# How long the activation loop waits before re-entering events() after the
+# microphone stopped delivering. Subscription.frames()' own idle bound
+# already rate-limits each cycle to _IDLE_TIMEOUT_SECONDS; this only stops a
+# source that fails INSTANTLY (a raising activator, say) from spinning.
+_ACTIVATION_RESTART_SECONDS = 5.0
+
 
 def audio_self_test(mic: MicStream, seconds: float = 1.0) -> bool:
     """Capture briefly and assert the microphone is actually producing audio.
@@ -196,6 +202,12 @@ class Daemon:
         self._activator = activator
         self._mic = mic
         self._running = False
+        # Set when shutdown is requested. An Event, not just the _running
+        # bool, because the activation thread has to WAIT on it: a plain
+        # flag would have to be polled, and the restart backoff would then
+        # be waited out in full before a stop() was noticed.
+        self._shutdown = threading.Event()
+        self._activation_thread: threading.Thread | None = None
         self.degraded = False
 
     def run_catch_up(self) -> list[tuple[str, str]]:
@@ -402,16 +414,59 @@ class Daemon:
         self._store.set_heartbeat()
 
     def _activation_loop(self) -> None:
+        """Consume activation events, RE-ENTERING events() if it ever ends.
+
+        The outer `while` is the whole point. events() is not an endless
+        source any more: A1 gave Subscription.frames() a wall-clock idle
+        bound, and when it fires the chain is unconditional — frames()
+        returns, _detect returns, events() closes its subscription and ends.
+        With a single `for` this thread simply returned, and nothing ever
+        restarted it: start() launches it exactly once. The triggers are the
+        ordinary ones mic.py lists — sleep/wake, AirPods taking over the
+        default input, a USB mic unplugged, a coreaudiod restart — so any
+        one of them over five seconds permanently ended "hey jarvis", with
+        _running still True, nothing logged, and `doctor` unable to see it.
+        Spec §10 exactly inverted.
+
+        WARNING, not INFO: a microphone that stopped delivering is a real
+        fault even though ZEUS recovers from it, and this line is the only
+        evidence of it that ever reaches zeusd.log.
+
+        The backoff is a floor on the cycle time, not the main rate limit —
+        the idle bound already caps each cycle at _IDLE_TIMEOUT_SECONDS.
+        What it protects against is an activation source that fails
+        instantly and repeatedly. Waiting on _shutdown rather than sleeping
+        means stop() cuts the wait short instead of being made to sit
+        through it, which matters because launchd escalates to SIGKILL.
+        """
         if self._activator is None:
             return
-        for event in self._activator.events():
-            if not self._running:
-                return
-            log.info("activated via %s", event.source)
+        restarts = 0
+        while self._running and not self._shutdown.is_set():
             try:
-                self._handle_activation()
+                for event in self._activator.events():
+                    if not self._running:
+                        return
+                    log.info("activated via %s", event.source)
+                    try:
+                        self._handle_activation()
+                    except Exception:
+                        log.error("ad-hoc conversation failed", exc_info=True)
             except Exception:
-                log.error("ad-hoc conversation failed", exc_info=True)
+                # A raising activator must not end activation either — that
+                # is the same silent death by a different door.
+                log.error("the activation source failed", exc_info=True)
+            if not self._running or self._shutdown.is_set():
+                return
+            restarts += 1
+            log.warning(
+                "the microphone stopped delivering audio, so wake-word "
+                "activation ended; restarting it in %.0fs (restart #%d). "
+                "If this repeats, the input device is failing — run "
+                "'zeus doctor'.", _ACTIVATION_RESTART_SECONDS, restarts,
+            )
+            if self._shutdown.wait(_ACTIVATION_RESTART_SECONDS):
+                return
 
     def _handle_activation(self) -> None:
         """Ad-hoc conversation triggered by the wake word."""
@@ -434,6 +489,11 @@ class Daemon:
             self._store.end_conversation(conversation_id)
 
     def start(self) -> None:
+        # Cleared FIRST, before _running is raised, so a restarted daemon
+        # does not inherit the previous run's shutdown signal — and so a
+        # request_stop() arriving during the slow part of start() below
+        # cannot be erased by a later clear.
+        self._shutdown.clear()
         self._running = True
         if self._mic is not None:
             self._mic.start()
@@ -457,11 +517,20 @@ class Daemon:
                     )
         if self._activator is not None and not self.degraded:
             self._activator.start()
-            threading.Thread(target=self._activation_loop, daemon=True).start()
+            # Kept as an attribute so shutdown is OBSERVABLE. Without a
+            # handle, "the activation thread ended" can only be inferred
+            # from threading.active_count(), which counts every other
+            # thread in the process too -- an oracle that let an
+            # uninterruptible backoff survive a mutation run.
+            self._activation_thread = threading.Thread(
+                target=self._activation_loop, daemon=True
+            )
+            self._activation_thread.start()
         self.run_catch_up()
 
     def stop(self) -> None:
         self._running = False
+        self._shutdown.set()
         if self._activator is not None:
             self._activator.stop()
         if self._mic is not None:

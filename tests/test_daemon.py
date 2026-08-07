@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 from zeus.audio.activator import FakeActivator
 from zeus.audio.mic import FRAME_SAMPLES, MicStream
 from zeus.brain.fake import FakeConversation
+from zeus.brain.prompts import NOT_CAUGHT_LINE
 from zeus.brain.tools import build_tool_callables
 from zeus.clock import FakeClock, from_utc_iso
 from zeus.config import AudioConfig, Config, ScheduleConfig
@@ -34,6 +35,14 @@ NOW = datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc)
 
 SILENCE = np.zeros(FRAME_SAMPLES, dtype=np.int16).tobytes()
 SPEECH = (np.ones(FRAME_SAMPLES, dtype=np.int16) * 5000).tobytes()
+
+
+def _await(predicate, message, timeout=5.0):
+    """Spin until `predicate` holds, or fail with `message`."""
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        assert time.monotonic() < deadline, message
+        time.sleep(0.005)
 
 
 def _mic(frames):
@@ -447,8 +456,6 @@ def test_an_activation_that_heard_nothing_says_so(tmp_path):
     talking to it -- and `if not heard: return` walked away without a word.
     No conversation is started, so this costs no API call and still works
     when the brain is the thing that is down."""
-    from zeus.brain.prompts import NOT_CAUGHT_LINE
-
     clock = FakeClock(NOW)
     store = Store(tmp_path / "zeus.db", clock)
     journal = Journal(tmp_path / "journal", clock, LAGOS)
@@ -1399,3 +1406,168 @@ def test_a_retry_that_is_merely_late_still_fires(tmp_path):
     instance.tick()
 
     assert ran == [datetime(2026, 8, 5, 11, 0, tzinfo=tz)]
+
+
+# ---- X2: a gap in the audio must not end "hey jarvis" for the life of the
+#          process
+#
+# THE REGRESSION TEST FOR THE SECOND-ORDER DEFECT THE A1 IDLE BOUND
+# INTRODUCED.
+#
+# Subscription.frames() used to return only on stop(); A1 made it also
+# return after _IDLE_TIMEOUT_SECONDS of silence. The wake detector is the
+# only long-lived consumer, and its chain is unconditional: frames() returns
+# -> _detect returns -> events() closes its subscription and ends ->
+# _activation_loop's single `for` falls out -> the thread returns, and
+# nothing restarted it. Sleep/wake, AirPods taking over the default input, a
+# USB mic unplugged, a coreaudiod restart -- any of them over five seconds
+# permanently ended ad-hoc activation, with _running still True, nothing
+# logged, and `doctor` unable to see it. Spec §10 inverted.
+#
+# Real MicStream, real WakeWordActivator, real Daemon thread. Only the
+# openWakeWord model is a double, because loading the real one downloads
+# over the network.
+
+
+class _ScriptedModel:
+    """Stands in for openwakeword.Model; `score` is flipped by the test."""
+
+    def __init__(self) -> None:
+        self.score = 0.0
+        self.seen = 0
+
+    def predict(self, samples):
+        self.seen += 1
+        return {"hey_jarvis": self.score}
+
+
+class _SignallingVoice:
+    """A voice that records what was spoken and signals that it was used."""
+
+    def __init__(self) -> None:
+        self.spoken: list[str] = []
+        self.activated = threading.Event()
+
+    def speak(self, sentences) -> None:
+        self.spoken.extend(sentences)
+        self.activated.set()
+
+    def listen(self) -> str:
+        return ""
+
+
+def test_wake_word_activation_survives_a_gap_in_the_audio(
+    tmp_path, monkeypatch, caplog
+):
+    """Frames, a gap past the idle bound, then frames again — still activates.
+
+    The gap is a real one: the idle bound is shortened to 0.2s so the test
+    costs a fraction of a second rather than five, but the mechanism is
+    untouched — Subscription.frames() genuinely gives up, _detect genuinely
+    returns, events() genuinely closes its subscription. Before the fix the
+    activation thread was gone by then and the 0.9 scores below reached
+    nobody.
+    """
+    import logging
+
+    from zeus.audio.wakeword import WakeWordActivator
+    from zeus.config import WakeConfig
+
+    monkeypatch.setattr("zeus.audio.mic._IDLE_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr("zeus.daemon._ACTIVATION_RESTART_SECONDS", 0.01)
+
+    clock = FakeClock(NOW)
+    store = Store(tmp_path / "zeus.db", clock)
+    journal = Journal(tmp_path / "journal", clock, LAGOS)
+    scheduler = Scheduler(store, clock, LAGOS)
+    mic = MicStream(AudioConfig())
+    model = _ScriptedModel()
+    activator = WakeWordActivator(mic, WakeConfig(), threshold=0.5)
+    monkeypatch.setattr(activator, "_load_model", lambda: model)
+    voice = _SignallingVoice()
+
+    instance = Daemon(
+        config=Config(root=tmp_path), store=store, journal=journal,
+        scheduler=scheduler, presence=None, voice=voice, notifier=None,
+        checkins={}, clock=clock, activator=activator, mic=None, tz=LAGOS,
+    )
+
+    try:
+        with caplog.at_level(logging.WARNING, logger="zeus.daemon"):
+            instance.start()
+            _await(lambda: activator._subscription is not None,
+                   "the detector never subscribed")
+
+            for _ in range(5):                       # audio, below threshold
+                mic._on_audio(SILENCE, FRAME_SAMPLES, None, None)
+            _await(lambda: model.seen >= 5, "the first frames were not scored")
+
+            time.sleep(0.35)                         # the gap: past the bound
+            _await(lambda: activator._subscription is not None,
+                   "activation was never restarted after the audio gap")
+
+            # The device comes back and the model scores the wake word.
+            model.score = 0.9
+            deadline = time.monotonic() + 5.0
+            while not voice.activated.is_set() and time.monotonic() < deadline:
+                mic._on_audio(SPEECH, FRAME_SAMPLES, None, None)
+                time.sleep(0.02)
+
+        assert voice.activated.is_set(), (
+            "a >5s gap in the audio ended wake-word activation for the life "
+            "of the process: 'hey jarvis' never works again"
+        )
+        assert voice.spoken == [NOT_CAUGHT_LINE]
+        assert any(
+            "restarting" in record.message and record.levelno == logging.WARNING
+            for record in caplog.records
+        ), (
+            "activation restarted silently — §10: fail loudly, never pretend"
+        )
+    finally:
+        instance.stop()
+        mic.stop()
+
+
+def test_the_activation_loop_ends_when_the_daemon_stops(tmp_path, monkeypatch):
+    """The other half: a restart loop that cannot be stopped is a spin.
+
+    stop() must end the thread rather than have it re-enter events() forever
+    — and it must do so without waiting out the restart backoff, since
+    launchd escalates SIGTERM to SIGKILL.
+    """
+    from zeus.audio.wakeword import WakeWordActivator
+    from zeus.config import WakeConfig
+
+    monkeypatch.setattr("zeus.audio.mic._IDLE_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr("zeus.daemon._ACTIVATION_RESTART_SECONDS", 30.0)
+
+    clock = FakeClock(NOW)
+    store = Store(tmp_path / "zeus.db", clock)
+    journal = Journal(tmp_path / "journal", clock, LAGOS)
+    scheduler = Scheduler(store, clock, LAGOS)
+    mic = MicStream(AudioConfig())
+    activator = WakeWordActivator(mic, WakeConfig(), threshold=0.5)
+    monkeypatch.setattr(activator, "_load_model", lambda: _ScriptedModel())
+
+    instance = Daemon(
+        config=Config(root=tmp_path), store=store, journal=journal,
+        scheduler=scheduler, presence=None, voice=None, notifier=None,
+        checkins={}, clock=clock, activator=activator, mic=None, tz=LAGOS,
+    )
+    instance.start()
+    _await(lambda: activator._subscription is not None,
+           "the detector never subscribed")
+    time.sleep(0.15)                         # let it idle out and back off
+
+    instance.stop()
+    mic.stop()
+
+    # The thread itself, not threading.active_count(): the process-wide
+    # count is polluted by every other thread the suite has running, and it
+    # let an uninterruptible time.sleep() backoff survive a mutation run.
+    instance._activation_thread.join(timeout=5.0)
+    assert not instance._activation_thread.is_alive(), (
+        "the activation thread outlived stop() — the 30s restart backoff was "
+        "waited out instead of interrupted, and launchd escalates to SIGKILL"
+    )
