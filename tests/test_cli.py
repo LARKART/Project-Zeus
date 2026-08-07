@@ -493,6 +493,60 @@ def test_run_starts_on_defaults_instead_of_crash_looping(
     ), "ZEUS fell back to defaults without saying so"
 
 
+def test_run_stops_the_daemon_on_sigterm(monkeypatch, tmp_path):
+    """A5: nothing installed a SIGTERM handler, so the whole shutdown path
+    was dead code as deployed -- SIGTERM took its default disposition and
+    the process died on the spot, without Daemon.stop(), MicStream.stop()
+    or the PortAudio close. SIGTERM is how launchd stops a LaunchAgent, so
+    that was every ordinary stop; only KeyboardInterrupt reached the
+    carefully ordered shutdown, i.e. only when run by hand in a terminal.
+
+    The signal is delivered for real (os.kill on this process) rather than
+    by calling the handler directly, so the test also proves the handler
+    was actually INSTALLED.
+
+    The `caught_by_the_net` handler is a SAFETY NET FOR THIS TEST, not part
+    of the assertion: with the fix reverted, an unhandled SIGTERM takes its
+    default disposition and KILLS THE TEST RUNNER -- which is the bug,
+    demonstrated, but it means a regression would take the whole suite down
+    instead of reporting one red test. Installing a no-op first means
+    cmd_run either replaces it (fix present) or does not (fix absent, net
+    absorbs the signal, this test fails alone). The previous disposition is
+    restored afterwards: signal handlers are process-global and monkeypatch
+    does not track them.
+    """
+    import os
+    import signal
+
+    stopped = []
+    caught_by_the_net = []
+
+    class _FakeDaemon:
+        def run_forever(self):
+            os.kill(os.getpid(), signal.SIGTERM)
+            # PEP 475 resumes an interrupted syscall after the handler
+            # returns, so a real run_forever would carry on to its next
+            # tick and exit there. What matters is that stop() ran.
+
+        def stop(self):
+            stopped.append(True)
+
+    monkeypatch.setattr("zeus.daemon.build_daemon", lambda config: _FakeDaemon())
+    previous = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGTERM, lambda *_: caught_by_the_net.append(True))
+    try:
+        assert main(["run", "--root", str(tmp_path)]) == 0
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+    assert caught_by_the_net == [], (
+        "cmd_run never installed a SIGTERM handler — the test's own safety "
+        "net absorbed the signal. Deployed, that signal is fatal and "
+        "Daemon.stop() never runs"
+    )
+    assert stopped == [True], "SIGTERM did not reach Daemon.stop()"
+
+
 def test_a_valid_config_is_still_loaded_and_reported_healthy(
     monkeypatch, tmp_path, capsys
 ):

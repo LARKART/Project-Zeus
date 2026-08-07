@@ -244,6 +244,56 @@ def test_the_self_test_deadline_tolerates_a_slow_device():
     )
 
 
+def test_self_test_fails_when_a_real_mic_dies_part_way_through(monkeypatch):
+    """A4, and the hole A1's own fix opened.
+
+    Subscription.frames() now gives up after an idle timeout instead of
+    parking forever, which fixes the leaked consumer thread -- but it also
+    means `done` no longer means "the wanted frames arrived". It fires when
+    frames() gave up too. A mic that delivered 2 of 6 frames and died would
+    set `done`, sail past the deadline, find seen != 0 and energy != 0, and
+    be reported HEALTHY: the exact R1 failure this function exists to
+    catch, reintroduced through the back door.
+
+    A REAL MicStream, since the whole point is the interaction with the
+    real frames() bound; the idle timeout is shortened so it lands well
+    inside the self-test deadline, which is precisely the ordering that
+    makes `done` win the race.
+    """
+    monkeypatch.setattr("zeus.audio.mic._IDLE_TIMEOUT_SECONDS", 0.3)
+
+    mic = MicStream(AudioConfig())
+
+    def feed():
+        deadline = time.monotonic() + 5.0
+        while not mic._subscribers:
+            if time.monotonic() >= deadline:
+                return
+            time.sleep(0.005)
+        for _ in range(2):          # 2 frames, then the callback dies
+            mic._on_audio(SPEECH, FRAME_SAMPLES, None, None)
+
+    threading.Thread(target=feed, daemon=True).start()
+
+    assert audio_self_test(mic, seconds=0.5) is False, (
+        "a microphone that stopped delivering after 2 of 6 frames was "
+        "reported as healthy"
+    )
+    # ...and the consumer thread is gone rather than left holding a live
+    # subscription that _on_audio keeps filling forever (A4).
+    deadline = time.monotonic() + 5.0
+    while mic._subscribers and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert mic._subscribers == [], "the self-test leaked its subscription"
+
+    for _ in range(50):
+        mic._on_audio(SPEECH, FRAME_SAMPLES, None, None)
+    assert mic.dropped == 0, (
+        "an orphaned subscription is still swallowing frames and polluting "
+        "MicStream.dropped"
+    )
+
+
 @pytest.mark.parametrize(
     "missed,expected",
     [

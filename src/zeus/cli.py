@@ -437,8 +437,54 @@ def cmd_run(config: Config, config_error: str | None = None) -> int:
             "ANTHROPIC_API_KEY is not set and %s did not supply it. "
             "Every conversation will fail. Run 'zeus doctor'.", env_file,
         )
-    build_daemon(config).run_forever()
+    daemon = build_daemon(config)
+    _install_sigterm_handler(daemon)
+    daemon.run_forever()
     return 0
+
+
+def _install_sigterm_handler(daemon) -> None:
+    """Make Daemon.stop() reachable under launchd.
+
+    Without this the whole shutdown path is dead code as deployed: nothing
+    installed a handler, so SIGTERM took its default disposition and the
+    process died on the spot. Daemon.stop(), MicStream.stop() and the
+    PortAudio close never ran — and SIGTERM is how launchd stops a
+    LaunchAgent (`launchctl unload`, logout, shutdown), so that was every
+    ordinary stop. KeyboardInterrupt was the only path that reached the
+    carefully ordered shutdown, i.e. only when run in a terminal by hand.
+
+    stop() runs INSIDE the handler rather than setting a flag for the loop
+    to notice, because PEP 475 makes time.sleep() resume after a handler
+    returns: the tick loop can be up to a minute from its next wake, and
+    launchd sends SIGKILL long before that. Doing the work here means the
+    device is released and the activator stopped even if the process is
+    killed a moment later. stop() itself is signal-safe enough for this —
+    it sets an Event, flips two flags, and closes the stream; it takes no
+    lock the main thread could already be holding, and sqlite needs
+    nothing, being isolation_level=None with every statement autocommitted.
+
+    Failures are swallowed: raising from a signal handler would propagate
+    into whatever the main thread happened to be doing, which is a worse
+    exit than an untidy one.
+    """
+    import signal
+
+    def handle(signum, frame):
+        log.info("SIGTERM received; shutting down")
+        try:
+            daemon.stop()
+        except Exception:
+            log.error("error during shutdown", exc_info=True)
+
+    try:
+        signal.signal(signal.SIGTERM, handle)
+    except ValueError:
+        # signal.signal() only works on the main thread. cmd_run always is
+        # one, but a caller embedding it need not be, and refusing to run
+        # the daemon over a missing shutdown nicety would be the wrong
+        # trade.
+        log.warning("could not install a SIGTERM handler off the main thread")
 
 
 def main(argv: list[str] | None = None) -> int:

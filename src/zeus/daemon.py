@@ -50,6 +50,18 @@ def audio_self_test(mic: MicStream, seconds: float = 1.0) -> bool:
     backed by a monotonic clock, so it can never be defeated by a backward
     wall-clock jump (an NTP correction, a DST transition) the way a
     datetime.now()-based elapsed-time check could be.
+
+    Subscription.frames() now carries its own idle bound (A1), which
+    changes this function in two ways. The thread no longer runs forever on
+    a dead device -- it ends within _IDLE_TIMEOUT_SECONDS of the last frame
+    and closes its subscription, so the leak this used to spring on timeout
+    is bounded and self-clearing. But `done` stopped meaning "the wanted
+    frames arrived": it now also fires when frames() gave up. Hence the
+    explicit `seen < wanted` check below. Without it, a mic that delivered
+    2 of 12 frames and died would set `done`, sail past the deadline, find
+    seen != 0 and energy != 0, and be reported HEALTHY -- the exact R1
+    failure this function exists to catch, reintroduced through the back
+    door by its own fix.
     """
     wanted = max(1, int(seconds * 16000 / FRAME_SAMPLES))
     energy = 0.0
@@ -82,6 +94,13 @@ def audio_self_test(mic: MicStream, seconds: float = 1.0) -> bool:
         return False
     if seen == 0:
         log.error("audio self-test: no frames received from the microphone")
+        return False
+    if seen < wanted:
+        log.error(
+            "audio self-test: the microphone delivered %d of %d frames and "
+            "then stopped — the input device is failing mid-capture",
+            seen, wanted,
+        )
         return False
     if energy <= 0.0:
         log.error(

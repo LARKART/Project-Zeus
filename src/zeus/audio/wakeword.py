@@ -99,8 +99,17 @@ class WakeWordActivator:
             if self._mute_depth > 0:
                 return
             self._muted = False
-        if self._subscription is not None:
-            self._subscription.drain()
+        # BOUND TO A LOCAL FIRST. `if self._subscription is not None:
+        # self._subscription.drain()` compiles to two separate LOAD_ATTRs
+        # (confirmed in the bytecode), and events()' `finally` sets the
+        # attribute to None on another thread — so the second read could
+        # return None and raise AttributeError out of the `finally:` in
+        # VoiceIO.speak/listen, masking whatever exception was already in
+        # flight. The window is tiny (0 hits in 400 forced trials) and only
+        # reachable at shutdown; it is one line to close.
+        subscription = self._subscription
+        if subscription is not None:
+            subscription.drain()
 
     def events(self) -> Iterator[ActivationEvent]:
         if self._model is None:
