@@ -5,6 +5,9 @@ Two distinct retry paths with different causes, cadences, and limits:
   DEFER      user is away or the screen is locked   20 min × 3
   NO_ANSWER  ZEUS spoke into silence                30 min × 1
 
+TWO, not three. NOTIFY is deliberately absent from that list, and from
+§9.3's table — see next_step().
+
 On exhaustion a morning check-in folds forward into the evening one; an
 evening check-in is recorded as skipped, because there is nothing to fold
 into.
@@ -58,7 +61,31 @@ def next_step(
     if answered:
         return Decision(Outcome.ANSWERED, None, False)
 
-    if verdict in (Verdict.DEFER, Verdict.NOTIFY) and answered is None:
+    # NOTIFY IS NOT A RETRY PATH. §9.3's table names exactly two causes,
+    # DEFER and NO_ANSWER, and NOTIFY is not among them. It used to fall
+    # through to the DEFER branch below, which was invisible while run() was
+    # still discarding Decision.retry_after — one notification per check-in.
+    # Once Task 19 wired the ladder, the same fall-through became FOUR
+    # notifications twenty minutes apart, and nothing anywhere can mark a
+    # macOS notification "answered", so it always ran to exhaustion. In
+    # degraded mode DegradedPresence turns every SPEAK into NOTIFY, so that
+    # is not an edge case there but the guaranteed path: eight notifications
+    # a day until the microphone is fixed.
+    #
+    # Retrying would also be redundant rather than merely noisy: §8 says the
+    # notification "speaks on click or wake word", so the user is already
+    # holding the way back in.
+    #
+    # `deferred`, not `skipped`: the check-in is unanswered, not abandoned,
+    # and keeping the row non-terminal is what lets an unanswered morning
+    # fold into the evening opener — the same place an exhausted DEFER
+    # ladder ends up. Checked before the DEFER branch and without consulting
+    # `answered`, because ZEUS never spoke, so "spoke and heard nothing"
+    # cannot apply either.
+    if verdict is Verdict.NOTIFY:
+        return Decision(Outcome.DEFERRED, None, False)
+
+    if verdict is Verdict.DEFER and answered is None:
         if attempts + 1 > config.max_defer_retries:
             return _exhausted(kind, Outcome.DEFERRED)
         return Decision(Outcome.DEFERRED, config.defer_retry_after, False)

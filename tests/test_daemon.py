@@ -1571,3 +1571,52 @@ def test_the_activation_loop_ends_when_the_daemon_stops(tmp_path, monkeypatch):
         "the activation thread outlived stop() — the 30s restart backoff was "
         "waited out instead of interrupted, and launchd escalates to SIGKILL"
     )
+
+
+# ---- X3: degraded mode must notify once a check-in, not four times -------
+
+
+def test_a_notified_checkin_is_not_notified_again_every_twenty_minutes(tmp_path):
+    """The user-visible half of X3, driven through the real ladder.
+
+    A failed mic self-test turns every SPEAK into NOTIFY (DegradedPresence),
+    and nothing anywhere can mark a macOS notification "answered" — so while
+    NOTIFY fell through to the DEFER branch it always ran to exhaustion:
+    four notifications per check-in, eight a day, for as long as the
+    microphone stayed broken. §9.3's table gives NOTIFY no retry at all.
+
+    The scheduler, the CheckIn and the ladder are all real; only presence is
+    pinned, which is exactly what DegradedPresence does.
+    """
+    tz = LOS_ANGELES
+    clock = FakeClock(datetime(2026, 8, 5, 10, 0, tzinfo=tz))
+    store = Store(tmp_path / "zeus.db", clock)
+    journal = Journal(tmp_path / "journal", clock, tz)
+    scheduler = Scheduler(store, clock, tz)
+    notifier = FakeNotifier()
+
+    checkin = CheckIn(
+        kind="morning", store=store, journal=journal,
+        presence=DegradedPresence(_StubPresence(Verdict.SPEAK)),
+        voice=_StubVoice(), notifier=notifier,
+        conversation_factory=lambda conv_id, local: FakeConversation({}),
+        config=ScheduleConfig(), tz=tz, clock=clock,
+    )
+    scheduler.register("checkin_morning", "0 11 * * *", checkin.run)
+    instance = Daemon(
+        config=Config(root=tmp_path), store=store, journal=journal,
+        scheduler=scheduler, presence=None, voice=None, notifier=None,
+        checkins={"checkin_morning": checkin}, clock=clock, tz=tz,
+    )
+
+    for _ in range(13 * 12):                     # 10:00 -> 23:00 local
+        instance.tick()
+        clock.advance(timedelta(minutes=5))
+
+    assert len(notifier.sent) == 1, (
+        f"a degraded-mode check-in sent {len(notifier.sent)} notifications; "
+        f"§9.3 gives NOTIFY no retry, so it must send exactly one"
+    )
+    row = store.get_checkin(1)
+    assert row.retry_at is None
+    assert row.outcome == "deferred"             # unanswered, not abandoned
