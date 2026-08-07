@@ -30,6 +30,7 @@ def _checkin_row(row: Any) -> "CheckIn":
         scheduled_for=from_utc_iso(row["scheduled_for"]),
         fired_at=_dt(row["fired_at"]), outcome=row["outcome"],
         attempts=row["attempts"], retry_at=_dt(row["retry_at"]),
+        notified=bool(row["notified"]),
     )
 
 
@@ -59,6 +60,10 @@ class CheckIn:
     outcome: str
     attempts: int
     retry_at: datetime | None = None
+    # Has macOS already been notified about THIS check-in? One notification
+    # per check-in, however many rungs the §9.3 ladder walks -- see
+    # CheckIn.run(). Set once and never cleared; the row is the scope.
+    notified: bool = False
 
 
 @dataclass(frozen=True)
@@ -155,6 +160,10 @@ class Store:
         }
         if "retry_at" not in columns:
             self.connection.execute("ALTER TABLE checkins ADD COLUMN retry_at TEXT")
+        if "notified" not in columns:
+            self.connection.execute(
+                "ALTER TABLE checkins ADD COLUMN notified INTEGER NOT NULL DEFAULT 0"
+            )
 
     def close(self) -> None:
         with self._lock:
@@ -277,6 +286,20 @@ class Store:
                      to_utc_iso(retry_at) if retry_at is not None else None,
                      checkin_id),
                 )
+
+    def mark_notified(self, checkin_id: int) -> None:
+        """Record that macOS has been notified about this check-in.
+
+        A method of its own rather than another optional argument on
+        update_checkin: `notified` is only ever set, never cleared, so it
+        needs none of retry_at's sentinel machinery -- and adding a third
+        optional column there would have doubled that method's branches
+        again.
+        """
+        with self._lock:
+            self.connection.execute(
+                "UPDATE checkins SET notified = 1 WHERE id = ?", (checkin_id,)
+            )
 
     def due_retries(self, now_utc: datetime) -> list[DueRetry]:
         """Check-ins whose retry time has arrived, oldest first."""

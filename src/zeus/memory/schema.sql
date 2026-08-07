@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS checkins (
     outcome       TEXT NOT NULL DEFAULT 'deferred'
                   CHECK (outcome IN ('answered','no_answer','deferred','skipped')),
     attempts      INTEGER NOT NULL DEFAULT 0,
-    retry_at      TEXT                           -- UTC ISO; NULL = no retry due
+    retry_at      TEXT,                          -- UTC ISO; NULL = no retry due
+    notified      INTEGER NOT NULL DEFAULT 0     -- 1 once macOS has been notified for this row
 );
 CREATE INDEX IF NOT EXISTS idx_checkins_sched ON checkins (scheduled_for);
 CREATE INDEX IF NOT EXISTS idx_checkins_local_date ON checkins (local_date, kind);

@@ -51,10 +51,11 @@ def test_no_answer_exhaustion_skips_an_evening_checkin():
 
 
 def test_notify_is_treated_as_deferred_until_acknowledged():
-    # Deferred, but NOT retried -- this used to expect a 20-minute retry.
-    # See the X3 block at the foot of this file for why that was wrong.
+    # Deferred, and retried on DEFER's cadence. The notification is capped at
+    # one per check-in in CheckIn.run(), not here -- see the §9.3 block at
+    # the foot of this file, which records both ways this has been wrong.
     result = next_step("morning", Verdict.NOTIFY, answered=None, attempts=0, config=CONFIG)
-    assert result == Decision(Outcome.DEFERRED, None, False)
+    assert result == Decision(Outcome.DEFERRED, timedelta(minutes=20), False)
 
 
 def test_notify_that_gets_answered_ends_the_sequence():
@@ -78,30 +79,57 @@ def test_custom_config_is_honoured():
     assert next_step("morning", Verdict.SPEAK, False, 1, config).retry_after == timedelta(minutes=10)
 
 
-# ---- X3: NOTIFY is not one of §9.3's retry paths ------------------------
+# ---- §9.3: NOTIFY walks the DEFER ladder, and notifies once -------------
 #
-# NOTIFY used to fall through to the DEFER branch, which was harmless while
-# Task 19 was still dropping Decision.retry_after on the floor -- one
-# notification per check-in. Once the ladder was wired, the same fall-through
-# became four notifications twenty minutes apart, and nothing can ever mark a
-# macOS notification "answered", so it always ran to exhaustion.
+# This rule has been wrong in both directions, so both are pinned here.
 #
-# In degraded mode (a failed mic self-test) DegradedPresence turns every
-# SPEAK into NOTIFY, so this is not an edge case there but the guaranteed
-# path: eight notifications a day, every day, until the mic is fixed.
+# TOO MANY NOTIFICATIONS. NOTIFY fell through to the DEFER branch, harmless
+# while Task 19 still dropped Decision.retry_after on the floor. Once the
+# ladder was wired it meant four notifications twenty minutes apart, because
+# nothing can ever mark a macOS notification "answered" so it always ran to
+# exhaustion -- and DegradedPresence turns every SPEAK into NOTIFY, making
+# that the guaranteed path after a failed mic self-test: eight a day.
 #
-# §9.3's table names exactly two retry causes, DEFER and NO_ANSWER. NOTIFY is
-# not among them -- and the notification itself is the whole delivery: §8
-# says it "speaks on click or wake word", so the user already holds a way
-# back in that does not need ZEUS to ask again.
+# TOO FEW CHECK-INS. The fix for that made NOTIFY terminal, which killed the
+# ladder: a call starting at 11:20, after an 11:00 defer, cost the whole
+# day's goal.
+#
+# The ruling: the cadence is DEFER's, unchanged, and the ONCE is enforced in
+# CheckIn.run() via the row's `notified` flag -- scheduling and side effect
+# kept apart, since conflating them is what let each defect look like the
+# fix for the other. §8 is why once is enough: the notification "speaks on
+# click or wake word", so the first one is still sitting there.
 
 
-def test_notify_does_not_schedule_a_retry():
-    result = next_step("morning", Verdict.NOTIFY, answered=None, attempts=0, config=CONFIG)
-    assert result.retry_after is None, (
-        "NOTIFY walked the DEFER ladder: four notifications per check-in, "
-        "eight a day in degraded mode, where every check-in is a NOTIFY"
+@pytest.mark.parametrize("attempts", [0, 1, 2])
+def test_notify_keeps_the_defer_ladder_running(attempts):
+    """A passing call must not cost the day's goal.
+
+    Screen locked at 11:00 -> DEFER, rung booked for 11:20. A Zoom call or
+    Focus session starts by 11:20 -> NOTIFY. If that ends the ladder, the
+    morning is never asked again and the evening opens with FOLDED_OPENER.
+    """
+    result = next_step(
+        "morning", Verdict.NOTIFY, answered=None, attempts=attempts, config=CONFIG
     )
+    assert result.retry_after == timedelta(minutes=20), (
+        "a NOTIFY rung ended the DEFER ladder: one passing call at the wrong "
+        "moment and the day gets no goal at all"
+    )
+
+
+def test_notify_exhausts_on_the_same_rung_defer_does():
+    """It shares the ladder, so it shares the end of it -- not a longer one.
+
+    attempts + 1 > max_defer_retries is the boundary; at max_defer_retries
+    the ladder is spent and a morning folds forward into the evening.
+    """
+    spent = next_step(
+        "morning", Verdict.NOTIFY, answered=None,
+        attempts=CONFIG.max_defer_retries, config=CONFIG,
+    )
+    assert spent.retry_after is None
+    assert spent.fold_forward is True
 
 
 def test_notify_leaves_the_checkin_open_rather_than_settling_it():
@@ -117,29 +145,8 @@ def test_notify_leaves_the_checkin_open_rather_than_settling_it():
     assert result.outcome is Outcome.DEFERRED
 
 
-@pytest.mark.parametrize("attempts", [0, 1, 2, 3, 9])
-def test_notify_never_schedules_a_retry_at_any_attempt_count(attempts):
-    """No rung of the ladder, not just not the first.
-
-    A NOTIFY landing partway through a DEFER ladder (the screen unlocks into
-    a Focus session) must end the retries rather than continue them: the
-    cause of THIS attempt is NOTIFY, and §9.3 gives NOTIFY no retry.
-
-    Honest about which params carry the fix: only [0]-[2] do. At attempts=3
-    and 9 the ladder is already exhausted, so the PRE-FIX code returned None
-    here too and those two params would pass against the bug. They are kept
-    because "at any attempt count" is the claim being made, and a reader
-    checking the boundary should see it covered — but the guard against the
-    NOTIFY defect itself lives entirely in [0]-[2].
-    """
-    result = next_step(
-        "evening", Verdict.NOTIFY, answered=None, attempts=attempts, config=CONFIG
-    )
-    assert result.retry_after is None
-
-
 def test_defer_still_walks_the_ladder():
-    """Guards the guard: the fix must not disarm the DEFER path with it."""
+    """Guards the guard: the rule must not disarm the DEFER path with it."""
     assert next_step(
         "morning", Verdict.DEFER, answered=None, attempts=0, config=CONFIG
     ).retry_after == timedelta(minutes=20)

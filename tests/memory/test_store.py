@@ -174,7 +174,12 @@ def test_the_retry_column_is_added_to_a_database_that_predates_it(tmp_path):
     """schema.sql runs through executescript with CREATE TABLE IF NOT EXISTS,
     which will NOT add a column to a table that already exists -- and this
     database is already on someone's disk. Only a guarded ALTER TABLE gets
-    `retry_at` onto it.
+    `retry_at` -- and, later, `notified` -- onto it.
+
+    Both columns are checked here, and `notified` is read back through
+    get_checkin rather than just queried: _checkin_row does a SELECT * and
+    reads row["notified"], so a missing migration is not a default-value
+    problem but an exception on every check-in the daemon ever loads.
     """
     import sqlite3
 
@@ -203,6 +208,10 @@ def test_the_retry_column_is_added_to_a_database_that_predates_it(tmp_path):
                          retry_at=START + timedelta(minutes=20))
 
     assert [d.id for d in store.due_retries(START + timedelta(hours=1))] == [cid]
+
+    assert store.get_checkin(cid).notified is False
+    store.mark_notified(cid)
+    assert store.get_checkin(cid).notified is True
     store.close()
 
 

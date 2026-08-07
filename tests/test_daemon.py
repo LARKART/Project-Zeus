@@ -1727,7 +1727,78 @@ def test_a_ladder_longer_than_the_cap_says_so_instead_of_blaming_the_clock(
     )
 
 
-# ---- X3: degraded mode must notify once a check-in, not four times -------
+# ---- §9.3: notify once per check-in, but never end the ladder -----------
+#
+# Two guarantees that have to hold TOGETHER, and each has been broken by the
+# fix for the other. Both are driven through the real scheduler, the real
+# CheckIn and the real ladder here, because both defects were invisible in
+# next_step() alone and only showed up as a day's behaviour.
+
+
+class _VerdictScript:
+    """Presence that returns a different verdict on each successive call."""
+
+    def __init__(self, verdicts) -> None:
+        self._verdicts = list(verdicts)
+        self.calls = 0
+
+    def verdict(self):
+        v = self._verdicts[min(self.calls, len(self._verdicts) - 1)]
+        self.calls += 1
+        return v
+
+
+def test_a_call_at_the_wrong_moment_does_not_cost_the_days_goal(tmp_path):
+    """The other half: a NOTIFY rung must not END the ladder.
+
+    Screen locked at 11:00 → DEFER, rung booked for 11:20. A Zoom call or
+    Focus session has started by 11:20 → NOTIFY. When NOTIFY was terminal
+    that was the end of the morning: no goal that day, and the evening
+    opening with FOLDED_OPENER, all from one passing call. The ladder must
+    survive it and still ask when the user is free at 11:40.
+
+    Real scheduler, real CheckIn, real ladder; only presence is scripted,
+    and the conversation calls the genuine save_goal.
+    """
+    tz = LOS_ANGELES
+    clock = FakeClock(datetime(2026, 8, 5, 10, 0, tzinfo=tz))
+    store = Store(tmp_path / "zeus.db", clock)
+    journal = Journal(tmp_path / "journal", clock, tz)
+    scheduler = Scheduler(store, clock, tz)
+    notifier = FakeNotifier()
+    presence = _VerdictScript([Verdict.DEFER, Verdict.NOTIFY, Verdict.SPEAK])
+
+    def factory(conversation_id, date):
+        return FakeConversation(
+            script={},
+            tools=build_tool_callables(store, journal, conversation_id, date),
+            tool_calls=[[("save_goal", {"text": "finish the deck"})]],
+        )
+
+    checkin = CheckIn(
+        kind="morning", store=store, journal=journal, presence=presence,
+        voice=_StubVoice(), notifier=notifier, conversation_factory=factory,
+        config=ScheduleConfig(), tz=tz, clock=clock,
+    )
+    scheduler.register("checkin_morning", "0 11 * * *", checkin.run)
+    instance = Daemon(
+        config=Config(root=tmp_path), store=store, journal=journal,
+        scheduler=scheduler, presence=None, voice=None, notifier=None,
+        checkins={"checkin_morning": checkin}, clock=clock, tz=tz,
+    )
+
+    for _ in range(13 * 12):                     # 10:00 -> 23:00 local
+        instance.tick()
+        clock.advance(timedelta(minutes=5))
+
+    goal = store.get_goal("2026-08-05")
+    assert goal is not None and goal.text == "finish the deck", (
+        "a single NOTIFY rung ended the DEFER ladder — one passing call at "
+        "11:20 and the whole day gets no goal"
+    )
+    assert len(notifier.sent) == 1, (
+        f"{len(notifier.sent)} notifications for one check-in; the cap is one"
+    )
 
 
 def test_a_notified_checkin_is_not_notified_again_every_twenty_minutes(tmp_path):
@@ -1735,9 +1806,13 @@ def test_a_notified_checkin_is_not_notified_again_every_twenty_minutes(tmp_path)
 
     A failed mic self-test turns every SPEAK into NOTIFY (DegradedPresence),
     and nothing anywhere can mark a macOS notification "answered" — so while
-    NOTIFY fell through to the DEFER branch it always ran to exhaustion:
-    four notifications per check-in, eight a day, for as long as the
-    microphone stayed broken. §9.3's table gives NOTIFY no retry at all.
+    the ladder notified on every rung it ran to exhaustion: four
+    notifications per check-in, eight a day, for as long as the microphone
+    stayed broken.
+
+    The ladder itself is right to keep running (see the test above); what
+    must not repeat is the NOTIFICATION, and CheckIn.run() caps that on the
+    row's `notified` flag.
 
     The scheduler, the CheckIn and the ladder are all real; only presence is
     pinned, which is exactly what DegradedPresence does.
@@ -1769,10 +1844,14 @@ def test_a_notified_checkin_is_not_notified_again_every_twenty_minutes(tmp_path)
 
     assert len(notifier.sent) == 1, (
         f"a degraded-mode check-in sent {len(notifier.sent)} notifications; "
-        f"§9.3 gives NOTIFY no retry, so it must send exactly one"
+        f"the cap is one per check-in, however many rungs the ladder walks"
     )
     row = store.get_checkin(1)
+    # The ladder ran and then EXHAUSTED, rather than never having run: the
+    # notification is capped, the retries are not.
     assert row.retry_at is None
+    assert row.attempts == ScheduleConfig().max_defer_retries + 1
+    assert row.notified is True
     assert row.outcome == "deferred"             # unanswered, not abandoned
 
 

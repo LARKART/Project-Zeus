@@ -191,16 +191,28 @@ class CheckIn:
     def run(self, scheduled_for: datetime) -> Outcome:
         date = local_date(scheduled_for, self._tz)
         checkin_id = self._find_or_open(scheduled_for)
-        previous = self._store.get_checkin(checkin_id).attempts
+        row = self._store.get_checkin(checkin_id)
+        previous = row.attempts
         verdict = self._presence.verdict()
 
         answered: bool | None = None
 
         if verdict is Verdict.NOTIFY:
-            self._notifier.notify(
-                "ZEUS", "Morning check-in" if self._kind == "morning"
-                else "Evening check-in"
-            )
+            # ONCE PER CHECK-IN, however many rungs the ladder walks. The
+            # ladder must keep running -- a passing call at 11:20 must not
+            # cost the day's goal -- but nothing can mark a macOS
+            # notification "answered", so a ladder that notified on every
+            # rung ran to exhaustion and sent four; in degraded mode, where
+            # every verdict is NOTIFY, eight a day. §8 also makes a repeat
+            # pointless rather than merely noisy: the notification "speaks
+            # on click or wake word", so the first one already handed the
+            # user the way back in and it is still sitting there.
+            if not row.notified:
+                self._notifier.notify(
+                    "ZEUS", "Morning check-in" if self._kind == "morning"
+                    else "Evening check-in"
+                )
+                self._store.mark_notified(checkin_id)
         elif verdict is Verdict.SPEAK:
             try:
                 answered = self._converse(checkin_id, date)

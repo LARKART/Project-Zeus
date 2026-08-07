@@ -61,31 +61,38 @@ def next_step(
     if answered:
         return Decision(Outcome.ANSWERED, None, False)
 
-    # NOTIFY IS NOT A RETRY PATH. §9.3's table names exactly two causes,
-    # DEFER and NO_ANSWER, and NOTIFY is not among them. It used to fall
-    # through to the DEFER branch below, which was invisible while run() was
-    # still discarding Decision.retry_after — one notification per check-in.
-    # Once Task 19 wired the ladder, the same fall-through became FOUR
-    # notifications twenty minutes apart, and nothing anywhere can mark a
-    # macOS notification "answered", so it always ran to exhaustion. In
-    # degraded mode DegradedPresence turns every SPEAK into NOTIFY, so that
-    # is not an edge case there but the guaranteed path: eight notifications
+    # NOTIFY WALKS THE DEFER LADDER, BUT NOTIFIES ONLY ONCE. The two halves
+    # are separated on purpose, and this comment is the record of why —
+    # getting it wrong has now produced a defect in each direction.
+    #
+    # Too many notifications: NOTIFY used to fall through to the DEFER
+    # branch, which was harmless while run() still discarded
+    # Decision.retry_after. Once Task 19 wired the ladder it became FOUR
+    # notifications twenty minutes apart, because nothing anywhere can mark
+    # a macOS notification "answered" so the ladder always ran to
+    # exhaustion. DegradedPresence turns every SPEAK into NOTIFY, so in
+    # degraded mode that is not an edge case but the guaranteed path: eight
     # a day until the microphone is fixed.
     #
-    # Retrying would also be redundant rather than merely noisy: §8 says the
-    # notification "speaks on click or wake word", so the user is already
-    # holding the way back in.
+    # Too few check-ins: the fix for that made NOTIFY terminal, which killed
+    # the ladder outright. Measured — screen locked at 11:00 (DEFER, rung
+    # booked for 11:20), a call or Focus session starting by 11:20 (NOTIFY),
+    # and the morning was never asked again. A twenty-second call cost the
+    # whole day's goal. §9.3's table gives NOTIFY no retry CAUSE, but it
+    # does not contemplate the verdict changing mid-ladder, and the human
+    # ruled on the reading: the ladder is the DEFER ladder, and NOTIFY
+    # neither extends nor ends it.
+    #
+    # So the cadence is DEFER's, unchanged, and the ONCE is enforced where
+    # the notification is actually sent — CheckIn.run() consults the row's
+    # `notified` flag. Scheduling and side effect, kept apart, because that
+    # is what let one defect masquerade as the other.
     #
     # `deferred`, not `skipped`: the check-in is unanswered, not abandoned,
     # and keeping the row non-terminal is what lets an unanswered morning
-    # fold into the evening opener — the same place an exhausted DEFER
-    # ladder ends up. Checked before the DEFER branch and without consulting
-    # `answered`, because ZEUS never spoke, so "spoke and heard nothing"
-    # cannot apply either.
-    if verdict is Verdict.NOTIFY:
-        return Decision(Outcome.DEFERRED, None, False)
-
-    if verdict is Verdict.DEFER and answered is None:
+    # fold into the evening opener. `answered` is not consulted for NOTIFY
+    # because ZEUS never spoke, so "spoke and heard nothing" cannot apply.
+    if verdict is Verdict.NOTIFY or (verdict is Verdict.DEFER and answered is None):
         if attempts + 1 > config.max_defer_retries:
             return _exhausted(kind, Outcome.DEFERRED)
         return Decision(Outcome.DEFERRED, config.defer_retry_after, False)
