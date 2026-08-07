@@ -14,7 +14,6 @@ from zeus.memory.journal import Journal
 from zeus.memory.store import Store
 from zeus.ritual.checkin import CheckIn, FakeNotifier, local_date
 from zeus.schedule.scheduler import Scheduler
-from zeus.tts.fake import FakeSpeaker
 
 # RUN THE WHOLE GOLDEN PATH IN TWO ZONES. The original version hardcoded UTC
 # instants and read them through Africa/Lagos (UTC+1), where 10:00Z and 20:00Z
@@ -31,7 +30,6 @@ from zeus.tts.fake import FakeSpeaker
 #
 # Lagos stays because it is the user's real timezone; LA is added because it
 # is the one that can fail.
-LAGOS = ZoneInfo("Africa/Lagos")
 ZONES = [
     pytest.param("Africa/Lagos", id="lagos_utc_plus_1"),
     pytest.param("America/Los_Angeles", id="los_angeles_utc_minus_7"),
@@ -187,8 +185,11 @@ def test_full_day_morning_goal_to_evening_review(rig):
     assert goal.reviewed_at is not None
 
     # The evening's own words must also land in the LOCAL day's journal file,
-    # not tomorrow's.
-    assert "tests missing" in journal.read(day) or journal.read(day)
+    # not tomorrow's. NO `or journal.read(day)` TAIL: that made the assertion
+    # unconditional, because the morning's "Goal set: ..." line already makes
+    # read(day) truthy. Proven vacuous by deleting the evening's
+    # journal.append() from _record_outcome — both zones still passed.
+    assert "tests missing" in journal.read(day)
 
     assert [a.tool for a in store.recent_actions()] == [
         "record_outcome", "save_goal",      # recent_actions is newest-first

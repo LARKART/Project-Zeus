@@ -76,6 +76,12 @@ class ContextConfig:
 
 @dataclass
 class PrivacyConfig:
+    # DECLARED, NOT ENFORCED. Nothing in src/ reads this field: no purge job
+    # is registered with the scheduler, no `DELETE FROM messages` exists
+    # anywhere. Slice 1 keeps transcripts indefinitely regardless of this
+    # value. Enforcing it (a scheduled purge job) is Slice 2 work — do not
+    # assume this number does anything until that lands. See README.md
+    # "Your data".
     transcript_retention_days: int = 90
 
 

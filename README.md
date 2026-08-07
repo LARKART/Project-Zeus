@@ -63,9 +63,15 @@ talking at you.
 ## Your data
 
 Everything lives in `~/.zeus/` — delete that directory and ZEUS knows
-nothing. Audio is never written to disk; only transcripts are stored, for
-`transcript_retention_days` (default 90). Your transcribed text goes to the
-Anthropic API; your audio does not, because transcription runs locally.
+nothing. Audio is never written to disk; only transcripts are stored. Your
+transcribed text goes to the Anthropic API; your audio does not, because
+transcription runs locally.
+
+**Retention is not yet enforced.** `transcript_retention_days` exists in
+`~/.zeus/config.toml` (default 90) but nothing currently reads it — no purge
+job runs, so transcripts are kept indefinitely in Slice 1. Automatic
+deletion after that window is planned for Slice 2. Until then, the only way
+to remove old transcripts is to delete them yourself from `~/.zeus/`.
 
 ## Tests
 
