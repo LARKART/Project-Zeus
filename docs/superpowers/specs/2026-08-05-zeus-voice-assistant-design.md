@@ -254,7 +254,7 @@ voice loop. WAL permits concurrent readers alongside one writer. Combined with a
 | Table | Purpose | Columns |
 |---|---|---|
 | `goals` | the ritual's substance | `id`, `date`, `text`, `status`, `set_at`, `reviewed_at`, `notes` |
-| `checkins` | did the ritual fire, and what happened | `id`, `kind`, `scheduled_for`, `fired_at`, `outcome`, `attempts` |
+| `checkins` | did the ritual fire, and what happened | `id`, `kind`, `local_date`, `scheduled_for`, `fired_at`, `outcome`, `attempts`, `retry_at`, `notified` |
 | `actions` | every tool call — the dashboard's spine | `id`, `ts`, `conversation_id`, `tool`, `args_json`, `result_json`, `ok`, `duration_ms`, `error` |
 | `conversations` | session envelope | `id`, `started_at`, `ended_at`, `trigger` |
 | `messages` | transcript | `id`, `conversation_id`, `role`, `content`, `ts` |
@@ -396,6 +396,26 @@ Both paths increment `checkins.attempts`. A check-in still awaiting a retry carr
 `outcome=deferred`; the value is rewritten to `answered`, `no_answer`, or `skipped` when
 the sequence terminates.
 
+**NOTIFY within a ladder.** The table above lists the two things that START a retry
+sequence. It is not a statement about what happens when the context gate returns a
+different verdict on a rung of a sequence already running, and that case is real: the
+screen is locked at 11:00 (`DEFER`, rung booked for 11:20) and a call has started by 11:20
+(`NOTIFY`). The rule is:
+
+- A `NOTIFY` rung **neither extends nor ends** the ladder. It keeps the `DEFER` cadence,
+  the `DEFER` attempt limit, and the `DEFER` exhaustion behaviour.
+- **At most one notification per check-in**, however many rungs the ladder walks. This is
+  enforced by `checkins.notified`, not by the retry state machine.
+
+Both halves are required, and each was once broken by the fix for the other. Notifying on
+every rung sent four notifications per check-in — eight a day in degraded mode, where a
+failed mic self-test turns every `SPEAK` into `NOTIFY` — because nothing can ever mark a
+macOS notification "answered", so the ladder always ran to exhaustion. Ending the ladder
+on `NOTIFY` instead meant one passing call at 11:20 cost the entire day's goal.
+
+One notification is enough because of §8: it "speaks on click or wake word", so the first
+one is still sitting there offering the way back in.
+
 The listen window itself is `listen_timeout` (30 s) of silence after the prompt finishes
 playing.
 
@@ -508,6 +528,7 @@ was said), `FakeClock`, and a stubbed brain.
 | Catch-up | Stale heartbeat → correct set of missed jobs identified and §9.2 rules applied |
 | Ring buffer | Utterance assembled from a wake event includes pre-roll audio (no clipping) |
 | Retry paths (§9.3) | DEFER retries 3× at 20 min; NO_ANSWER retries 1× at 30 min; `checkins.attempts` increments; exhaustion folds a morning check-in into the evening one and marks an evening one `skipped` |
+| NOTIFY within a ladder (§9.3) | A `NOTIFY` rung keeps the `DEFER` cadence rather than ending the sequence, and the check-in sends at most one notification however many rungs it walks |
 | Failure paths | Empty transcript, API error, refusal stop reason, locked DB each produce the §10 behavior |
 | Timezone | A check-in across a DST boundary still fires at local 11:00 |
 
