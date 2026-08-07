@@ -6459,6 +6459,264 @@ git commit -m "test: end-to-end golden path across the assembled spine"
 
 ---
 
+### Task 19: Wire the retry ladder (added after the final review)
+
+**Why this task exists.** The final whole-branch review found that spec §9.3's
+retry ladder is computed and then discarded. `next_step()` returns
+`Decision(outcome, retry_after, fold_forward)`; `CheckIn.run` reads `.outcome`
+and drops the rest, and its return value is discarded by both call sites.
+`Scheduler` has only a cron `register()` — no one-shot API — and `build_daemon`
+registers exactly two cron jobs. Nothing anywhere schedules a run at
+`now + retry_after`.
+
+Proven end to end with the real `Scheduler` and a real `CheckIn`, presence
+pinned to DEFER, ticking every 5 minutes from 10:00 to 23:00 local:
+
+```
+handler fired 1 time(s):  11:00 PDT
+checkins: kind=morning outcome=deferred attempts=1
+spec requires 3 attempts (11:00 / 11:20 / 11:40); got 1
+```
+
+So if the user is away from the desk at 11:00, ZEUS asks once and gives up for
+the day — the exact situation the ladder was designed for.
+`defer_retry_after`, `max_defer_retries`, `no_answer_retry_after` and
+`max_no_answer_retries` currently have no runtime effect, and because
+`attempts` never reaches 2, `_exhausted()` and the whole morning→evening
+fold-forward path are unreachable.
+
+It hid because the two tests that look like retry tests call
+`checkin.run(morning_at)` twice at the SAME instant with no scheduler and no
+clock advance. They pin the state machine and row reuse — never the
+scheduling.
+
+**Scope note:** folding needs no new code. `_opener()` already falls back to
+`FOLDED_OPENER` when the evening finds no goal, so `fold_forward` is
+informational. The only missing mechanism is "run this check-in again at T".
+
+**Design — durable, not in-memory.** The retry lives in the database, so a
+daemon restarted between 11:00 and 11:20 still honours it. A `retry_at` column
+on `checkins` is the natural home: that row already carries `attempts`,
+`outcome`, and the original `scheduled_for` the retry must re-use, and it is
+already found by `_find_or_open`.
+
+**Files:**
+- Modify: `src/zeus/memory/schema.sql` — add `retry_at TEXT` to `checkins`
+- Modify: `src/zeus/memory/store.py` — `update_checkin(..., retry_at=...)`, new `due_retries()`
+- Modify: `src/zeus/ritual/checkin.py` — persist `retry_at`; wrap `_converse`
+- Modify: `src/zeus/daemon.py` — run due retries each tick
+- Test: `tests/memory/test_store.py`, `tests/ritual/test_checkin.py`, `tests/test_daemon.py`
+
+**Interfaces:**
+- Produces: `Store.due_retries(now_utc: datetime) -> list[DueRetry]` where
+  `DueRetry` carries `id: int`, `kind: str`, `scheduled_for: datetime`.
+- `Store.update_checkin` gains `retry_at: datetime | None`, written as UTC ISO
+  via `to_utc_iso`, or `NULL` to clear.
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# tests/memory/test_store.py
+def test_due_retries_returns_only_checkins_whose_retry_time_has_passed(tmp_path):
+    clock = FakeClock(START)
+    store = Store(tmp_path / "z.db", clock)
+    early = store.open_checkin("morning", START, "2026-08-05")
+    late = store.open_checkin("evening", START, "2026-08-05")
+    store.update_checkin(early, outcome="deferred", attempts=1,
+                         retry_at=START + timedelta(minutes=20))
+    store.update_checkin(late, outcome="deferred", attempts=1,
+                         retry_at=START + timedelta(hours=5))
+
+    assert [d.id for d in store.due_retries(START + timedelta(minutes=19))] == []
+    due = store.due_retries(START + timedelta(minutes=21))
+    assert [d.id for d in due] == [early]
+    assert due[0].kind == "morning"
+    assert due[0].scheduled_for == START      # the ORIGINAL occurrence, not now
+
+
+def test_clearing_retry_at_removes_it_from_due_retries(tmp_path):
+    """An answered check-in must not keep retrying."""
+    clock = FakeClock(START)
+    store = Store(tmp_path / "z.db", clock)
+    cid = store.open_checkin("morning", START, "2026-08-05")
+    store.update_checkin(cid, outcome="deferred", attempts=1,
+                         retry_at=START + timedelta(minutes=20))
+    store.update_checkin(cid, outcome="answered", attempts=2, retry_at=None)
+    assert store.due_retries(START + timedelta(hours=1)) == []
+```
+
+```python
+# tests/ritual/test_checkin.py
+def test_a_deferred_checkin_schedules_its_own_retry(tmp_path):
+    """The ladder, at the unit level: DEFER must leave a retry_at behind."""
+    rig = _deferring_checkin(tmp_path)          # presence returns DEFER
+    rig.checkin.run(NOW)
+    row = rig.store.get_checkin(1)
+    assert row.outcome == "deferred"
+    assert row.retry_at == NOW + rig.config.defer_retry_after
+
+
+def test_an_exhausted_checkin_stops_scheduling_retries(tmp_path):
+    rig = _deferring_checkin(tmp_path)
+    for _ in range(rig.config.max_defer_retries):
+        rig.checkin.run(NOW)
+    assert rig.store.get_checkin(1).retry_at is None
+
+
+def test_a_conversation_that_raises_still_counts_as_an_attempt(tmp_path):
+    """Without this, a failing brain retries forever: the exception escaped
+    run() before update_checkin, so attempts never incremented."""
+    rig = _raising_checkin(tmp_path)
+    rig.checkin.run(NOW)                        # must not raise
+    assert rig.store.get_checkin(1).attempts == 1
+```
+
+```python
+# tests/test_daemon.py
+def test_the_daemon_runs_a_retry_when_it_comes_due(tmp_path):
+    """THE REGRESSION TEST FOR THE WHOLE FINDING. Drives the real Scheduler
+    and a real CheckIn across a simulated morning with the user away, and
+    asserts the ladder actually fires three times."""
+    rig = _away_all_morning(tmp_path, tz=LOS_ANGELES)
+    for _ in range(13 * 12):                    # 10:00 -> 23:00 local, every 5 min
+        rig.daemon.tick()
+        rig.clock.advance(timedelta(minutes=5))
+    assert rig.store.get_checkin(1).attempts == 3
+    assert [f.astimezone(LOS_ANGELES).strftime("%H:%M")
+            for f in rig.fired] == ["11:00", "11:20", "11:40"]
+```
+
+- [ ] **Step 2: Run them and watch them fail**
+
+Run: `.venv/bin/pytest tests/ -k "retry or due_retries" -v`
+Expected: FAIL — `Store.due_retries` does not exist; `attempts == 1`, not 3.
+
+- [ ] **Step 3: Add the column**
+
+`src/zeus/memory/schema.sql`, in `checkins`:
+
+```sql
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    retry_at      TEXT                          -- UTC ISO; NULL = no retry due
+```
+
+The schema runs through `executescript` with `CREATE TABLE IF NOT EXISTS`, so
+an existing database will NOT gain the column. Add a guarded migration in
+`Store.__init__`, after the `executescript`:
+
+```python
+        # CREATE TABLE IF NOT EXISTS will not add a column to a table that
+        # already exists, and this database is already on someone's disk.
+        columns = {row["name"] for row in self.connection.execute(
+            "PRAGMA table_info(checkins)")}
+        if "retry_at" not in columns:
+            self.connection.execute("ALTER TABLE checkins ADD COLUMN retry_at TEXT")
+```
+
+- [ ] **Step 4: Store support**
+
+`update_checkin` gains `retry_at: datetime | None = _UNSET`. Use a sentinel,
+not `None`, as the default: `None` is a meaningful value here (clear the
+retry), so a plain default would silently wipe the retry on every call that
+does not mention it. Write with `to_utc_iso`.
+
+```python
+@dataclass(frozen=True)
+class DueRetry:
+    id: int
+    kind: str
+    scheduled_for: datetime
+
+
+    def due_retries(self, now_utc: datetime) -> list[DueRetry]:
+        """Check-ins whose retry time has arrived, oldest first."""
+        with self._lock:
+            rows = self.connection.execute(
+                "SELECT id, kind, scheduled_for FROM checkins "
+                "WHERE retry_at IS NOT NULL AND retry_at <= ? "
+                "ORDER BY retry_at",
+                (to_utc_iso(now_utc),),
+            ).fetchall()
+        return [DueRetry(int(r["id"]), r["kind"], from_utc_iso(r["scheduled_for"]))
+                for r in rows]
+```
+
+- [ ] **Step 5: Persist the decision in CheckIn.run**
+
+Two changes. First, `_converse` must not be able to skip the bookkeeping —
+otherwise a brain that raises never increments `attempts` and, once retries
+are live, retries forever:
+
+```python
+        elif verdict is Verdict.SPEAK:
+            try:
+                answered = self._converse(checkin_id, date)
+            except Exception:
+                # An attempt that died is still an attempt. Before retries
+                # were wired this merely lost a row update; with them, a
+                # persistently failing brain would retry until the day ended.
+                log.error("check-in conversation failed", exc_info=True)
+                answered = False
+```
+
+Then persist the retry alongside the outcome:
+
+```python
+        retry_at = (
+            self._clock.now_utc() + decision.retry_after
+            if decision.retry_after is not None else None
+        )
+        self._store.update_checkin(
+            checkin_id,
+            outcome=decision.outcome.value,
+            attempts=previous + 1,
+            fired_at=self._clock.now_utc() if verdict is Verdict.SPEAK else None,
+            retry_at=retry_at,
+        )
+```
+
+- [ ] **Step 6: Run due retries from the daemon tick**
+
+In `Daemon.tick()`, before `run_pending` so a due retry is not delayed by a
+cron job's work:
+
+```python
+    def _run_due_retries(self, now: datetime) -> None:
+        """Fire check-ins whose retry_at has arrived (spec §9.3).
+
+        Re-runs with the ORIGINAL scheduled_for, so local_date and the
+        check-in row stay the ones the ritual started with — a retry at 11:20
+        belongs to the 11:00 occurrence, not to a new one.
+        """
+        for due in self._store.due_retries(now):
+            checkin = self._checkins.get(f"checkin_{due.kind}")
+            if checkin is None:
+                continue
+            try:
+                checkin.run(due.scheduled_for)
+            except Exception:
+                # One failing retry must not stop the others or the tick.
+                log.error("retry for %s failed", due.kind, exc_info=True)
+```
+
+The daemon already wakes at least once a minute (`seconds_until_next` caps at
+`_MAX_SLEEP`), so no new sleep machinery is needed — a 20-minute retry is
+observed within a minute of coming due.
+
+- [ ] **Step 7: Run the tests**
+
+Run: `.venv/bin/pytest -q --import-mode=importlib`
+Expected: PASS, including the daemon regression test showing 11:00/11:20/11:40.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add src/zeus/memory/ src/zeus/ritual/ src/zeus/daemon.py tests/
+git commit -m "fix: wire the retry ladder so a deferred check-in actually retries"
+```
+
+---
+
 ## Plan Self-Review
 
 Run after the plan is written, before execution begins.
