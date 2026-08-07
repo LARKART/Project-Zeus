@@ -416,6 +416,97 @@ def test_doctor_reports_the_env_file_it_actually_loaded(
     assert str(Config(root=root).env_path) not in output
 
 
+# -- C-I3: a malformed config.toml must not take ZEUS down ---------------
+#
+# load_config() raises on a typo'd key, malformed TOML, a bad duration, a
+# duration written as a number, or an unreadable file -- and main() called
+# it outside any try. Verified before the fix: `zeus doctor` died with
+# `UNCAUGHT ValueError: unknown config key: 'morningg'`, and `zeus run`
+# died identically, which under the shipped plist's KeepAlive:true is an
+# infinite respawn loop. This is the same hazard cli.py already guards
+# twice for _load_env_file.
+
+BAD_CONFIGS = {
+    "unknown key": '[schedule]\nmorningg = "09:00"\n',
+    "unknown section": '[scheduel]\nmorning = "09:00"\n',
+    "malformed toml": '[schedule\nmorning = "09:00"\n',
+    "bad duration": '[audio]\nsilence_timeout = "soon"\n',
+    "duration as a number": "[audio]\nsilence_timeout = 2\n",
+}
+
+
+def _with_config(tmp_path, text):
+    root = tmp_path / "root"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "config.toml").write_text(text)
+    return root
+
+
+@pytest.mark.parametrize("label", sorted(BAD_CONFIGS))
+def test_doctor_reports_a_broken_config_instead_of_dying_on_it(
+    monkeypatch, tmp_path, capsys, label
+):
+    """doctor is the command you run BECAUSE something is wrong."""
+    import zeus.cli as cli
+
+    _mock_probes(monkeypatch, cli)
+    root = _with_config(tmp_path, BAD_CONFIGS[label])
+
+    code = main(["doctor", "--root", str(root)])       # must not raise
+
+    output = capsys.readouterr().out
+    assert code == 1, f"a broken config ({label}) was reported as healthy"
+    assert "FAIL" in output and "config" in output
+    assert str(root / "config.toml") in output
+
+
+@pytest.mark.parametrize("label", sorted(BAD_CONFIGS))
+def test_run_starts_on_defaults_instead_of_crash_looping(
+    monkeypatch, tmp_path, caplog, label
+):
+    """The KeepAlive half. `zeus run` must reach build_daemon at all.
+
+    build_daemon is stubbed because the real one opens a database, an
+    Anthropic client and a MicStream; what is under test is that cmd_run
+    gets that far rather than dying in main(), and that it says so loudly
+    first -- degrading silently would be the "pretend" §10 forbids.
+    """
+    import logging
+
+    import zeus.cli as cli
+
+    started = []
+    monkeypatch.setattr(
+        "zeus.daemon.build_daemon",
+        lambda config: type("D", (), {"run_forever": lambda self: started.append(config)})(),
+    )
+    root = _with_config(tmp_path, BAD_CONFIGS[label])
+
+    with caplog.at_level(logging.ERROR, logger="zeus.cli"):
+        assert main(["run", "--root", str(root)]) == 0   # must not raise
+
+    assert len(started) == 1, "cmd_run never reached build_daemon"
+    assert started[0].schedule.morning == "11:00", "the defaults were not used"
+    assert any(
+        "config.toml could not be read" in record.message
+        for record in caplog.records
+    ), "ZEUS fell back to defaults without saying so"
+
+
+def test_a_valid_config_is_still_loaded_and_reported_healthy(
+    monkeypatch, tmp_path, capsys
+):
+    """The guard must not swallow good configs along with bad ones."""
+    import zeus.cli as cli
+
+    _mock_probes(monkeypatch, cli)
+    root = _with_config(tmp_path, '[schedule]\nmorning = "07:30"\n')
+
+    assert main(["doctor", "--root", str(root)]) == 0
+    output = capsys.readouterr().out
+    assert "OK    config" in output
+
+
 def test_install_agent_names_the_venv_interpreter_not_the_resolved_symlink(
     monkeypatch, tmp_path
 ):

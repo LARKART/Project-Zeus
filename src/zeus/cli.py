@@ -9,7 +9,7 @@ import plistlib
 import sys
 from pathlib import Path
 
-from zeus.config import Config, load_config
+from zeus.config import DEFAULT_ROOT, Config, load_config
 
 log = logging.getLogger(__name__)
 
@@ -139,6 +139,38 @@ def _load_env_file(path: Path) -> int:
     return loaded
 
 
+def _load_config_or_default(root: Path | None) -> tuple[Config, str | None]:
+    """Load config.toml, degrading to built-in defaults if it cannot be read.
+
+    THE SAME TREATMENT _load_env_file ALREADY GETS, for the same two
+    reasons. load_config() raises on any of: an unknown key or section
+    (`ValueError: unknown config key: 'morningg'`), malformed TOML
+    (`tomllib.TOMLDecodeError`, itself a ValueError), a bad duration string
+    (`ValueError: invalid duration`), a duration written as a number rather
+    than a string (`silence_timeout = 2` -> `TypeError: expected string or
+    bytes-like object, got 'int'`), or an unreadable file (path.exists()
+    re-raises EACCES/EPERM/ENAMETOOLONG exactly as is_file() does, and
+    read_text() adds OSError and UnicodeDecodeError).
+
+    Every one of those escaped main() uncaught. Verified: a single typo'd
+    key produced `UNCAUGHT ValueError: unknown config key: 'morningg'` out
+    of `zeus doctor` -- the health oracle dying on the very condition it
+    exists to diagnose -- and `zeus run` died the same way, which under
+    KeepAlive:true is an infinite respawn loop with one traceback per
+    restart in zeusd.log.
+
+    Degrading rather than exiting is deliberate, and it is NOT pretending
+    (spec §10): the caller is handed the reason so `doctor` can print it as
+    a FAIL line and `run` can log it at ERROR before starting. What must
+    not happen is ZEUS going down entirely because one line of TOML has a
+    typo -- the check-ins matter more than the customised times.
+    """
+    try:
+        return (load_config(root=root) if root else load_config()), None
+    except (ValueError, TypeError, OSError, UnicodeDecodeError) as exc:
+        return Config(root=root or DEFAULT_ROOT), f"{type(exc).__name__}: {exc}"
+
+
 def _probe_python() -> bool:
     """A function, not an inline expression, so a test can monkeypatch it.
 
@@ -174,7 +206,7 @@ def _probe_transcriber() -> bool:
     return importlib.util.find_spec("faster_whisper") is not None
 
 
-def _probe_env_file(path: Path) -> bool:
+def _probe_file(path: Path) -> bool:
     """is_file() re-raises EACCES/EPERM/ENAMETOOLONG — see _load_env_file."""
     try:
         return path.is_file()
@@ -192,7 +224,7 @@ def _probe_openwakeword() -> bool:
     return importlib.util.find_spec("openwakeword") is not None
 
 
-def cmd_doctor(config: Config) -> int:
+def cmd_doctor(config: Config, config_error: str | None = None) -> int:
     # Load the env file FIRST, exactly as cmd_run does. Without this, doctor
     # reads only os.environ: a key exported in ~/.zshrc makes doctor report
     # all-OK, and then the LaunchAgent — which inherits no shell environment —
@@ -201,9 +233,22 @@ def cmd_doctor(config: Config) -> int:
     # exact failure ZEUS_ENV_FILE exists to prevent.
     env_file = Path(os.environ.get("ZEUS_ENV_FILE", config.env_path))
     _load_env_file(env_file)
+    # REPORT a bad config.toml rather than dying on it. doctor is the
+    # command you run BECAUSE something is wrong, so it is the last place
+    # that may exit on a malformed input; `config` below is the fallback
+    # Config built by _load_config_or_default, so every other line in this
+    # report describes what ZEUS would actually run with.
+    config_path = config.root / "config.toml"
+    if config_error is not None:
+        config_detail = f"{config_path} — {config_error}"
+    elif _probe_file(config_path):
+        config_detail = str(config_path)
+    else:
+        config_detail = f"{config_path} (absent; using defaults)"
     checks = [
         ("python", f"{sys.version_info.major}.{sys.version_info.minor}",
          _probe_python()),
+        ("config", config_detail, config_error is None),
         ("say", "/usr/bin/say", _probe_say()),
         ("ANTHROPIC_API_KEY", "environment or env file", _probe_api_key()),
         ("transcriber", "faster_whisper", _probe_transcriber()),
@@ -214,7 +259,7 @@ def cmd_doctor(config: Config) -> int:
         # env_file, NOT config.env_path: ZEUS_ENV_FILE overrides it, so
         # reporting the default while having loaded the override is the same
         # lying-oracle bug this check was added to fix.
-        ("env file", str(env_file), _probe_env_file(env_file)),
+        ("env file", str(env_file), _probe_file(env_file)),
         ("afplay", "/usr/bin/afplay", _probe_afplay()),
         ("LaunchAgent", str(PLIST_PATH), PLIST_PATH.exists()),
     ]
@@ -228,8 +273,11 @@ def cmd_doctor(config: Config) -> int:
         # both are hard imports on the capture path, and neither was checked
         # at all before. A missing database, env file, or LaunchAgent is
         # expected before first run.
+        # `config` is fatal because an unreadable config.toml means ZEUS is
+        # silently running on built-in defaults: your 07:00 morning check-in
+        # is happening at 11:00 and nothing else would say so.
         if not ok and name in {
-            "python", "say", "ANTHROPIC_API_KEY", "transcriber",
+            "python", "config", "say", "ANTHROPIC_API_KEY", "transcriber",
             "audio input", "wake word",
         }:
             healthy = False
@@ -359,13 +407,24 @@ def cmd_install_agent(config: Config) -> int:
     return 0
 
 
-def cmd_run(config: Config) -> int:
+def cmd_run(config: Config, config_error: str | None = None) -> int:
     from zeus.daemon import build_daemon
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # Loud, but not fatal — see _load_config_or_default. Logged after
+    # basicConfig so the message actually reaches zeusd.log, and before
+    # build_daemon so it precedes the startup lines rather than being
+    # buried under them.
+    if config_error is not None:
+        log.error(
+            "config.toml could not be read (%s). ZEUS is starting on BUILT-IN "
+            "DEFAULTS — your check-in times and audio settings are NOT in "
+            "effect. Fix the file and restart; run 'zeus doctor' to see it.",
+            config_error,
+        )
     # Under launchd the environment is empty but ZEUS_ENV_FILE points at the
     # key file (see launch_agent_plist). Run from a shell and the file is
     # usually absent while the variable is already exported — both paths end
@@ -424,11 +483,22 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_usage()
         return 2
 
-    config = load_config(root=args.root) if args.root else load_config()
+    # NOT a bare load_config(): it raises on a typo'd key, malformed TOML, a
+    # bad duration, or an unreadable file, and that exception reached the
+    # top of main() — killing `zeus doctor`, the one command whose entire
+    # job is diagnosing a broken install, and turning `zeus run` into a
+    # KeepAlive respawn loop. See _load_config_or_default.
+    config, config_error = _load_config_or_default(args.root)
+    # Only doctor and run take the error. doctor REPORTS it — that is what
+    # doctor is for — and run logs it before starting on defaults. selftest
+    # and install-agent are interactive one-shots that a bad schedule block
+    # does not change.
+    if args.command == "doctor":
+        return cmd_doctor(config, config_error)
+    if args.command == "run":
+        return cmd_run(config, config_error)
     return {
-        "run": cmd_run,
         "selftest": cmd_selftest,
-        "doctor": cmd_doctor,
         "install-agent": cmd_install_agent,
     }[args.command](config)
 
