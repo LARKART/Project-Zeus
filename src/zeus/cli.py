@@ -7,11 +7,13 @@ import logging
 import os
 import plistlib
 import sys
+import threading
 from pathlib import Path
 
 from zeus.clock import resolve_timezone
 from zeus.config import DEFAULT_ROOT, Config, load_config
 from zeus.dashboard.server import BIND_HOST, DEFAULT_PORT, build_server, serve
+from zeus.ui.overlay import NullOverlay, build_overlay
 
 log = logging.getLogger(__name__)
 
@@ -453,7 +455,8 @@ def cmd_install_agent(config: Config) -> int:
     return 0
 
 
-def cmd_run(config: Config, config_error: str | None = None) -> int:
+def cmd_run(config: Config, config_error: str | None = None,
+            overlay_enabled: bool = True) -> int:
     from zeus.daemon import build_daemon
 
     logging.basicConfig(
@@ -483,9 +486,34 @@ def cmd_run(config: Config, config_error: str | None = None) -> int:
             "ANTHROPIC_API_KEY is not set and %s did not supply it. "
             "Every conversation will fail. Run 'zeus doctor'.", env_file,
         )
-    daemon = build_daemon(config)
+    overlay = build_overlay(enabled=overlay_enabled)
+    daemon = build_daemon(config, overlay=overlay)
     _install_sigterm_handler(daemon)
-    daemon.run_forever()
+
+    if isinstance(overlay, NullOverlay):
+        daemon.run_forever()
+        return 0
+
+    # APPKIT OWNS THREAD 0, so ZEUS moves off it. Cocoa requires its run loop
+    # on the main thread and refuses to draw from any other, while
+    # daemon.run_forever() is an ordinary blocking loop that does not care
+    # which thread it is on -- so the daemon is the one that moves. Doing it
+    # the other way round (NSApp on a worker) silently produces a panel that
+    # never paints.
+    #
+    # NOT a daemon thread: a daemon thread is killed abruptly at interpreter
+    # exit, skipping Daemon.stop() and the PortAudio close -- the exact
+    # shutdown path A5 was raised to make reachable. The overlay's own
+    # terminate ends the process, and this thread is joined before that.
+    worker = threading.Thread(target=daemon.run_forever, name="zeus")
+    worker.start()
+    try:
+        overlay.run_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        daemon.request_stop()
+        worker.join(timeout=20)
     return 0
 
 
@@ -572,6 +600,11 @@ def main(argv: list[str] | None = None) -> int:
         ("dashboard", "serve the read-only dashboard on 127.0.0.1"),
     ]:
         subparser = sub.add_parser(name, help=help_text)
+        if name == "run":
+            subparser.add_argument(
+                "--no-overlay", action="store_true",
+                help="run without the on-screen panel (headless / no login session)",
+            )
         if name == "dashboard":
             subparser.add_argument(
                 "--port", type=int, default=DEFAULT_PORT,
@@ -621,7 +654,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "doctor":
         return cmd_doctor(config, config_error)
     if args.command == "run":
-        return cmd_run(config, config_error)
+        return cmd_run(config, config_error,
+                       overlay_enabled=not args.no_overlay)
     if args.command == "dashboard":
         return cmd_dashboard(config, args.port)
     return {

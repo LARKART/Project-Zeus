@@ -478,12 +478,14 @@ def test_run_starts_on_defaults_instead_of_crash_looping(
     started = []
     monkeypatch.setattr(
         "zeus.daemon.build_daemon",
-        lambda config: type("D", (), {"run_forever": lambda self: started.append(config)})(),
+        lambda config, overlay=None: type(
+            "D", (), {"run_forever": lambda self: started.append(config)}
+        )(),
     )
     root = _with_config(tmp_path, BAD_CONFIGS[label])
 
     with caplog.at_level(logging.ERROR, logger="zeus.cli"):
-        assert main(["run", "--root", str(root)]) == 0   # must not raise
+        assert main(["run", "--no-overlay", "--root", str(root)]) == 0
 
     assert len(started) == 1, "cmd_run never reached build_daemon"
     assert started[0].schedule.morning == "11:00", "the defaults were not used"
@@ -544,11 +546,12 @@ def test_run_stops_the_daemon_on_sigterm(monkeypatch, tmp_path):
         def stop(self):
             stopped.append(True)
 
-    monkeypatch.setattr("zeus.daemon.build_daemon", lambda config: _FakeDaemon())
+    monkeypatch.setattr("zeus.daemon.build_daemon",
+                        lambda config, overlay=None: _FakeDaemon())
     previous = signal.getsignal(signal.SIGTERM)
     signal.signal(signal.SIGTERM, lambda *_: caught_by_the_net.append(True))
     try:
-        assert main(["run", "--root", str(tmp_path)]) == 0
+        assert main(["run", "--no-overlay", "--root", str(tmp_path)]) == 0
     finally:
         signal.signal(signal.SIGTERM, previous)
 

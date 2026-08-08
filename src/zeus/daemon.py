@@ -19,6 +19,7 @@ from zeus.context.presence import Verdict
 # split that broke every retry got in last time.
 from zeus.ritual.checkin import local_date
 from zeus.schedule.cron import hhmm_to_cron
+from zeus.ui.overlay import LISTENING
 from zeus.schedule.scheduler import MissedRun, Scheduler
 
 log = logging.getLogger(__name__)
@@ -521,6 +522,20 @@ class Daemon:
         """Ad-hoc conversation triggered by the wake word."""
         if self._voice is None:
             return
+        # RAISED FIRST, before listen() does anything. The panel is the only
+        # signal that ZEUS heard its name -- if it appeared after the capture
+        # instead, the user would speak into a screen showing nothing and
+        # have no way to tell whether the wake word had registered.
+        overlay = getattr(self._voice, "_overlay", None)
+        if overlay is not None:
+            overlay.show(LISTENING)
+        try:
+            self._handle_turn()
+        finally:
+            if overlay is not None:
+                overlay.hide()
+
+    def _handle_turn(self) -> None:
         heard = self._voice.listen()
         if not heard:
             # The wake word fired, so the user IS talking to ZEUS — going
@@ -637,7 +652,7 @@ class Daemon:
             remaining -= interval
 
 
-def build_daemon(config: Config | None = None) -> Daemon:
+def build_daemon(config: Config | None = None, overlay=None) -> Daemon:
     """Construct a daemon from real components. See spec §5 for the wiring."""
     import anthropic
 
@@ -665,6 +680,7 @@ def build_daemon(config: Config | None = None) -> Daemon:
         activator, mic,
         build_transcriber(config.stt, config.models_dir),
         build_speaker(config.tts), config.audio,
+        overlay=overlay,
     )
     notifier = MacNotifier()
     client = anthropic.Anthropic()

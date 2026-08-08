@@ -25,6 +25,7 @@ from zeus.context.presence import Verdict
 from zeus.memory.journal import Journal
 from zeus.memory.store import Store
 from zeus.ritual.retry import Outcome, next_step
+from zeus.ui.overlay import LISTENING, SPEAKING, THINKING
 
 log = logging.getLogger(__name__)
 
@@ -62,7 +63,8 @@ class FakeNotifier:
 class VoiceIO:
     """Speak-then-listen, honouring the half-duplex rule (spec §7.3)."""
 
-    def __init__(self, activator, mic, transcriber, speaker, audio_config):
+    def __init__(self, activator, mic, transcriber, speaker, audio_config,
+                 overlay=None):
         # NO endpointer PARAMETER. listen() builds one per capture (see
         # there for why); accepting a shared instance here is what let the
         # daemon hand the SAME mutable Endpointer to two threads, so the
@@ -73,6 +75,11 @@ class VoiceIO:
         self._transcriber = transcriber
         self._speaker = speaker
         self._config = audio_config
+        # Defaulted rather than required: every existing caller and every
+        # test builds a VoiceIO without a screen, and a daemon under launchd
+        # with no login session genuinely has nowhere to draw.
+        from zeus.ui.overlay import NullOverlay
+        self._overlay = overlay or NullOverlay()
 
     def speak(self, sentences: Iterable[str]) -> None:
         mute = getattr(self._activator, "mute", None)
@@ -81,6 +88,11 @@ class VoiceIO:
             mute()
         try:
             for sentence in sentences:
+                # Painted BEFORE the sentence is spoken, so the panel and the
+                # voice stay in step. `say` blocks for the whole utterance;
+                # updating after it would show each line only once ZEUS had
+                # already finished saying it.
+                self._overlay.show(SPEAKING, sentence)
                 self._speaker.say(sentence)
         finally:
             if unmute:
@@ -107,6 +119,7 @@ class VoiceIO:
         unmute = getattr(self._activator, "unmute", None)
         if mute:
             mute()
+        self._overlay.show(LISTENING)
         try:
             frames_per_second = self._config.sample_rate / FRAME_SAMPLES
             timeout_frames = int(
@@ -133,7 +146,15 @@ class VoiceIO:
                 unmute()
         if not audio:
             return ""
-        return self._transcriber.transcribe(audio, self._config.sample_rate)
+        # Transcription is the slowest step in the turn -- a second or more
+        # of local Whisper. Without this the panel sits on "Listening…" long
+        # after the user stopped talking, which reads as "it did not hear me"
+        # and invites them to repeat themselves over the top of it.
+        self._overlay.show(THINKING)
+        heard = self._transcriber.transcribe(audio, self._config.sample_rate)
+        if heard:
+            self._overlay.show(THINKING, heard)
+        return heard
 
 
 # ---- the ritual -------------------------------------------------------
