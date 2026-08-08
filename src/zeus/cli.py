@@ -9,7 +9,9 @@ import plistlib
 import sys
 from pathlib import Path
 
+from zeus.clock import resolve_timezone
 from zeus.config import DEFAULT_ROOT, Config, load_config
+from zeus.dashboard.server import BIND_HOST, DEFAULT_PORT, build_server, serve
 
 log = logging.getLogger(__name__)
 
@@ -370,6 +372,50 @@ def cmd_selftest(config: Config) -> int:
     return 0
 
 
+def cmd_dashboard(config: Config, port: int = DEFAULT_PORT) -> int:
+    """Serve the read-only dashboard on loopback (spec §12).
+
+    Its own process, reading the same database the daemon writes. That is
+    what WAL is for (§6.1) -- concurrent readers alongside one writer -- and
+    it is why the dashboard opens the file `mode=ro` rather than sharing the
+    daemon's Store: a page load must not be able to take a write lock the
+    voice loop is waiting on, and `mode=ro` makes that impossible rather
+    than merely unlikely.
+
+    Runs whether or not the daemon is up. A dashboard that needs ZEUS
+    running cannot answer "is ZEUS running?", which is the first question
+    anyone opens it to ask.
+    """
+    tz = resolve_timezone(config.schedule.timezone)
+    settings = {
+        "timezone": str(tz),
+        "morning": config.schedule.morning,
+        "evening": config.schedule.evening,
+        "model": config.brain.model,
+        "wake word": config.wake.model,
+        "speech-to-text": f"{config.stt.provider} ({config.stt.model})",
+        "text-to-speech": f"{config.tts.provider} ({config.tts.voice})",
+        "data directory": str(config.root),
+    }
+    try:
+        server = build_server(
+            config.db_path, config.journal_dir, tz, port, settings
+        )
+    except OSError as problem:
+        # The overwhelmingly common one is "address already in use", which
+        # usually means a dashboard is ALREADY running -- say that rather
+        # than printing errno 48.
+        print(f"Could not bind {BIND_HOST}:{port} — {problem}", file=sys.stderr)
+        print("Another dashboard may already be running; try --port.",
+              file=sys.stderr)
+        return 1
+    if not config.db_path.exists():
+        print(f"Note: {config.db_path} does not exist yet — the page will "
+              f"show an empty ZEUS until the daemon has run once.")
+    serve(server)
+    return 0
+
+
 def cmd_install_agent(config: Config) -> int:
     # sys.executable AS-IS. It is already absolute, and NOT .resolve()d:
     # .resolve() follows the venv symlink out of the venv, to the real
@@ -523,8 +569,14 @@ def main(argv: list[str] | None = None) -> int:
         ("selftest", "check the microphone and speakers (requires hardware)"),
         ("doctor", "print an environment report"),
         ("install-agent", "write the LaunchAgent plist"),
+        ("dashboard", "serve the read-only dashboard on 127.0.0.1"),
     ]:
         subparser = sub.add_parser(name, help=help_text)
+        if name == "dashboard":
+            subparser.add_argument(
+                "--port", type=int, default=DEFAULT_PORT,
+                help=f"port to bind on {BIND_HOST} (default {DEFAULT_PORT})",
+            )
         # `--root` is declared on the TOP-level parser only, but argparse
         # subparsers consume every token after the subcommand name and hand
         # them to the chosen subparser's own parser — one that knows nothing
@@ -570,6 +622,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_doctor(config, config_error)
     if args.command == "run":
         return cmd_run(config, config_error)
+    if args.command == "dashboard":
+        return cmd_dashboard(config, args.port)
     return {
         "selftest": cmd_selftest,
         "install-agent": cmd_install_agent,
