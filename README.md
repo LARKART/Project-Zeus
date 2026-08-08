@@ -59,12 +59,59 @@ launchctl load ~/Library/LaunchAgents/com.zeus.daemon.plist
 
 ## Usage
 
-Say **"hey jarvis"** to start a conversation. (openWakeWord ships no "zeus"
-model; see `[wake] model` in `~/.zeus/config.toml` to swap in a custom one.)
+Say **"hey jarvis"** to start a conversation.
+
+**Not "Hi Zeus" — not yet.** openWakeWord ships six pretrained models
+(`alexa`, `hey_mycroft`, `hey_jarvis`, `hey_rhasspy`, `timer`, `weather`)
+and none of them is a Zeus. A wake word is a trained model, not a config
+string, so pointing `[wake] model` at `"hi_zeus"` would only fail to load.
+Getting the real phrase means training a custom model with openWakeWord's
+own tooling and then setting:
+
+```toml
+[wake]
+model = "/Users/you/.zeus/models/hi_zeus.onnx"
+```
+
+The plumbing already takes an arbitrary model path — it is the model that
+does not exist. Until it does, `hey_jarvis` is the closest thing that
+actually works, and pretending otherwise would just mean a daemon that
+never wakes.
 
 ZEUS asks for your goal at 11:00 and reviews it at 21:00. If you are away,
 on a call, or in a Focus mode, it defers or notifies quietly instead of
 talking at you.
+
+## Dashboard
+
+```bash
+.venv/bin/zeus dashboard          # → http://127.0.0.1:8787
+```
+
+Everything ZEUS has recorded, on one page: today's goal and check-ins,
+daemon health, your streak, goal history, every check-in attempt, every tool
+call with its arguments and result, full transcripts, the journal, and the
+scheduled jobs and settings. Say the wake word while it is open and a live
+session pops up in the corner.
+
+It needs no microphone, no API key, and no running daemon — so it also works
+as the answer to "is ZEUS actually alive?".
+
+Four things it will not do:
+
+- **It cannot write.** The database is opened read-only, so a page load can
+  never take a write lock the voice loop is waiting on.
+- **It binds `127.0.0.1` only**, never the wildcard address. The page shows
+  every transcript with no authentication; that is safe exactly and only
+  because nothing off this machine can reach it.
+- **It runs no third-party script.** One inline poller, pinned in the
+  Content-Security-Policy by hash, is the whole of its JavaScript.
+- **It shows no secret.** The page never reads your API key.
+
+**Do not deploy it.** Publishing this page publishes your journal. The
+`demo/` directory holds a frozen copy built from invented data
+(`python tools/build_demo.py`) for showing the project off; that is the only
+version meant to leave the machine.
 
 ## Your data
 

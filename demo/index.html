@@ -1,0 +1,447 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ZEUS</title>
+<style>
+:root {
+  --bg:#070b09; --surface:#0d1310; --card:#101713; --line:#1d2a23;
+  --ink:#e6efe9; --muted:#8a9b92; --dim:#5f7168;
+  --accent:#4ade80; --accent-2:#22c55e; --glow:rgba(74,222,128,.28);
+  --ok:#4ade80; --ok-bg:rgba(74,222,128,.12);
+  --warn:#fbbf24; --warn-bg:rgba(251,191,36,.12);
+  --bad:#f87171; --bad-bg:rgba(248,113,113,.12);
+  --info:#60a5fa; --info-bg:rgba(96,165,250,.12);
+  --empty:rgba(255,255,255,.06);
+  --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,sans-serif;
+  --r:14px;
+}
+/* A committed dark design, but a utility opened at midday should not sear.
+   Light is a full token set, never a partial override. */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg:#f3f6f4; --surface:#ffffff; --card:#ffffff; --line:#dde5e0;
+    --ink:#0f1a14; --muted:#5c6b63; --dim:#84968d;
+    --accent:#15803d; --accent-2:#166534; --glow:rgba(21,128,61,.18);
+    --ok:#15803d; --ok-bg:rgba(21,128,61,.1);
+    --warn:#a16207; --warn-bg:rgba(161,98,7,.1);
+    --bad:#b91c1c; --bad-bg:rgba(185,28,28,.1);
+    --info:#1d4ed8; --info-bg:rgba(29,78,216,.1);
+    --empty:rgba(15,26,20,.07);
+  }
+}
+:root[data-theme="light"] {
+  --bg:#f3f6f4; --surface:#ffffff; --card:#ffffff; --line:#dde5e0;
+  --ink:#0f1a14; --muted:#5c6b63; --dim:#84968d;
+  --accent:#15803d; --accent-2:#166534; --glow:rgba(21,128,61,.18);
+  --ok:#15803d; --ok-bg:rgba(21,128,61,.1);
+  --warn:#a16207; --warn-bg:rgba(161,98,7,.1);
+  --bad:#b91c1c; --bad-bg:rgba(185,28,28,.1);
+  --info:#1d4ed8; --info-bg:rgba(29,78,216,.1);
+  --empty:rgba(15,26,20,.07);
+}
+* { box-sizing:border-box; }
+body {
+  margin:0; background:var(--bg); color:var(--ink); font-family:var(--sans);
+  font-size:14px; line-height:1.55; -webkit-font-smoothing:antialiased;
+  min-height:100vh;
+}
+.aurora {
+  position:fixed; inset:0; pointer-events:none; z-index:0;
+  background:
+    radial-gradient(60rem 30rem at 12% -10%, var(--glow), transparent 60%),
+    radial-gradient(50rem 26rem at 92% 4%, rgba(34,197,94,.16), transparent 62%);
+}
+.wrap { position:relative; z-index:1; max-width:1180px; margin:0 auto;
+  padding:26px 22px 40px; }
+.mono, code, pre, table, .pill, .eyebrow { font-family:var(--mono); }
+a { color:inherit; text-decoration:none; }
+a:focus-visible, summary:focus-visible {
+  outline:2px solid var(--accent); outline-offset:3px; border-radius:8px;
+}
+/* masthead */
+.masthead { display:flex; align-items:center; gap:15px; margin-bottom:22px;
+  flex-wrap:wrap; }
+.mark {
+  width:46px; height:46px; border-radius:13px; flex:none; display:grid;
+  place-items:center; background:linear-gradient(150deg,var(--accent),var(--accent-2));
+  box-shadow:0 0 26px var(--glow); color:#04140c; font-weight:700; font-size:22px;
+  font-family:var(--mono);
+}
+.wordmark h1 { margin:0; font-size:26px; font-weight:650; letter-spacing:-.01em; }
+.wordmark h1 em { font-style:normal; color:var(--accent); }
+.wordmark p { margin:2px 0 0; color:var(--dim); font-size:10.5px;
+  letter-spacing:.22em; font-family:var(--mono); }
+.actions { margin-left:auto; display:flex; gap:9px; flex-wrap:wrap; }
+.btn {
+  display:inline-flex; align-items:center; gap:7px; padding:8px 15px;
+  border-radius:11px; font-size:12.5px; border:1px solid var(--line);
+  background:var(--surface); color:var(--muted); white-space:nowrap;
+  text-transform:capitalize;
+}
+.btn.solid {
+  background:linear-gradient(150deg,var(--accent),var(--accent-2)); color:#04140c;
+  border-color:transparent; box-shadow:0 0 20px var(--glow); font-weight:600;
+  font-family:var(--mono);
+}
+/* segmented nav */
+.segments {
+  display:flex; gap:5px; padding:5px; margin-bottom:20px; overflow-x:auto;
+  background:var(--surface); border:1px solid var(--line); border-radius:var(--r);
+}
+.seg { padding:8px 15px; border-radius:10px; color:var(--muted); font-size:12.5px;
+  white-space:nowrap; }
+.seg:hover { color:var(--ink); background:var(--empty); }
+/* panels switch on :target -- with no hash yet, Today opens */
+.panel { display:none; }
+.panel:target { display:block; }
+body:not(:has(.panel:target)) #today { display:block; }
+/* stat cards */
+.stats { display:grid; grid-template-columns:repeat(4,1fr); gap:13px;
+  margin-bottom:20px; }
+@media (max-width:860px) { .stats { grid-template-columns:repeat(2,1fr); } }
+.stat {
+  display:flex; align-items:center; gap:13px; padding:15px 17px;
+  background:var(--card); border:1px solid var(--line); border-radius:var(--r);
+}
+.stat > div { display:flex; flex-direction:column; }
+.stat b { font-size:26px; font-family:var(--mono); font-variant-numeric:tabular-nums;
+  line-height:1.15; }
+.stat span:last-child { color:var(--muted); font-size:11.5px; }
+.badge { width:36px; height:36px; border-radius:11px; display:grid; place-items:center;
+  font-size:13px; flex:none; }
+.stat.ok .badge { color:var(--ok); background:var(--ok-bg);
+  box-shadow:inset 0 0 0 1px var(--ok-bg); }
+.stat.warn .badge { color:var(--warn); background:var(--warn-bg); }
+.stat.bad .badge { color:var(--bad); background:var(--bad-bg); }
+.stat.info .badge { color:var(--info); background:var(--info-bg); }
+.stat.bad { border-color:rgba(248,113,113,.35); }
+.stat.warn { border-color:rgba(251,191,36,.3); }
+/* cards */
+.card {
+  background:var(--card); border:1px solid var(--line); border-radius:var(--r);
+  padding:18px 20px; margin-bottom:13px;
+}
+.grid-2 { display:grid; grid-template-columns:1.55fr 1fr; gap:13px; }
+@media (max-width:820px) { .grid-2 { grid-template-columns:1fr; } }
+.grid-3 { display:grid; grid-template-columns:repeat(3,1fr); gap:13px; }
+@media (max-width:980px) { .grid-3 { grid-template-columns:repeat(2,1fr); } }
+@media (max-width:660px) { .grid-3 { grid-template-columns:1fr; } }
+.grid-2 > .card, .grid-3 > .card { margin-bottom:0; }
+.eyebrow { display:block; color:var(--dim); font-size:10.5px; letter-spacing:.16em;
+  text-transform:uppercase; margin-bottom:10px; }
+.goal { margin:0 0 12px; font-size:23px; line-height:1.3; font-weight:640;
+  text-wrap:balance; }
+.row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.muted { color:var(--muted); font-size:12.5px; }
+.divider { height:1px; background:var(--line); margin:16px 0; }
+.ritual { display:flex; align-items:center; gap:10px; padding:5px 0; flex-wrap:wrap; }
+.ritual b { min-width:66px; font-size:13px; }
+.health { display:flex; gap:11px; align-items:flex-start; }
+.health div { display:flex; flex-direction:column; }
+.dot { width:8px; height:8px; border-radius:50%; flex:none; margin-top:7px; }
+.dot.ok { background:var(--ok); box-shadow:0 0 9px var(--ok); }
+.dot.warn { background:var(--warn); } .dot.bad { background:var(--bad); }
+.dot.muted { background:var(--dim); }
+.btn .dot, .entry-head .dot { margin-top:0; }
+.strip { display:flex; gap:3px; flex-wrap:wrap; margin-bottom:11px; }
+.cell { width:13px; height:13px; border-radius:4px; background:var(--empty); flex:none; }
+.cell.ok { background:var(--ok); } .cell.warn { background:var(--warn); }
+.cell.bad { background:var(--bad); } .cell.info { background:var(--info); }
+.cell.muted { background:var(--dim); opacity:.45; }
+.legend { display:flex; gap:12px; flex-wrap:wrap; color:var(--muted); font-size:11px; }
+.legend span { display:flex; align-items:center; gap:5px; }
+.legend i { width:9px; height:9px; border-radius:3px; display:inline-block; }
+/* goal cards */
+.goal-card { display:flex; flex-direction:column; gap:5px; }
+.goal-card h3 { margin:0; font-size:15px; font-weight:620; line-height:1.35;
+  text-wrap:balance; }
+.kv { display:flex; justify-content:space-between; gap:12px; font-size:12px;
+  color:var(--muted); }
+.kv b { color:var(--ink); font-weight:550; font-family:var(--mono); font-size:11.5px; }
+.notes { margin:6px 0 0; color:var(--muted); font-size:12.5px; }
+.card-foot { margin-top:auto; padding-top:12px; }
+.goal-card.done { border-color:rgba(74,222,128,.28); }
+.goal-card.missed { border-color:rgba(248,113,113,.3); }
+/* pills */
+.pill { display:inline-flex; align-items:center; gap:6px; padding:3px 10px;
+  border-radius:999px; font-size:11px; white-space:nowrap; }
+.pill i { width:5px; height:5px; border-radius:50%; background:currentColor; flex:none; }
+.pill.ok { color:var(--ok); background:var(--ok-bg); }
+.pill.warn { color:var(--warn); background:var(--warn-bg); }
+.pill.bad { color:var(--bad); background:var(--bad-bg); }
+.pill.info { color:var(--info); background:var(--info-bg); }
+.pill.muted, .pill.empty { color:var(--muted); background:var(--empty); }
+/* tables */
+.scroll { overflow-x:auto; background:var(--card); border:1px solid var(--line);
+  border-radius:var(--r); }
+table { width:100%; border-collapse:collapse; font-size:12.5px;
+  font-variant-numeric:tabular-nums; }
+th, td { text-align:left; padding:11px 16px; border-bottom:1px solid var(--line);
+  vertical-align:middle; }
+th { color:var(--dim); font-size:10.5px; letter-spacing:.11em; white-space:nowrap;
+  text-transform:uppercase; }
+tbody tr:last-child td { border-bottom:0; }
+tbody tr:hover { background:var(--empty); }
+h4 { margin:22px 0 9px; font-size:10.5px; color:var(--dim); font-family:var(--mono);
+  letter-spacing:.16em; text-transform:uppercase; }
+h4:first-of-type { margin-top:0; }
+/* action log */
+.entry.failed { border-color:rgba(248,113,113,.35); }
+.entry-head { display:flex; align-items:center; gap:10px; margin-bottom:11px;
+  flex-wrap:wrap; }
+.entry-head b { font-size:13px; }
+.push { margin-left:auto; }
+.io { display:flex; gap:12px; align-items:flex-start; padding:3px 0; }
+.gutter { flex:none; width:52px; color:var(--dim); font-family:var(--mono);
+  font-size:10.5px; letter-spacing:.08em; padding-top:2px; }
+.gutter.bad { color:var(--bad); }
+.io code { color:var(--muted); font-size:11.5px; overflow-wrap:anywhere; }
+/* chat */
+.chat { display:flex; flex-direction:column; gap:10px; padding-top:12px; }
+.bubble { max-width:80%; padding:9px 13px; border-radius:14px; background:var(--empty); }
+.bubble .who { display:block; font-size:9.5px; letter-spacing:.14em;
+  text-transform:uppercase; color:var(--dim); font-family:var(--mono); }
+.bubble p { margin:2px 0 0; white-space:pre-wrap; font-size:13px; }
+.bubble .when { font-size:10.5px; color:var(--dim); font-family:var(--mono); }
+.bubble.assistant { align-self:flex-start; border-bottom-left-radius:5px;
+  background:var(--ok-bg); }
+.bubble.user { align-self:flex-end; border-bottom-right-radius:5px; }
+summary { cursor:pointer; display:flex; align-items:center; gap:10px; list-style:none;
+  font-size:12.5px; }
+summary::-webkit-details-marker { display:none; }
+pre { margin:10px 0 0; padding:14px 16px; background:var(--bg);
+  border:1px solid var(--line); border-radius:10px; overflow-x:auto;
+  white-space:pre-wrap; font-size:11.5px; color:var(--muted); }
+.empty { color:var(--muted); font-size:13px; margin:4px 0; }
+.banner { padding:14px 18px; border-radius:var(--r); margin-bottom:16px;
+  color:var(--bad); background:var(--bad-bg); border:1px solid var(--bad); }
+.foot { margin-top:26px; color:var(--dim); font-size:11.5px; text-align:center; }
+/* wake-word pop-up */
+.popup {
+  position:fixed; right:20px; bottom:20px; width:min(370px,calc(100vw - 40px));
+  max-height:min(520px,70vh); display:none; flex-direction:column; z-index:20;
+  background:var(--surface); border:1px solid var(--accent); border-radius:18px;
+  box-shadow:0 0 0 1px var(--glow),0 18px 50px rgba(0,0,0,.5),0 0 40px var(--glow);
+  padding:15px 17px; overflow:hidden;
+}
+.popup.on { display:flex; }
+.popup-head { display:flex; align-items:center; gap:11px; }
+.popup-head > div { display:flex; flex-direction:column; }
+.popup-head b { font-size:13.5px; }
+.mic { width:32px; height:32px; border-radius:50%; flex:none; display:grid;
+  place-items:center; background:var(--ok-bg); }
+.mic i { width:9px; height:9px; border-radius:50%; background:var(--accent);
+  box-shadow:0 0 0 0 var(--glow); animation:pulse 1.8s ease-out infinite; }
+@keyframes pulse {
+  0% { box-shadow:0 0 0 0 var(--glow); }
+  70% { box-shadow:0 0 0 13px rgba(74,222,128,0); }
+  100% { box-shadow:0 0 0 0 rgba(74,222,128,0); }
+}
+.close { margin-left:auto; color:var(--dim); font-size:19px; line-height:1;
+  padding:0 4px; }
+.close:hover { color:var(--ink); }
+.popup .chat { overflow-y:auto; }
+@media (prefers-reduced-motion: reduce) {
+  * { transition:none !important; animation:none !important; }
+}
+body:has(#today:target) .seg-today{color:#04140c;background:var(--accent);box-shadow:0 0 18px var(--glow);}body:has(#goals:target) .seg-goals{color:#04140c;background:var(--accent);box-shadow:0 0 18px var(--glow);}body:has(#checkins:target) .seg-checkins{color:#04140c;background:var(--accent);box-shadow:0 0 18px var(--glow);}body:has(#session:target) .seg-session{color:#04140c;background:var(--accent);box-shadow:0 0 18px var(--glow);}body:has(#log:target) .seg-log{color:#04140c;background:var(--accent);box-shadow:0 0 18px var(--glow);}body:has(#journal:target) .seg-journal{color:#04140c;background:var(--accent);box-shadow:0 0 18px var(--glow);}body:has(#system:target) .seg-system{color:#04140c;background:var(--accent);box-shadow:0 0 18px var(--glow);}</style>
+</head>
+<body>
+<div class="aurora"></div>
+<div class="wrap">
+  <header class="masthead">
+    <div class="mark"><span>Z</span></div>
+    <div class="wordmark">
+      <h1>ZEUS <em>Assistant</em></h1>
+      <p>LISTEN · ASK · REMEMBER</p>
+    </div>
+    <div class="actions">
+      <span class="btn ghost"><span class="dot ok"></span>alive</span>
+      <span class="btn ghost">America/Los_Angeles</span>
+      <span class="btn solid">2026-08-07</span>
+    </div>
+  </header>
+  <nav class="segments"><a class="seg seg-today" href="#today">Today</a><a class="seg seg-goals" href="#goals">Goals</a><a class="seg seg-checkins" href="#checkins">Check-ins</a><a class="seg seg-session" href="#session">Session</a><a class="seg seg-log" href="#log">Action log</a><a class="seg seg-journal" href="#journal">Journal</a><a class="seg seg-system" href="#system">System</a></nav>
+  <main class="content">
+<div class="banner" style="color:var(--info);background:var(--info-bg);
+     border-color:var(--info)">
+  <b>Demo — every goal, transcript and tool call below is invented.</b>
+  This is the page <code>zeus dashboard</code> renders, frozen to a static
+  file. The real one binds <code>127.0.0.1</code> and never leaves your Mac;
+  it is not deployable, and deliberately so.
+  <a href="https://github.com/" style="color:var(--info);text-decoration:underline">
+  Source on GitHub</a>
+</div><section class="panel" id="today">
+<div class="stats">
+
+<div class="stat ok">
+  <span class="badge">◆</span>
+  <div><b>3</b><span>day streak</span></div>
+</div>
+
+<div class="stat warn">
+  <span class="badge">●</span>
+  <div><b>1</b><span>check-ins open</span></div>
+</div>
+
+<div class="stat bad">
+  <span class="badge">▲</span>
+  <div><b>1</b><span>failed tool calls</span></div>
+</div>
+
+<div class="stat info">
+  <span class="badge">■</span>
+  <div><b>6/9</b><span>goals kept</span></div>
+</div>
+</div>
+<div class="grid-2">
+  <div class="card feature">
+    <span class="eyebrow">Today · 2026-08-07</span>
+    <p class="goal">Finish the dashboard and merge it</p><div class="row"><span class="pill muted"><i></i>Pending</span></div>
+    <div class="divider"></div>
+    <span class="eyebrow">Check-ins</span>
+    <div class="ritual"><b>Evening</b><span class="pill warn"><i></i>Deferred</span><span class="muted">attempt 2 · retry 14:34</span></div><div class="ritual"><b>Morning</b><span class="pill ok"><i></i>Answered</span><span class="muted">attempt 1 · fired 11:00</span></div>
+  </div>
+  <div class="card">
+    <span class="eyebrow">Daemon</span>
+    <div class="health"><span class="dot ok"></span>
+      <div><b>Alive</b>
+      <span class="muted">the daemon is ticking</span>
+      <span class="muted">heartbeat 0s ago</span></div>
+    </div>
+    <div class="divider"></div>
+    <span class="eyebrow">Last 30 days</span>
+    <div class="strip"><span class="cell empty" title="2026-07-09 — no goal"></span><span class="cell empty" title="2026-07-10 — no goal"></span><span class="cell empty" title="2026-07-11 — no goal"></span><span class="cell empty" title="2026-07-12 — no goal"></span><span class="cell empty" title="2026-07-13 — no goal"></span><span class="cell empty" title="2026-07-14 — no goal"></span><span class="cell empty" title="2026-07-15 — no goal"></span><span class="cell empty" title="2026-07-16 — no goal"></span><span class="cell empty" title="2026-07-17 — no goal"></span><span class="cell empty" title="2026-07-18 — no goal"></span><span class="cell empty" title="2026-07-19 — no goal"></span><span class="cell empty" title="2026-07-20 — no goal"></span><span class="cell empty" title="2026-07-21 — no goal"></span><span class="cell empty" title="2026-07-22 — no goal"></span><span class="cell empty" title="2026-07-23 — no goal"></span><span class="cell empty" title="2026-07-24 — no goal"></span><span class="cell empty" title="2026-07-25 — no goal"></span><span class="cell empty" title="2026-07-26 — no goal"></span><span class="cell empty" title="2026-07-27 — no goal"></span><span class="cell empty" title="2026-07-28 — no goal"></span><span class="cell empty" title="2026-07-29 — no goal"></span><span class="cell ok" title="2026-07-30 — Set up the repo"></span><span class="cell warn" title="2026-07-31 — Read the openWakeWord docs"></span><span class="cell ok" title="2026-08-01 — Sketch the architecture"></span><span class="cell ok" title="2026-08-02 — Draft the spec"></span><span class="cell bad" title="2026-08-03 — Rest day"></span><span class="cell ok" title="2026-08-04 — Write the end-to-end test"></span><span class="cell ok" title="2026-08-05 — Wire the retry ladder"></span><span class="cell ok" title="2026-08-06 — Fix the stale-retry data loss"></span><span class="cell muted" title="2026-08-07 — Finish the dashboard and merge it"></span></div>
+    <div class="legend"><span><i class="cell ok"></i>Done</span><span><i class="cell warn"></i>Partial</span><span><i class="cell bad"></i>Missed</span><span><i class="cell info"></i>Carried</span><span><i class="cell muted"></i>Pending</span><span><i class="cell empty"></i>—</span></div>
+  </div>
+</div></section><section class="panel" id="goals"><div class="grid-3">
+<article class="card goal-card pending">
+  <h3>Finish the dashboard and merge it</h3>
+  <span class="muted mono">2026-08-07</span>
+  <div class="kv"><span>Set</span><b>Aug 07, 14:20</b></div>
+  <div class="kv"><span>Reviewed</span><b>—</b></div>
+  
+  <div class="card-foot"><span class="pill muted"><i></i>Pending</span></div>
+</article>
+<article class="card goal-card done">
+  <h3>Fix the stale-retry data loss</h3>
+  <span class="muted mono">2026-08-06</span>
+  <div class="kv"><span>Set</span><b>Aug 07, 14:20</b></div>
+  <div class="kv"><span>Reviewed</span><b>Aug 07, 14:20</b></div>
+  <p class="notes">Took most of the morning.</p>
+  <div class="card-foot"><span class="pill ok"><i></i>Done</span></div>
+</article>
+<article class="card goal-card done">
+  <h3>Wire the retry ladder</h3>
+  <span class="muted mono">2026-08-05</span>
+  <div class="kv"><span>Set</span><b>Aug 07, 14:20</b></div>
+  <div class="kv"><span>Reviewed</span><b>Aug 07, 14:20</b></div>
+  <p class="notes">Done before lunch.</p>
+  <div class="card-foot"><span class="pill ok"><i></i>Done</span></div>
+</article>
+<article class="card goal-card done">
+  <h3>Write the end-to-end test</h3>
+  <span class="muted mono">2026-08-04</span>
+  <div class="kv"><span>Set</span><b>Aug 07, 14:20</b></div>
+  <div class="kv"><span>Reviewed</span><b>Aug 07, 14:20</b></div>
+  
+  <div class="card-foot"><span class="pill ok"><i></i>Done</span></div>
+</article>
+<article class="card goal-card missed">
+  <h3>Rest day</h3>
+  <span class="muted mono">2026-08-03</span>
+  <div class="kv"><span>Set</span><b>Aug 07, 14:20</b></div>
+  <div class="kv"><span>Reviewed</span><b>Aug 07, 14:20</b></div>
+  <p class="notes">Went hiking instead. No regrets.</p>
+  <div class="card-foot"><span class="pill bad"><i></i>Missed</span></div>
+</article>
+<article class="card goal-card done">
+  <h3>Draft the spec</h3>
+  <span class="muted mono">2026-08-02</span>
+  <div class="kv"><span>Set</span><b>Aug 07, 14:20</b></div>
+  <div class="kv"><span>Reviewed</span><b>Aug 07, 14:20</b></div>
+  
+  <div class="card-foot"><span class="pill ok"><i></i>Done</span></div>
+</article>
+<article class="card goal-card done">
+  <h3>Sketch the architecture</h3>
+  <span class="muted mono">2026-08-01</span>
+  <div class="kv"><span>Set</span><b>Aug 07, 14:20</b></div>
+  <div class="kv"><span>Reviewed</span><b>Aug 07, 14:20</b></div>
+  
+  <div class="card-foot"><span class="pill ok"><i></i>Done</span></div>
+</article>
+<article class="card goal-card partial">
+  <h3>Read the openWakeWord docs</h3>
+  <span class="muted mono">2026-07-31</span>
+  <div class="kv"><span>Set</span><b>Aug 07, 14:20</b></div>
+  <div class="kv"><span>Reviewed</span><b>Aug 07, 14:20</b></div>
+  <p class="notes">Got halfway.</p>
+  <div class="card-foot"><span class="pill warn"><i></i>Partial</span></div>
+</article>
+<article class="card goal-card done">
+  <h3>Set up the repo</h3>
+  <span class="muted mono">2026-07-30</span>
+  <div class="kv"><span>Set</span><b>Aug 07, 14:20</b></div>
+  <div class="kv"><span>Reviewed</span><b>Aug 07, 14:20</b></div>
+  
+  <div class="card-foot"><span class="pill ok"><i></i>Done</span></div>
+</article></div></section><section class="panel" id="checkins"><div class="scroll"><table><thead><tr><th>Date</th><th>Kind</th><th>Outcome</th><th>Attempts</th><th>Fired</th><th>Retry due</th><th>Notified</th></tr></thead><tbody><tr><td><span class="mono">2026-08-07</span></td><td>Evening</td><td><span class="pill warn"><i></i>Deferred</span></td><td><span class="mono">2</span></td><td><span class="mono muted">—</span></td><td><span class="mono muted">2026-08-07 14:34</span></td><td>no</td></tr><tr><td><span class="mono">2026-08-07</span></td><td>Morning</td><td><span class="pill ok"><i></i>Answered</span></td><td><span class="mono">1</span></td><td><span class="mono muted">2026-08-07 11:00</span></td><td><span class="mono muted">—</span></td><td>no</td></tr><tr><td><span class="mono">2026-08-06</span></td><td>Evening</td><td><span class="pill ok"><i></i>Answered</span></td><td><span class="mono">1</span></td><td><span class="mono muted">2026-08-06 21:00</span></td><td><span class="mono muted">—</span></td><td>no</td></tr><tr><td><span class="mono">2026-08-06</span></td><td>Morning</td><td><span class="pill ok"><i></i>Answered</span></td><td><span class="mono">1</span></td><td><span class="mono muted">2026-08-06 11:00</span></td><td><span class="mono muted">—</span></td><td>no</td></tr></tbody></table></div></section><section class="panel" id="session"><details class="card thread" open><summary><span class="pill ok"><i></i>live</span><b class="mono">#3</b><span class="muted">2026-08-07 14:20 · 2 messages</span></summary><div class="chat"><div class="bubble user"><span class="who">user</span><p>What did I say I&#x27;d do today?</p><span class="when">14:20</span></div><div class="bubble assistant"><span class="who">assistant</span><p>Finish the dashboard and merge it.</p><span class="when">14:20</span></div></div></details><details class="card thread"><summary><span class="pill info"><i></i>schedule</span><b class="mono">#2</b><span class="muted">2026-08-07 14:20 · 2 messages</span></summary><div class="chat"><div class="bubble assistant"><span class="who">assistant</span><p>How did it go with fixing the stale-retry bug?</p><span class="when">14:20</span></div><div class="bubble user"><span class="who">user</span><p>Done. Took most of the morning.</p><span class="when">14:20</span></div></div></details><details class="card thread"><summary><span class="pill info"><i></i>schedule</span><b class="mono">#1</b><span class="muted">2026-08-07 14:20 · 3 messages</span></summary><div class="chat"><div class="bubble assistant"><span class="who">assistant</span><p>Morning. What&#x27;s the one thing today?</p><span class="when">14:20</span></div><div class="bubble user"><span class="who">user</span><p>Finish the dashboard and merge it.</p><span class="when">14:20</span></div><div class="bubble assistant"><span class="who">assistant</span><p>Got it — finish the dashboard and merge it. Saved.</p><span class="when">14:20</span></div></div></details></section><section class="panel" id="log">
+<article class="card entry failed">
+  <div class="entry-head">
+    <span class="dot bad"></span>
+    <b class="mono">record_outcome</b>
+    <span class="muted">2026-08-07 14:20</span>
+    <span class="muted push">6 ms</span>
+  </div>
+  <div class="io"><span class="gutter">Input</span><code>{&quot;status&quot;: &quot;done&quot;}</code></div>
+  <div class="io"><span class="gutter bad">Error</span>
+    <code>There is no goal recorded for today.</code></div>
+</article>
+<article class="card entry ">
+  <div class="entry-head">
+    <span class="dot ok"></span>
+    <b class="mono">record_outcome</b>
+    <span class="muted">2026-08-07 14:20</span>
+    <span class="muted push">11 ms</span>
+  </div>
+  <div class="io"><span class="gutter">Input</span><code>{&quot;status&quot;: &quot;done&quot;, &quot;notes&quot;: &quot;Took most of the morning.&quot;}</code></div>
+  <div class="io"><span class="gutter ">Result</span>
+    <code>&quot;Recorded: done&quot;</code></div>
+</article>
+<article class="card entry ">
+  <div class="entry-head">
+    <span class="dot ok"></span>
+    <b class="mono">save_goal</b>
+    <span class="muted">2026-08-07 14:20</span>
+    <span class="muted push">9 ms</span>
+  </div>
+  <div class="io"><span class="gutter">Input</span><code>{&quot;text&quot;: &quot;Finish the dashboard and merge it&quot;}</code></div>
+  <div class="io"><span class="gutter ">Result</span>
+    <code>&quot;Saved today&#x27;s goal&quot;</code></div>
+</article></section><section class="panel" id="journal"><details class="card" open><summary><b class="mono">2026-08-07.md</b></summary><pre># 2026-08-07
+
+- 14:20 — Goal set: Finish the dashboard and merge it
+- 14:20 — Wake conversation: 2 messages
+</pre></details></section><section class="panel" id="system"><h4>Scheduled jobs</h4><div class="scroll"><table><thead><tr><th>Job</th><th>Cron</th><th>Last run</th><th>Next run</th><th></th></tr></thead><tbody><tr><td><span class="mono">checkin_evening</span></td><td><span class="mono">0 21 * * *</span></td><td><span class="mono muted">—</span></td><td><span class="mono muted">—</span></td><td><span class="pill ok"><i></i>Enabled</span></td></tr><tr><td><span class="mono">checkin_morning</span></td><td><span class="mono">0 11 * * *</span></td><td><span class="mono muted">2026-08-07 11:20</span></td><td><span class="mono muted">—</span></td><td><span class="pill ok"><i></i>Enabled</span></td></tr></tbody></table></div><h4>Settings</h4><div class="scroll"><table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>data directory</td><td><span class="mono">~/.zeus</span></td></tr><tr><td>evening</td><td><span class="mono">21:00</span></td></tr><tr><td>model</td><td><span class="mono">claude-opus-5</span></td></tr><tr><td>morning</td><td><span class="mono">11:00</span></td></tr><tr><td>speech-to-text</td><td><span class="mono">local_whisper (base.en)</span></td></tr><tr><td>text-to-speech</td><td><span class="mono">mac_say (Alex)</span></td></tr><tr><td>timezone</td><td><span class="mono">America/Los_Angeles</span></td></tr><tr><td>wake word</td><td><span class="mono">hey_jarvis</span></td></tr></tbody></table></div><h4>Facts</h4><p class="empty">Nothing learned yet — pattern learning arrives in Slice 4.</p></section></main>
+  <footer class="foot">
+    Local to this machine · bound to 127.0.0.1 · nothing here leaves your Mac
+  </footer>
+</div>
+
+<aside id="wake" class="popup on" aria-live="polite">
+  <div class="popup-head">
+    <span class="mic"><i></i></span>
+    <div><b>ZEUS is listening</b>
+      <span class="muted" id="wake-trigger">wake</span>
+    </div>
+    <a class="close" href="#" aria-label="dismiss">×</a>
+  </div>
+  <div class="chat" id="wake-chat"><div class="bubble user"><span class="who">user</span><p>What did I say I&#x27;d do today?</p></div><div class="bubble assistant"><span class="who">assistant</span><p>Finish the dashboard and merge it.</p></div></div>
+</aside>
+
+</body>
+</html>
