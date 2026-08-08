@@ -662,6 +662,7 @@ def build_daemon(config: Config | None = None, overlay=None) -> Daemon:
     from zeus.brain.tools import build_tools
     from zeus.memory.journal import Journal
     from zeus.memory.store import Store
+    from zeus.mcp import Confirmer, MCPRegistry, load_server_configs
     from zeus.ritual.checkin import CheckIn, MacNotifier, VoiceIO
     from zeus.stt import build_transcriber
     from zeus.tts import build_speaker
@@ -685,11 +686,34 @@ def build_daemon(config: Config | None = None, overlay=None) -> Daemon:
     notifier = MacNotifier()
     client = anthropic.Anthropic()
 
+    # MCP: everything ZEUS can reach beyond its own database. Started BEFORE
+    # the factories below because they close over the tool list, and started
+    # here rather than lazily because tool discovery costs an `npx` download
+    # on first run -- paying that in the middle of a conversation would leave
+    # the user listening to silence.
+    #
+    # The confirmer is bound to the SAME VoiceIO the conversation uses, which
+    # is what makes §12's gate real: the question is asked through the
+    # speaker and answered through the microphone, in the same turn, rather
+    # than through some out-of-band prompt the user never sees.
+    mcp = MCPRegistry(confirmer=Confirmer(voice), store=store)
+    if config.mcp.enabled:
+        try:
+            mcp.start(load_server_configs(config.mcp.servers))
+        except Exception:
+            # A tool surface that fails to build must not cost the ritual.
+            log.error("mcp: registry failed to start; continuing with the "
+                      "built-in tools only", exc_info=True)
+    mcp_tools = mcp.beta_tools()
+    if mcp_tools:
+        log.info("mcp: %d tool(s) available to the brain", len(mcp_tools))
+
     def conversation_factory(conversation_id: int, date: str):
         return Conversation(
             client=client, config=config.brain, store=store, journal=journal,
             conversation_id=conversation_id, system=SYSTEM_PROMPT,
-            tools=build_tools(store, journal, conversation_id, date),
+            tools=build_tools(store, journal, conversation_id, date)
+            + mcp_tools,
         )
 
     def adhoc_factory(conversation_id: int):
@@ -697,7 +721,8 @@ def build_daemon(config: Config | None = None, overlay=None) -> Daemon:
         return Conversation(
             client=client, config=config.brain, store=store, journal=journal,
             conversation_id=conversation_id, system=SYSTEM_PROMPT,
-            tools=build_tools(store, journal, conversation_id, date),
+            tools=build_tools(store, journal, conversation_id, date)
+            + mcp_tools,
             effort=config.brain.effort_adhoc,
         )
 

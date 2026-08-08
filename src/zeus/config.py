@@ -86,6 +86,21 @@ class PrivacyConfig:
 
 
 @dataclass
+class McpConfig:
+    """MCP servers ZEUS may call tools on. See zeus.mcp.registry.
+
+    `servers` is a free-form table, not a dataclass, because its keys are
+    server names the user invents. _apply's unknown-key check therefore
+    cannot police the inside of it -- load_server_configs validates each
+    entry instead, and skips a malformed one loudly rather than raising,
+    since this is parsed at daemon startup under KeepAlive.
+    """
+
+    enabled: bool = True
+    servers: dict = field(default_factory=dict)
+
+
+@dataclass
 class Config:
     root: Path
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
@@ -96,6 +111,7 @@ class Config:
     brain: BrainConfig = field(default_factory=BrainConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
     privacy: PrivacyConfig = field(default_factory=PrivacyConfig)
+    mcp: McpConfig = field(default_factory=McpConfig)
 
     @property
     def db_path(self) -> Path:

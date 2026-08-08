@@ -82,6 +82,43 @@ ZEUS asks for your goal at 11:00 and reviews it at 21:00. If you are away,
 on a call, or in a Focus mode, it defers or notifies quietly instead of
 talking at you.
 
+## Connecting apps (MCP)
+
+ZEUS can call tools on any [MCP](https://modelcontextprotocol.io) server —
+your files, your mail, a browser, anything with a server. List them in
+`~/.zeus/config.toml`:
+
+```toml
+[mcp.servers.files]
+command = ["npx", "-y", "@modelcontextprotocol/server-filesystem",
+           "/Users/you/Documents"]
+
+[mcp.servers.gmail]
+command = ["npx", "-y", "@your/gmail-mcp-server"]
+env = { GMAIL_TOKEN = "..." }
+```
+
+Tools are discovered at startup and namespaced by server (`files__read_file`),
+so two servers may both offer `search`. They arrive at the brain in exactly
+the same shape as the built-in `save_goal`, so the model chooses between all
+of them together.
+
+**Anything hard to take back is confirmed out loud first.** ZEUS states the
+action and waits for a spoken yes:
+
+> "You want me to write file using files, with path notes.txt. Shall I?"
+
+Say no and it is not run — the model is told so, and told not to retry.
+Gating is by verb (`delete`, `send`, `write`, `move`, `run`, `pay`…), so
+reads and searches are never interrupted. If there is no voice channel to
+ask through — a scheduled check-in, a headless run — a destructive tool is
+**refused**, because "nobody objected" is not "someone agreed".
+
+Every MCP call is written to the action log alongside the built-in tools,
+so the dashboard shows all of it.
+
+One broken server costs only its own tools: ZEUS logs it and carries on.
+
 ## Dashboard
 
 ```bash
