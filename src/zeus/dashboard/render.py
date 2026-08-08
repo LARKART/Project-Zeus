@@ -48,6 +48,7 @@ PANELS = [
     ("session", "Session", "ACTIVITY"),
     ("log", "Action log", "ACTIVITY"),
     ("journal", "Journal", "ACTIVITY"),
+    ("connect", "Connect", "SYSTEM"),
     ("system", "System", "SYSTEM"),
 ]
 
@@ -351,6 +352,87 @@ def _journal(snapshot: Snapshot) -> str:
     return _panel("journal", body)
 
 
+def _connect(snapshot: Snapshot) -> str:
+    """Add and remove MCP servers — the dashboard's only write surface.
+
+    The token below is what actually stops a cross-site write: a page on
+    another origin can make your browser POST here, but it cannot READ this
+    page to learn the token. See dashboard/actions.py for the whole threat
+    model; it is short and worth reading before changing anything here.
+    """
+    from zeus.dashboard.actions import CSRF_TOKEN
+
+    if snapshot.mcp_servers:
+        rows = []
+        for server in snapshot.mcp_servers:
+            command = " ".join(server["command"])
+            env = ", ".join(server["env_keys"])
+            rows.append(f"""
+<article class="card server{'' if server['enabled'] else ' off'}">
+  <div class="entry-head">
+    <span class="dot {'ok' if server['enabled'] else 'muted'}"></span>
+    <b class="mono">{esc(server["name"])}</b>
+    {_pill("enabled" if server["enabled"] else "disabled",
+           "ok" if server["enabled"] else "muted")}
+    <span class="muted push">{esc(server["source"])}</span>
+  </div>
+  <div class="io"><span class="gutter">Command</span>
+    <code>{esc(command)}</code></div>
+  {f'<div class="io"><span class="gutter">Env</span><code>{esc(env)} '
+   f'(values hidden)</code></div>' if env else ""}
+  <div class="row server-actions">
+    <button class="btn" data-act="toggle" data-name="{esc(server["name"])}"
+            data-enabled="{'0' if server['enabled'] else '1'}">
+      {'Disable' if server['enabled'] else 'Enable'}</button>
+    <button class="btn danger" data-act="remove"
+            data-name="{esc(server["name"])}">Remove</button>
+  </div>
+</article>""")
+        listing = "".join(rows)
+    else:
+        listing = _empty(
+            "No servers added yet. Add one below, or declare it in "
+            "config.toml under [mcp.servers]."
+        )
+
+    return _panel("connect", f"""
+<div class="notice">
+  <b>Adding a server runs a command on this Mac.</b> An MCP entry is a
+  command line, executed at the next daemon start with your privileges. Add
+  only servers you trust, exactly as you would a shell command.
+</div>
+{listing}
+<article class="card">
+  <span class="eyebrow">Add a server</span>
+  <form id="add-server" autocomplete="off">
+    <input type="hidden" name="csrf" value="{esc(CSRF_TOKEN)}">
+    <label>Name
+      <input name="name" placeholder="gmail" maxlength="32" required
+             pattern="[A-Za-z0-9_-]+">
+      <small>Prefixes every tool it offers — <code>gmail__search</code>.
+        Letters, digits, hyphen and underscore.</small>
+    </label>
+    <label>Command
+      <input name="command" required
+             placeholder="npx -y @modelcontextprotocol/server-filesystem ~/Documents">
+      <small>Split like a shell would, but never run through one.</small>
+    </label>
+    <label>Environment <span class="muted">(optional)</span>
+      <textarea name="env" rows="3"
+                placeholder="GMAIL_TOKEN=ya29...&#10;ONE_PER_LINE=value"></textarea>
+      <small>KEY=VALUE per line. Stored in
+        <code>~/.zeus/mcp.json</code> at mode 600, never shown again.</small>
+    </label>
+    <div class="row">
+      <button class="btn solid" type="submit">Add server</button>
+      <span id="add-result" class="muted"></span>
+    </div>
+  </form>
+</article>
+<p class="empty">Servers are started once, at daemon startup, so tool
+discovery never happens mid-conversation — restart ZEUS after a change.</p>""")
+
+
 def _system(snapshot: Snapshot) -> str:
     jobs = _table(
         ["Job", "Cron", "Last run", "Next run", ""],
@@ -464,6 +546,43 @@ _POLLER = """
   }
   setInterval(poll, 2000);
   poll();
+
+  // The Connect form. fetch, not a native form submit, for one reason that
+  // matters: a real submit navigates away and the result would be a bare
+  // JSON page. This keeps the answer beside the button that caused it.
+  function post(url, body, done) {
+    body.append('csrf', document.querySelector('[name=csrf]').value);
+    fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams(body)
+    }).then(function (r) { return r.json(); })
+      .then(done)
+      .catch(function () { done({ ok: false, message: 'The dashboard is unreachable.' }); });
+  }
+  var form = document.getElementById('add-server');
+  if (form) {
+    var out = document.getElementById('add-result');
+    form.addEventListener('submit', function (e) {
+      e.preventDefault();
+      out.textContent = 'Saving…';
+      out.className = 'muted';
+      post('/api/mcp/add', new FormData(form), function (res) {
+        out.textContent = res.message;
+        out.className = res.ok ? 'ok-text' : 'bad-text';
+        if (res.ok) { form.reset(); setTimeout(function () { location.reload(); }, 1200); }
+      });
+    });
+  }
+  document.querySelectorAll('.server-actions button').forEach(function (b) {
+    b.addEventListener('click', function () {
+      var body = new FormData();
+      body.append('name', b.dataset.name);
+      if (b.dataset.act === 'toggle') body.append('enabled', b.dataset.enabled);
+      b.disabled = true;
+      post('/api/mcp/' + b.dataset.act, body, function () { location.reload(); });
+    });
+  });
   document.querySelector('#wake .close').addEventListener('click', function (e) {
     e.preventDefault();
     box.classList.remove('on');
@@ -493,7 +612,8 @@ def render_page(snapshot: Snapshot) -> str:
                   f"{esc(snapshot.error)}</div>")
     panels = "".join([
         _today(snapshot), _goals(snapshot), _checkins(snapshot), _session(snapshot),
-        _log(snapshot), _journal(snapshot), _system(snapshot),
+        _log(snapshot), _journal(snapshot), _connect(snapshot),
+        _system(snapshot),
     ])
     dot = {"alive": "ok", "stale": "bad", "never": "muted"}[snapshot.health.status]
     return f"""<!doctype html>
@@ -766,6 +886,27 @@ pre { margin:10px 0 0; padding:14px 16px; background:var(--bg);
 .empty { color:var(--muted); font-size:13px; margin:4px 0; }
 .banner { padding:14px 18px; border-radius:var(--r); margin-bottom:16px;
   color:var(--bad); background:var(--bad-bg); border:1px solid var(--bad); }
+.notice { padding:13px 16px; border-radius:var(--r); margin-bottom:14px;
+  color:var(--warn); background:var(--warn-bg); border:1px solid var(--warn);
+  font-size:12.5px; }
+form label { display:block; margin-bottom:14px; font-size:12.5px; color:var(--muted); }
+form input, form textarea {
+  display:block; width:100%; margin-top:6px; padding:9px 12px;
+  background:var(--bg); color:var(--ink); border:1px solid var(--line);
+  border-radius:10px; font-family:var(--mono); font-size:12.5px;
+}
+form input:focus, form textarea:focus {
+  outline:none; border-color:var(--accent); box-shadow:0 0 0 3px var(--glow);
+}
+form small { display:block; margin-top:5px; color:var(--dim); font-size:11px;
+  font-family:var(--sans); }
+button.btn { cursor:pointer; font-family:var(--sans); }
+button.btn:disabled { opacity:.5; cursor:default; }
+button.btn.danger { color:var(--bad); border-color:var(--bad); }
+.server.off { opacity:.6; }
+.server-actions { margin-top:12px; gap:8px; }
+.ok-text { color:var(--ok); font-size:12.5px; }
+.bad-text { color:var(--bad); font-size:12.5px; }
 .foot { margin-top:26px; color:var(--dim); font-size:11.5px; text-align:center; }
 /* wake-word pop-up */
 .popup {

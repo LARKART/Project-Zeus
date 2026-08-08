@@ -663,6 +663,7 @@ def build_daemon(config: Config | None = None, overlay=None) -> Daemon:
     from zeus.memory.journal import Journal
     from zeus.memory.store import Store
     from zeus.mcp import Confirmer, MCPRegistry, load_server_configs
+    from zeus.mcp import store as mcp_store
     from zeus.ritual.checkin import CheckIn, MacNotifier, VoiceIO
     from zeus.stt import build_transcriber
     from zeus.tts import build_speaker
@@ -699,7 +700,14 @@ def build_daemon(config: Config | None = None, overlay=None) -> Daemon:
     mcp = MCPRegistry(confirmer=Confirmer(voice), store=store)
     if config.mcp.enabled:
         try:
-            mcp.start(load_server_configs(config.mcp.servers))
+            # BOTH sources: config.toml's [mcp.servers] and the servers
+            # added from the dashboard's Connect page (~/.zeus/mcp.json).
+            # Without the merge the page would save happily and the server
+            # would never start -- the worst shape, since it looks like it
+            # worked.
+            mcp.start(load_server_configs(
+                mcp_store.merged(config.mcp.servers, config.root)
+            ))
         except Exception:
             # A tool surface that fails to build must not cost the ritual.
             log.error("mcp: registry failed to start; continuing with the "

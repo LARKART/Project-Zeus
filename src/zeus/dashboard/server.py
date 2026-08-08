@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Callable
 from zoneinfo import ZoneInfo
 
+from zeus.dashboard import actions
 from zeus.dashboard.data import Snapshot, read_snapshot
 from zeus.dashboard.render import (
     live_session, poller_hash, render_json, render_page,
@@ -44,9 +45,13 @@ class DashboardServer(ThreadingHTTPServer):
 
     daemon_threads = True
 
-    def __init__(self, address, snapshot_source: Callable[[], Snapshot]) -> None:
+    def __init__(self, address, snapshot_source: Callable[[], Snapshot],
+                 root: Path | None = None) -> None:
         super().__init__(address, _Handler)
         self.snapshot_source = snapshot_source
+        # Where mcp.json lives. The handler needs it to write, and the
+        # server is the only object it can reach.
+        self.root = root or Path.home() / ".zeus"
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -78,7 +83,7 @@ class _Handler(BaseHTTPRequestHandler):
             "Content-Security-Policy",
             f"default-src 'none'; style-src 'unsafe-inline'; "
             f"script-src {poller_hash()}; connect-src 'self'; "
-            f"base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+            f"base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
         )
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
@@ -124,6 +129,76 @@ class _Handler(BaseHTTPRequestHandler):
     def do_HEAD(self) -> None:  # noqa: N802
         self.do_GET()
 
+    def do_POST(self) -> None:  # noqa: N802
+        """The dashboard's only write path. See dashboard/actions.py.
+
+        Ordered cheapest-refusal-first, and every refusal says why: this is
+        a tool for one person on their own machine, and a silent 403 while
+        debugging your own dashboard is its own kind of failure.
+        """
+        import json as _json
+        from urllib.parse import parse_qs
+
+        route = self.path.split("?", 1)[0].rstrip("/") or "/"
+        handler = actions.HANDLERS.get(route)
+        if handler is None:
+            # JSON, like every other POST answer. The page's fetch handler
+            # parses the body to show the user what happened, and a plain
+            # "Not found" would surface as a parse error rather than a
+            # message -- the failure looking like a different failure.
+            self._refuse(404, f"no such action: {route}")
+            return
+
+        # The connection itself must be loopback. Belt and braces -- the
+        # socket is bound to 127.0.0.1 so nothing else can arrive -- but this
+        # is the file where belt and braces is the correct posture.
+        client = self.client_address[0] if self.client_address else ""
+        if client not in ("127.0.0.1", "::1"):
+            self._refuse(403, f"refused: {client} is not loopback")
+            return
+
+        refusal = actions.check_origin(self.headers, *self.server.server_address[:2])
+        if refusal:
+            self._refuse(403, refusal)
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self._refuse(400, "bad Content-Length")
+            return
+        # A body cap, because this reads into memory from an unauthenticated
+        # socket. 64 KB is far more than a command line and an env block.
+        if length > 65536:
+            self._refuse(413, "the request body is too large")
+            return
+
+        try:
+            raw = self.rfile.read(length).decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            self._refuse(400, "could not read the request body")
+            return
+
+        form = {k: v[0] for k, v in parse_qs(raw, keep_blank_values=True).items()}
+        refusal = actions.check_token(form.get("csrf"))
+        if refusal:
+            self._refuse(403, refusal)
+            return
+
+        result = handler(self.server.root, form)
+        self._respond(
+            result.status if not result.ok else 200,
+            _json.dumps({"ok": result.ok, "message": result.message}),
+            "application/json",
+        )
+
+    def _refuse(self, status: int, why: str) -> None:
+        import json as _json
+
+        log.warning("dashboard: %s", why)
+        self._respond(status, _json.dumps({"ok": False, "message": why}),
+                      "application/json")
+
 
 def build_server(
     db_path: Path, journal_dir: Path, tz: ZoneInfo,
@@ -141,7 +216,8 @@ def build_server(
     def snapshot() -> Snapshot:
         return read_snapshot(db_path, journal_dir, tz, clock(), settings)
 
-    return DashboardServer((BIND_HOST, port), snapshot)
+    return DashboardServer((BIND_HOST, port), snapshot,
+                           root=db_path.parent)
 
 
 def serve(server: DashboardServer) -> None:

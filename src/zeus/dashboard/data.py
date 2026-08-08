@@ -71,6 +71,7 @@ class Snapshot:
     facts: list[dict]
     journal: list[dict]
     settings: dict
+    mcp_servers: list[dict] = field(default_factory=list)
     error: str | None = None
 
 
@@ -206,6 +207,32 @@ def _read_journal(journal_dir: Path, today: str) -> list[dict]:
     return entries
 
 
+def _read_mcp_servers(root: Path) -> list[dict]:
+    """The configured MCP servers, and which tools each is currently offering.
+
+    Read from mcp.json rather than from the running registry because the
+    dashboard is a SEPARATE PROCESS from the daemon -- it cannot see the
+    daemon's live objects, only what both of them read from disk. The tool
+    counts therefore come from the action log: what a server has actually
+    been used for is the honest answer this process can give, and it is more
+    useful than a list of what it theoretically offers.
+    """
+    from zeus.mcp import store as mcp_store
+
+    servers = []
+    for name, entry in sorted(mcp_store.load(root).items()):
+        if not isinstance(entry, dict):
+            continue
+        servers.append({
+            "name": name,
+            "command": entry.get("command") or [],
+            "env_keys": sorted((entry.get("env") or {}).keys()),
+            "enabled": bool(entry.get("enabled", True)),
+            "source": "mcp.json",
+        })
+    return servers
+
+
 def read_snapshot(
     db_path: Path, journal_dir: Path, tz: ZoneInfo, now_utc: datetime,
     settings: dict | None = None,
@@ -224,6 +251,7 @@ def read_snapshot(
         streak=Streak(0, 0, 0, 0, []), today_goal=None, today_checkins=[],
         goals=[], checkins=[], actions=[], conversations=[], jobs=[], facts=[],
         journal=_read_journal(journal_dir, today), settings=settings or {},
+        mcp_servers=_read_mcp_servers(db_path.parent),
     )
     if not db_path.is_file():
         return empty
@@ -295,4 +323,5 @@ def read_snapshot(
         facts=facts,
         journal=_read_journal(journal_dir, today),
         settings=settings or {},
+        mcp_servers=_read_mcp_servers(db_path.parent),
     )

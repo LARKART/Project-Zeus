@@ -218,6 +218,27 @@ pre { margin:10px 0 0; padding:14px 16px; background:var(--bg);
 .empty { color:var(--muted); font-size:13px; margin:4px 0; }
 .banner { padding:14px 18px; border-radius:var(--r); margin-bottom:16px;
   color:var(--bad); background:var(--bad-bg); border:1px solid var(--bad); }
+.notice { padding:13px 16px; border-radius:var(--r); margin-bottom:14px;
+  color:var(--warn); background:var(--warn-bg); border:1px solid var(--warn);
+  font-size:12.5px; }
+form label { display:block; margin-bottom:14px; font-size:12.5px; color:var(--muted); }
+form input, form textarea {
+  display:block; width:100%; margin-top:6px; padding:9px 12px;
+  background:var(--bg); color:var(--ink); border:1px solid var(--line);
+  border-radius:10px; font-family:var(--mono); font-size:12.5px;
+}
+form input:focus, form textarea:focus {
+  outline:none; border-color:var(--accent); box-shadow:0 0 0 3px var(--glow);
+}
+form small { display:block; margin-top:5px; color:var(--dim); font-size:11px;
+  font-family:var(--sans); }
+button.btn { cursor:pointer; font-family:var(--sans); }
+button.btn:disabled { opacity:.5; cursor:default; }
+button.btn.danger { color:var(--bad); border-color:var(--bad); }
+.server.off { opacity:.6; }
+.server-actions { margin-top:12px; gap:8px; }
+.ok-text { color:var(--ok); font-size:12.5px; }
+.bad-text { color:var(--bad); font-size:12.5px; }
 .foot { margin-top:26px; color:var(--dim); font-size:11.5px; text-align:center; }
 /* wake-word pop-up */
 .popup {
@@ -247,7 +268,7 @@ pre { margin:10px 0 0; padding:14px 16px; background:var(--bg);
 @media (prefers-reduced-motion: reduce) {
   * { transition:none !important; animation:none !important; }
 }
-body:has(#today:target) .seg-today{color:#04140c;background:var(--accent);box-shadow:0 0 18px var(--glow);}body:has(#goals:target) .seg-goals{color:#04140c;background:var(--accent);box-shadow:0 0 18px var(--glow);}body:has(#checkins:target) .seg-checkins{color:#04140c;background:var(--accent);box-shadow:0 0 18px var(--glow);}body:has(#session:target) .seg-session{color:#04140c;background:var(--accent);box-shadow:0 0 18px var(--glow);}body:has(#log:target) .seg-log{color:#04140c;background:var(--accent);box-shadow:0 0 18px var(--glow);}body:has(#journal:target) .seg-journal{color:#04140c;background:var(--accent);box-shadow:0 0 18px var(--glow);}body:has(#system:target) .seg-system{color:#04140c;background:var(--accent);box-shadow:0 0 18px var(--glow);}</style>
+body:has(#today:target) .seg-today{color:#04140c;background:var(--accent);box-shadow:0 0 18px var(--glow);}body:has(#goals:target) .seg-goals{color:#04140c;background:var(--accent);box-shadow:0 0 18px var(--glow);}body:has(#checkins:target) .seg-checkins{color:#04140c;background:var(--accent);box-shadow:0 0 18px var(--glow);}body:has(#session:target) .seg-session{color:#04140c;background:var(--accent);box-shadow:0 0 18px var(--glow);}body:has(#log:target) .seg-log{color:#04140c;background:var(--accent);box-shadow:0 0 18px var(--glow);}body:has(#journal:target) .seg-journal{color:#04140c;background:var(--accent);box-shadow:0 0 18px var(--glow);}body:has(#connect:target) .seg-connect{color:#04140c;background:var(--accent);box-shadow:0 0 18px var(--glow);}body:has(#system:target) .seg-system{color:#04140c;background:var(--accent);box-shadow:0 0 18px var(--glow);}</style>
 </head>
 <body>
 <div class="aurora"></div>
@@ -264,7 +285,7 @@ body:has(#today:target) .seg-today{color:#04140c;background:var(--accent);box-sh
       <span class="btn solid">2026-08-07</span>
     </div>
   </header>
-  <nav class="segments"><a class="seg seg-today" href="#today">Today</a><a class="seg seg-goals" href="#goals">Goals</a><a class="seg seg-checkins" href="#checkins">Check-ins</a><a class="seg seg-session" href="#session">Session</a><a class="seg seg-log" href="#log">Action log</a><a class="seg seg-journal" href="#journal">Journal</a><a class="seg seg-system" href="#system">System</a></nav>
+  <nav class="segments"><a class="seg seg-today" href="#today">Today</a><a class="seg seg-goals" href="#goals">Goals</a><a class="seg seg-checkins" href="#checkins">Check-ins</a><a class="seg seg-session" href="#session">Session</a><a class="seg seg-log" href="#log">Action log</a><a class="seg seg-journal" href="#journal">Journal</a><a class="seg seg-connect" href="#connect">Connect</a><a class="seg seg-system" href="#system">System</a></nav>
   <main class="content">
 <div class="banner" style="color:var(--info);background:var(--info-bg);
      border-color:var(--info)">
@@ -426,7 +447,42 @@ body:has(#today:target) .seg-today{color:#04140c;background:var(--accent);box-sh
 
 - 14:20 — Goal set: Finish the dashboard and merge it
 - 14:20 — Wake conversation: 2 messages
-</pre></details></section><section class="panel" id="system"><h4>Scheduled jobs</h4><div class="scroll"><table><thead><tr><th>Job</th><th>Cron</th><th>Last run</th><th>Next run</th><th></th></tr></thead><tbody><tr><td><span class="mono">checkin_evening</span></td><td><span class="mono">0 21 * * *</span></td><td><span class="mono muted">—</span></td><td><span class="mono muted">—</span></td><td><span class="pill ok"><i></i>Enabled</span></td></tr><tr><td><span class="mono">checkin_morning</span></td><td><span class="mono">0 11 * * *</span></td><td><span class="mono muted">2026-08-07 11:20</span></td><td><span class="mono muted">—</span></td><td><span class="pill ok"><i></i>Enabled</span></td></tr></tbody></table></div><h4>Settings</h4><div class="scroll"><table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>data directory</td><td><span class="mono">~/.zeus</span></td></tr><tr><td>evening</td><td><span class="mono">21:00</span></td></tr><tr><td>model</td><td><span class="mono">claude-opus-5</span></td></tr><tr><td>morning</td><td><span class="mono">11:00</span></td></tr><tr><td>speech-to-text</td><td><span class="mono">local_whisper (base.en)</span></td></tr><tr><td>text-to-speech</td><td><span class="mono">mac_say (Alex)</span></td></tr><tr><td>timezone</td><td><span class="mono">America/Los_Angeles</span></td></tr><tr><td>wake word</td><td><span class="mono">hey_jarvis</span></td></tr></tbody></table></div><h4>Facts</h4><p class="empty">Nothing learned yet — pattern learning arrives in Slice 4.</p></section></main>
+</pre></details></section><section class="panel" id="connect">
+<div class="notice">
+  <b>Adding a server runs a command on this Mac.</b> An MCP entry is a
+  command line, executed at the next daemon start with your privileges. Add
+  only servers you trust, exactly as you would a shell command.
+</div>
+<p class="empty">No servers added yet. Add one below, or declare it in config.toml under [mcp.servers].</p>
+<article class="card">
+  <span class="eyebrow">Add a server</span>
+  <form id="add-server" autocomplete="off">
+    <input type="hidden" name="csrf" value="DrE7aUXme7iyZGjV7JjPh9ttCGSDYCHjzA3Pz-McMRs">
+    <label>Name
+      <input name="name" placeholder="gmail" maxlength="32" required
+             pattern="[A-Za-z0-9_-]+">
+      <small>Prefixes every tool it offers — <code>gmail__search</code>.
+        Letters, digits, hyphen and underscore.</small>
+    </label>
+    <label>Command
+      <input name="command" required
+             placeholder="npx -y @modelcontextprotocol/server-filesystem ~/Documents">
+      <small>Split like a shell would, but never run through one.</small>
+    </label>
+    <label>Environment <span class="muted">(optional)</span>
+      <textarea name="env" rows="3"
+                placeholder="GMAIL_TOKEN=ya29...&#10;ONE_PER_LINE=value"></textarea>
+      <small>KEY=VALUE per line. Stored in
+        <code>~/.zeus/mcp.json</code> at mode 600, never shown again.</small>
+    </label>
+    <div class="row">
+      <button class="btn solid" type="submit">Add server</button>
+      <span id="add-result" class="muted"></span>
+    </div>
+  </form>
+</article>
+<p class="empty">Servers are started once, at daemon startup, so tool
+discovery never happens mid-conversation — restart ZEUS after a change.</p></section><section class="panel" id="system"><h4>Scheduled jobs</h4><div class="scroll"><table><thead><tr><th>Job</th><th>Cron</th><th>Last run</th><th>Next run</th><th></th></tr></thead><tbody><tr><td><span class="mono">checkin_evening</span></td><td><span class="mono">0 21 * * *</span></td><td><span class="mono muted">—</span></td><td><span class="mono muted">—</span></td><td><span class="pill ok"><i></i>Enabled</span></td></tr><tr><td><span class="mono">checkin_morning</span></td><td><span class="mono">0 11 * * *</span></td><td><span class="mono muted">2026-08-07 11:20</span></td><td><span class="mono muted">—</span></td><td><span class="pill ok"><i></i>Enabled</span></td></tr></tbody></table></div><h4>Settings</h4><div class="scroll"><table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>data directory</td><td><span class="mono">~/.zeus</span></td></tr><tr><td>evening</td><td><span class="mono">21:00</span></td></tr><tr><td>model</td><td><span class="mono">claude-opus-5</span></td></tr><tr><td>morning</td><td><span class="mono">11:00</span></td></tr><tr><td>speech-to-text</td><td><span class="mono">local_whisper (base.en)</span></td></tr><tr><td>text-to-speech</td><td><span class="mono">mac_say (Alex)</span></td></tr><tr><td>timezone</td><td><span class="mono">America/Los_Angeles</span></td></tr><tr><td>wake word</td><td><span class="mono">hey_jarvis</span></td></tr></tbody></table></div><h4>Facts</h4><p class="empty">Nothing learned yet — pattern learning arrives in Slice 4.</p></section></main>
   <footer class="foot">
     Local to this machine · bound to 127.0.0.1 · nothing here leaves your Mac
   </footer>
